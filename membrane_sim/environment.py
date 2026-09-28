@@ -58,13 +58,15 @@ class Environment:
         return obstacle
 
     def add_fluid_volume(self, boundaries=(), P0=0.0, bulk_stiffness=0.0, pressure_law=None,
-                         initial_volume=None, color="blue", name=None) -> FluidVolume:
+                         initial_volume=None, gas_volume=None, atmospheric_pressure=0.101325, color="blue",
+                         name=None) -> FluidVolume:
         """
         boundaries: iterable of (shell, side) with side = +1 if the shell normal points out of
         this volume. Boundaries can also be attached later with shell.fluid_volume_contacts.
         """
         volume = FluidVolume(P0=P0, bulk_stiffness=bulk_stiffness, pressure_law=pressure_law,
-                             initial_volume=initial_volume, color=color, name=name)
+                             initial_volume=initial_volume, gas_volume=gas_volume,
+                             atmospheric_pressure=atmospheric_pressure, color=color, name=name)
         for shell, side in boundaries:
             volume.add_boundary(shell, side)
         self.fluid_volume_list.append(volume)

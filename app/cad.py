@@ -4,7 +4,8 @@ mid-surface extraction of thin bodies.
 
 Every solid in the STEP file is one body. Lengths are in millimetres.
 gmsh must be initialised from the main thread (CadModel.load_step); meshing may then run
-from a worker thread as long as only one thread uses gmsh at a time.
+from a worker thread as long as only one thread uses gmsh at a time. gmsh holds a single
+global model, so only the most recently loaded CadModel can be meshed.
 """
 import re
 from dataclasses import dataclass, field

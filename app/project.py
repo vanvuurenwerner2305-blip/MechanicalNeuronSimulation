@@ -95,8 +95,14 @@ ROLE_FIELDS = {
     ],
     CHAMBER: [
         Field("model", "Pressure model", "choice", CONSTANT, choices=tuple(CHAMBER_MODELS)),
-        Field("pressure", "Pressure", "float", 0.0, "kPa", -1e6, 1e6, 4,
-              tooltip="Applied gauge pressure (constant) or initial gauge pressure (closed)."),
+        Field("pressure", "Pressure (gauge)", "float", 0.0, "kPa", -1e6, 1e6, 4,
+              tooltip="Gauge pressure: 0 = atmospheric. For a constant-pressure chamber the applied "
+                      "pressure; for a closed chamber the pressure at the moment it was sealed."),
+        Field("incompressible", "Incompressible fluid", "float", 0.0, "%", 0.0, 99.0, 3,
+              visible_if=("model", (IDEAL_GAS,)),
+              tooltip="Share of the chamber's initial volume filled with incompressible liquid; the rest "
+                      "is gas. All volume change goes into the gas, so more liquid makes the chamber "
+                      "stiffer. For a chamber completely full of liquid use 'Closed: linear stiffness'."),
         Field("stiffness", "Volume stiffness", "float", 1e-3, "kPa/mm³", 0.0, 1e9, 6,
               visible_if=("model", (LINEAR,)), tooltip="dP/dV of the closed chamber."),
     ],

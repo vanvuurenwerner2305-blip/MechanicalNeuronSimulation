@@ -13,6 +13,7 @@ shells is P * d(dV)/dx, which is exactly the (follower) pressure load and gives 
 symmetric tangent: P * d2V/dx2 + P'(dV) * g g^T with g = d(dV)/dx.
 """
 import inspect
+import math
 
 import numpy as np
 import torch
@@ -42,20 +43,32 @@ class FluidVolume:
                  bulk_stiffness: float = 0.0,
                  pressure_law=None,
                  initial_volume: float = None,
+                 gas_volume: float = None,
+                 atmospheric_pressure: float = 0.101325,
                  color: str = "blue",
                  name: str = None):
         """
-        P0             : pressure at the rest volume.
+        P0             : gauge pressure at the rest volume (0 = atmospheric).
         bulk_stiffness : K in P = P0 - K * dV (dP/dV). K = 0 gives a constant pressure reservoir.
         pressure_law   : optional callable dV -> P or (dV, P0) -> P (torch scalars), replacing
                          the linear law, e.g. an ideal gas lambda dV, P0: P0 * V0 / (V0 + dV).
                          Must be differentiable with torch. Taking P0 as an argument lets P0 be
                          changed later (sweeps, warm starts).
         initial_volume : optional rest volume, only used for reporting `volume`.
+        gas_volume     : makes the chamber a sealed ideal gas (isothermal, Boyle's law) with this
+                         much gas at rest; the rest of the chamber is incompressible liquid, so the
+                         whole volume change goes into the gas:
+                             P = (P_atm + P0) * V_gas / (V_gas + dV) - P_atm   (gauge)
+                         The gas can not be compressed to zero volume (the energy becomes infinite).
+        atmospheric_pressure : P_atm for the gas law, in the model's pressure units (default MPa).
         """
         self.P0 = P0
         self.bulk_stiffness = bulk_stiffness
         self.pressure_law = pressure_law
+        self.gas_volume = gas_volume
+        self.atmospheric_pressure = atmospheric_pressure
+        if gas_volume is not None and gas_volume <= 0:
+            raise ValueError("gas_volume must be positive.")
         self._law_takes_P0 = pressure_law is not None and len(inspect.signature(pressure_law).parameters) >= 2
         self.start_P0 = None   # P0 the current load path starts from (None: from zero pressure)
         self.solved_P0 = None  # P0 of the last converged solve
@@ -99,12 +112,22 @@ class FluidVolume:
 
     def pressure(self, dV: float, P0: float = None) -> float:
         P0 = self.P0 if P0 is None else P0
+        if self.gas_volume is not None:
+            gas = self.gas_volume + dV
+            if gas <= 0:
+                return math.inf
+            return (self.atmospheric_pressure + P0) * self.gas_volume / gas - self.atmospheric_pressure
         if self.pressure_law is None:
             return P0 - self.bulk_stiffness * dV
         return float(self._law(torch.tensor(dV, dtype=DTYPE), P0))
 
     def pressure_slope(self, dV: float, P0: float = None) -> float:
         P0 = self.P0 if P0 is None else P0
+        if self.gas_volume is not None:
+            gas = self.gas_volume + dV
+            if gas <= 0:
+                return -math.inf
+            return -(self.atmospheric_pressure + P0) * self.gas_volume / gas ** 2
         if self.pressure_law is None:
             return -self.bulk_stiffness
         t = torch.tensor(dV, dtype=DTYPE, requires_grad=True)
@@ -114,6 +137,12 @@ class FluidVolume:
     def pressure_potential(self, dV: float, P0: float = None) -> float:
         """Integral of P from 0 to dV (the work done by the fluid)."""
         P0 = self.P0 if P0 is None else P0
+        if self.gas_volume is not None:
+            gas = self.gas_volume + dV
+            if gas <= 0:
+                return -math.inf  # total energy +inf: such a state is rejected by the solver
+            return ((self.atmospheric_pressure + P0) * self.gas_volume * math.log(gas / self.gas_volume)
+                    - self.atmospheric_pressure * dV)
         if self.pressure_law is None:
             return P0 * dV - 0.5 * self.bulk_stiffness * dV ** 2
         s = 0.5 * dV * (_GAUSS_X + 1.0)

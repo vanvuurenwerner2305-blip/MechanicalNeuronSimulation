@@ -264,3 +264,57 @@ def test_warm_start_reaches_the_same_state_as_a_fresh_solve():
     assert env2.solve().converged
     assert torch.allclose(shell.x, shell2.x, atol=1e-7)
     assert gas.P == pytest.approx(gas2.P, rel=1e-8)
+
+
+# -----------------------------
+# Gas chambers with an incompressible share
+# -----------------------------
+
+def _gas_system(liquid_fraction, drive=0.02, P0=0.0, V0=2.0):
+    env = ms.Environment()
+    shell = env.add_disk_membrane((0, 0, 0), (0, 0, 1), 1.0, rings=6, thickness=0.05, youngs_modulus=1.0)
+    inlet = env.add_fluid_volume(P0=drive)
+    gas = env.add_fluid_volume(P0=P0, initial_volume=V0, gas_volume=(1 - liquid_fraction) * V0)
+    shell.fluid_volume_contacts((inlet, gas))
+    return env, shell, gas
+
+
+def test_gas_chamber_energy_residual_and_tangent_are_consistent():
+    env, shell, gas = _gas_system(0.6)
+    shell.x = shell.X.clone()
+    free = ~shell.fixed
+    shell.x[free, 2] += 0.2 * (1 - (shell.X[free, :2] ** 2).sum(1))
+    solver = NewtonSolver(env.membrane_list, env.fluid_volume_list, [], 0.0)
+    state = solver.evaluate(0.8)
+    K = state["K"].toarray() + state["U"] @ np.diag(state["c"]) @ state["U"].T
+    u0, h = solver.get_u().clone(), 1e-6
+    d = torch.as_tensor(np.random.default_rng(0).standard_normal(solver.n_free))
+    out = []
+    for sign in (1, -1):
+        u = u0.clone()
+        u[solver._free_t] += sign * h * d
+        solver.set_u(u)
+        out.append(solver.evaluate(0.8, tangent=False))
+    solver.set_u(u0)
+    assert (out[0]["energy"] - out[1]["energy"]) / (2 * h) == pytest.approx(state["residual"] @ d, rel=1e-5)
+    dR = (out[0]["residual"] - out[1]["residual"]).numpy() / (2 * h)
+    assert np.linalg.norm(dR - K @ d.numpy()) <= 1e-5 * np.linalg.norm(dR)
+
+
+def test_gas_chamber_follows_boyle_on_the_gas_share_and_liquid_stiffens_it():
+    deflection = {}
+    for liquid in (0.0, 0.6):
+        env, shell, gas = _gas_system(liquid, P0=0.005)
+        assert env.solve().converged
+        Vg = (1 - liquid) * 2.0
+        expected = (0.101325 + 0.005) * Vg / (Vg + gas.delta_volume) - 0.101325
+        assert gas.P == pytest.approx(expected, rel=1e-10)
+        deflection[liquid] = shell.displacement()[:, 2].max().item()
+    assert deflection[0.6] < deflection[0.0]
+
+
+def test_gas_pocket_can_not_be_squeezed_to_zero():
+    env, shell, gas = _gas_system(0.99, drive=5.0, V0=0.1)  # overwhelming drive, tiny gas pocket
+    assert env.solve(load_steps=20).converged
+    assert gas.gas_volume + gas.delta_volume > 0
+    assert gas.P == pytest.approx(5.0, rel=1e-3)  # the gas pressure balances the drive

@@ -109,16 +109,16 @@ class BuildResult:
                               rtol=settings.tolerance, callback=callback, warm_start=warm_start)
 
 
-def chamber_pressure_law(props, initial_volume):
-    """(P0 [MPa], bulk stiffness [MPa/mm^3], pressure_law or None) for a chamber's properties."""
-    P0 = float(props.get("pressure", 0.0)) * KPA
+def chamber_model(props, initial_volume):
+    """Keyword arguments for FluidVolume from a chamber's properties (pressures in MPa, gauge)."""
+    kwargs = dict(P0=float(props.get("pressure", 0.0)) * KPA)
     model = props.get("model")
     if model == IDEAL_GAS:
-        V0 = float(initial_volume)
-        return P0, 0.0, lambda dV, P0: (P_ATM + P0) * V0 / (V0 + dV) - P_ATM
-    if model == LINEAR:
-        return P0, float(props.get("stiffness", 0.0)) * KPA, None
-    return P0, 0.0, None
+        liquid = min(max(float(props.get("incompressible", 0.0)), 0.0), 99.0) / 100.0
+        kwargs.update(gas_volume=(1.0 - liquid) * float(initial_volume), atmospheric_pressure=P_ATM)
+    elif model == LINEAR:
+        kwargs.update(bulk_stiffness=float(props.get("stiffness", 0.0)) * KPA)
+    return kwargs
 
 
 def build_environment(cad, mesh: MeshData, project) -> BuildResult:
@@ -176,9 +176,8 @@ def build_environment(cad, mesh: MeshData, project) -> BuildResult:
     volumes, couplings = {}, {}
     for c in chambers:
         part, body = parts[c], bodies[c]
-        P0, K, law = chamber_pressure_law(part.props, body.volume)
-        volume = env.add_fluid_volume(P0=P0, bulk_stiffness=K, pressure_law=law, initial_volume=body.volume,
-                                      name=part.name, color=ROLE_COLORS[CHAMBER])
+        volume = env.add_fluid_volume(initial_volume=body.volume, name=part.name, color=ROLE_COLORS[CHAMBER],
+                                      **chamber_model(part.props, body.volume))
         volumes[c] = volume
         couplings[c] = []
         cm = mesh.surfaces[c]

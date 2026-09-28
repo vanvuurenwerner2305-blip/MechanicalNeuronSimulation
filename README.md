@@ -89,9 +89,15 @@ tests/                  analytical benchmarks, consistency checks, application p
   neo-Hookean (the default, for rubber) or St. Venant–Kirchhoff. Optional pre-tension.
 - **Bending**: Morley triangle with one mid-edge rotation unknown per edge. It is independent of
   mesh orientation and converges to Kirchhoff plate theory.
-- **Fluid chambers**: `P = P0 - K dV`, an isothermal ideal gas `(Patm + P0) V0 / (V0 + dV) - Patm`,
-  or any differentiable `pressure_law(dV, P0)`. Chamber walls are not meshed: shell edges are fixed,
-  so `dV` follows from the shells alone.
+- **Fluid chambers** (all pressures gauge, 0 = atmospheric):
+  - constant pressure (inputs);
+  - closed ideal gas (isothermal) with an optional incompressible share. With a fraction `f` of
+    liquid the gas volume is `Vg = (1 - f) V0`, all volume change goes into the gas, and
+    `P = (Patm + P0) Vg / (Vg + dV) - Patm`. The gas can never be compressed to zero volume;
+  - closed with linear stiffness `P = P0 - K dV` (e.g. a chamber completely full of liquid);
+  - or any differentiable `pressure_law(dV, P0)` in scripts.
+
+  Chamber walls are not meshed: shell edges are fixed, so `dV` follows from the shells alone.
 - **Contact**: nodal penalty `1/2 k A_node gap^2` against rigid bodies, with the mid-surface kept
   half a thickness away. `k` is pressure per unit penetration. The automatic value gives about 5%
   of the thickness at the highest input pressure.
@@ -111,6 +117,7 @@ Units in the application: mm, N, MPa (pressures entered in kPa).
 | Hencky inflated membrane, `w = 0.655 a (qa/Et)^(1/3)` | 0.654 |
 | Contact signed distance vs brute force (non-convex prism, body with cavity) | exact |
 | Warm-started solve vs fresh solve | identical |
+| Gas chamber with incompressible share: energy/residual/tangent consistency, Boyle's law on the gas share, gas pocket never collapses | exact |
 | STEP import: names, volumes, outward meshes, mid-surfaces, chamber couplings, project round trip | exact |
 
 ## Known limitations

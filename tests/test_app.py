@@ -92,3 +92,24 @@ def test_fusion_style_multibody_names():
     cad = CadModel()
     names = [b.name for b in cad.load_step(step)]
     assert names == [f"Body{i}" for i in range(1, 7)]
+
+
+def test_incompressible_fraction_sets_the_gas_volume():
+    from app.builder import P_ATM, chamber_model
+    props = {"model": IDEAL_GAS, "pressure": 5.0, "incompressible": 60.0}
+    kw = chamber_model(props, 1000.0)
+    assert kw["gas_volume"] == pytest.approx(400.0)
+    assert kw["P0"] == pytest.approx(5e-3)
+    assert kw["atmospheric_pressure"] == P_ATM
+
+
+def test_builder_creates_gas_chamber_with_liquid_share(neuron):
+    cad, project, path = neuron
+    cad.load_step(path)  # gmsh holds one model at a time; other tests may have loaded another file
+    part = next(p for p in project.parts if p.name == "Chamber_Middle")
+    part.props.update(model=IDEAL_GAS, incompressible=60.0)
+    build = build_environment(cad, generate_mesh(cad, project), project)
+    index = project.parts.index(part)
+    volume = build.volumes[index]
+    assert volume.gas_volume == pytest.approx(0.4 * cad.bodies[index].volume)
+    part.props.update(model="Constant pressure (input)", incompressible=0.0)
