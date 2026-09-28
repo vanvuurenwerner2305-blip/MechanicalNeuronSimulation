@@ -10,11 +10,16 @@ The g g^T terms are dense (they couple every node of a chamber) so they are kept
 the sparse matrix and handled with the Sherman-Morrison-Woodbury identity on top of a
 sparse LU factorisation.
 
-Robustness: pressures are ramped with a load factor lambda in [0, 1] with automatic
-step cutting; every Newton step is limited in size and followed by a backtracking line
-search (energy Armijo or residual decrease); rejected steps and singular tangents (e.g. a
-flat membrane without bending or pre-tension has no out-of-plane stiffness) fall back to
-Levenberg-Marquardt damping K + mu I.
+Each Newton iteration tries, in order, until the potential energy decreases:
+  1. the Newton step, with a second-order correction (SOC) for closed chambers: chamber volume
+     is quadratic in the displacements, so along a straight step a stiff chamber sees a volume
+     error that its stiffness turns into a huge energy (the Maratos effect of SQP). The SOC moves
+     the trial point back onto the linearised volumes, so stiff and soft chambers converge alike;
+  2. Levenberg-Marquardt damped Newton steps (K + mu I), for indefinite or singular tangents;
+  3. a Jacobi-preconditioned gradient step, which always decreases the energy.
+Every candidate step is capped in size and accepted by a line search on the potential energy
+(Armijo condition, quadratic interpolation). Pressures are ramped with a load factor lambda in
+[0, 1] with automatic step cutting (see Environment.solve).
 """
 from dataclasses import dataclass, field
 
@@ -57,6 +62,7 @@ class NewtonSolver:
         self.max_iterations = max_iterations
         self.verbose = verbose
         self.callback = callback  # called as callback(load_factor, iteration, residual_norm)
+        self._damping = 0.0       # Levenberg-Marquardt damping carried between iterations
         self.device = self.shells[0].device
 
         # Global dof layout: one block per shell, [node coords..., edge rotations...]
@@ -130,7 +136,7 @@ class NewtonSolver:
         f_internal = R[self._free_t].norm().item()
 
         # Fluid pressure
-        U, c = [], []
+        U, c, closed = [], [], []
         f_pressure = torch.zeros_like(R)
         for v in self.fluid_volumes:
             dV = v.compute_delta_volume()
@@ -148,6 +154,7 @@ class NewtonSolver:
             if tangent and dP != 0.0:
                 U.append(g_vol[self._free_t].cpu().numpy())
                 c.append(-dP)
+                closed.append((v, dV))
         R -= f_pressure
 
         # Contact
@@ -187,24 +194,8 @@ class NewtonSolver:
             out["K"] = sp.coo_matrix((val[keep], (r[keep], col[keep])), shape=(self.n_free, self.n_free)).tocsc()
             out["U"] = np.stack(U, axis=1) if U else np.zeros((self.n_free, 0))
             out["c"] = np.asarray(c)
+            out["closed"] = closed  # (volume, dV) for each column of U
         return out
-
-    # -----------------------------
-    # Linear solve
-    # -----------------------------
-
-    @staticmethod
-    def _solve_linear(K, U, c, rhs, damping):
-        A = K + damping * sp.identity(K.shape[0], format="csc") if damping > 0 else K
-        lu = spla.splu(A.tocsc())
-        y = lu.solve(rhs)
-        if U.shape[1]:
-            Z = lu.solve(U)
-            S = np.diag(1.0 / c) + U.T @ Z
-            y = y - Z @ np.linalg.solve(S, U.T @ y)
-        if not np.all(np.isfinite(y)):
-            raise np.linalg.LinAlgError("non-finite Newton step")
-        return y
 
     # -----------------------------
     # Newton iterations for one load level
@@ -212,61 +203,135 @@ class NewtonSolver:
 
     def newton(self, load_factor: float):
         """Returns (converged, iterations) and leaves the shells in the final state."""
-        damping_rel = 0.0
+        damping = self._damping
         for iteration in range(1, self.max_iterations + 1):
             state = self.evaluate(load_factor, tangent=True)
             R = state["residual"]
             r_norm = R.norm().item()
             tol = self.atol + self.rtol * state["reference_force"]
             if self.verbose:
-                print(f"    it {iteration:2d}  |R| = {r_norm:.3e}  (tol {tol:.1e})  damping {damping_rel:.1e}")
+                print(f"    it {iteration:2d}  |R| = {r_norm:.3e}  (tol {tol:.1e})  damping {damping:.1e}")
             if self.callback is not None:
                 self.callback(load_factor, iteration, r_norm)
             if r_norm <= tol:
+                self._damping = damping
                 return True, iteration - 1
 
             K, U, c = state["K"], state["U"], state["c"]
-            diag_scale = max(np.abs(K.diagonal()).mean(), 1e-300)
-            rhs = -R.cpu().numpy()
+            diag = K.diagonal()
+            scale = max(np.abs(diag).mean(), 1e-300)
+            gradient = R.cpu().numpy()
             u0 = self.get_u().clone()
 
-            while True:
+            # 1-2) Newton step, then increasingly damped Newton steps
+            accepted = False
+            for attempt in range(4):
                 try:
-                    du = self._solve_linear(K, U, c, rhs, damping_rel * diag_scale)
+                    tangent = _Tangent(K, U, c, damping * scale)
+                    step = tangent.solve(-gradient)
                 except (RuntimeError, np.linalg.LinAlgError):
-                    du = None
-                if du is not None and damping_rel == 0.0 and np.abs(du).max() <= self.step_tol * self.length_scale:
-                    return True, iteration  # residual is at its round-off floor
-                if du is not None and self._line_search(u0, du, state, load_factor):
-                    damping_rel = damping_rel * 0.1 if damping_rel > 1e-10 else 0.0
-                    break
+                    tangent = step = None
+                if step is not None:
+                    if damping == 0.0 and np.abs(step).max() <= self.step_tol * self.length_scale:
+                        self._damping = damping
+                        return True, iteration  # residual is at its round-off floor
+                    alpha = self._line_search(u0, step, state, load_factor, tangent)
+                    if alpha:
+                        accepted = True
+                        if attempt == 0 and alpha == 1.0:
+                            damping = damping * 0.1 if damping > 1e-9 else 0.0
+                        break
+                damping = max(10.0 * damping, 1e-6)
+
+            # 3) first-order fallback: preconditioned steepest descent
+            if not accepted:
                 self.set_u(u0)
-                damping_rel = max(10.0 * damping_rel, 1e-8)
-                if damping_rel > 1e8:
+                precondition = np.abs(diag) + (U ** 2 @ np.abs(c) if U.shape[1] else 0.0) + 1e-8 * scale
+                if not self._line_search(u0, -gradient / precondition, state, load_factor, None,
+                                         max_backtracks=40):
+                    self.set_u(u0)
+                    self._damping = damping
                     return False, iteration
+                if self.verbose:
+                    print("      (gradient step)")
+        self._damping = damping
         return False, self.max_iterations
 
-    def _line_search(self, u0, du, state, load_factor, max_halvings: int = 8):
-        du = torch.as_tensor(du, dtype=DTYPE, device=self.device)
-        biggest = du[self._free_is_coord].abs().max().item() if self._free_is_coord.any() else 0.0
+    def _line_search(self, u0, step, state, load_factor, tangent, max_backtracks: int = 16):
+        """
+        Backtracking line search on the potential energy. Returns the accepted step length, or 0.
+        With a tangent factorisation, trial points get the second-order correction that restores
+        the closed-chamber volumes to their linearised values.
+        """
+        step = torch.as_tensor(step, dtype=DTYPE, device=self.device)
+        biggest = step[self._free_is_coord].abs().max().item() if self._free_is_coord.any() else 0.0
         if biggest > self.max_step:
-            du = du * (self.max_step / biggest)
+            step = step * (self.max_step / biggest)
+        gradient = state["residual"]
+        slope = torch.dot(gradient, step).item()
+        if not slope < 0:
+            return 0.0
 
-        # The potential energy is the merit function. Accepting on residual decrease as well would
-        # let the iteration cycle (e.g. a node flipping in and out of contact), so the residual is
-        # only used where energy differences are lost in round-off, close to the solution.
-        slope = torch.dot(state["residual"], du).item()
-        e0, r0 = state["energy"], state["residual"].norm().item()
+        e0, r0 = state["energy"], gradient.norm().item()
         noise = 1e-12 * (abs(e0) + state["reference_force"] * self.length_scale)
+        closed = state.get("closed", []) if tangent is not None else []
+        if closed:
+            step_np = step.cpu().numpy()
+            linear_rate = state["U"].T @ step_np  # d(dV)/d(alpha) of each closed chamber
+
         alpha = 1.0
-        for _ in range(max_halvings + 1):
+        for _ in range(max_backtracks):
             u = u0.clone()
-            u[self._free_t] += alpha * du
+            u[self._free_t] += alpha * step
             self.set_u(u)
+            if closed:
+                error = np.array([v.compute_delta_volume() - (dV + alpha * rate)
+                                  for (v, dV), rate in zip(closed, linear_rate)])
+                correction = tangent.volume_correction(error)
+                if np.all(np.isfinite(correction)):
+                    u[self._free_t] += torch.as_tensor(correction, dtype=DTYPE, device=self.device)
+                    self.set_u(u)
             trial = self.evaluate(load_factor, tangent=False)
-            if slope < 0 and trial["energy"] <= e0 + 1e-4 * alpha * slope:
-                return True
-            if abs(trial["energy"] - e0) <= noise and trial["residual"].norm().item() < r0:
-                return True
-            alpha *= 0.5
-        return False
+            energy = trial["energy"]
+            if energy <= e0 + 1e-4 * alpha * slope:
+                return alpha
+            if abs(energy - e0) <= noise and trial["residual"].norm().item() < r0:
+                return alpha
+            # minimiser of the quadratic through phi(0), phi'(0) and phi(alpha), safeguarded
+            if np.isfinite(energy):
+                curvature = energy - e0 - slope * alpha
+                guess = -slope * alpha ** 2 / (2.0 * curvature) if curvature > 0 else 0.5 * alpha
+                alpha = min(max(guess, 0.1 * alpha), 0.5 * alpha)
+            else:
+                alpha *= 0.1
+            if alpha < 1e-10:
+                break
+        return 0.0
+
+
+class _Tangent:
+    """
+    Factorised tangent: sparse LU of K (+ damping I), with the dense closed-chamber terms
+    U diag(c) U^T added through the Sherman-Morrison-Woodbury identity.
+    """
+
+    def __init__(self, K, U, c, damping=0.0):
+        A = K + damping * sp.identity(K.shape[0], format="csc") if damping > 0 else K
+        self.lu = spla.splu(A.tocsc())
+        self.U, self.c = U, c
+        if U.shape[1]:
+            self.Z = self.lu.solve(U)                   # A^-1 U
+            self.UZ = U.T @ self.Z
+            self.S = np.diag(1.0 / c) + self.UZ
+
+    def solve(self, rhs):
+        y = self.lu.solve(rhs)
+        if self.U.shape[1]:
+            y = y - self.Z @ np.linalg.solve(self.S, self.U.T @ y)
+        if not np.all(np.isfinite(y)):
+            raise np.linalg.LinAlgError("non-finite Newton step")
+        return y
+
+    def volume_correction(self, error):
+        """Smallest correction (in the A-norm) that changes the closed-chamber volumes by -error."""
+        return -self.Z @ np.linalg.solve(self.UZ, error)
