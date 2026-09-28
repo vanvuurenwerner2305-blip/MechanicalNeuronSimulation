@@ -1,0 +1,399 @@
+"""Dock panels: model tree, part properties, solver settings, results."""
+from qtpy.QtCore import QLocale, Qt, Signal
+from qtpy.QtGui import QColor, QDoubleValidator, QIcon, QPixmap
+from qtpy.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QFrame,
+                            QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QPushButton, QSlider,
+                            QSpinBox, QTableWidget, QTableWidgetItem, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+                            QWidget)
+
+from .project import CHAMBER, DEFORMABLE, ROLE_COLORS, ROLE_FIELDS, ROLE_HELP, ROLES, SOLVER_FIELDS
+from .viewport import RESULT_FIELDS
+
+
+def role_icon(role, size=12):
+    pixmap = QPixmap(size, size)
+    pixmap.fill(QColor(ROLE_COLORS[role]))
+    return QIcon(pixmap)
+
+
+def fmt(value):
+    return f"{value:.6g}"
+
+
+# -----------------------------
+# Model tree
+# -----------------------------
+
+class ModelTree(QTreeWidget):
+    selection_changed = Signal(list)
+    visibility_changed = Signal(int, bool)
+    role_requested = Signal(list, str)
+    show_only_requested = Signal(list)
+    show_all_requested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setHeaderLabels(["Part", "Role"])
+        self.setRootIsDecorated(False)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.itemSelectionChanged.connect(self._emit_selection)
+        self.itemChanged.connect(self._item_changed)
+        self.customContextMenuRequested.connect(self._context_menu)
+        self._updating = False
+
+    def populate(self, parts):
+        self._updating = True
+        self.clear()
+        for i, part in enumerate(parts):
+            item = QTreeWidgetItem([part.name, part.role])
+            item.setData(0, Qt.UserRole, i)
+            item.setIcon(1, role_icon(part.role))
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(0, Qt.Checked if part.visible else Qt.Unchecked)
+            item.setToolTip(0, "Tick to show, untick to hide")
+            self.addTopLevelItem(item)
+        self._updating = False
+
+    def refresh(self, parts):
+        self._updating = True
+        for i in range(self.topLevelItemCount()):
+            item, part = self.topLevelItem(i), parts[i]
+            item.setText(1, part.role)
+            item.setIcon(1, role_icon(part.role))
+            item.setCheckState(0, Qt.Checked if part.visible else Qt.Unchecked)
+        self._updating = False
+
+    def select(self, indices):
+        self._updating = True
+        for i in range(self.topLevelItemCount()):
+            self.topLevelItem(i).setSelected(i in indices)
+        if indices:
+            self.scrollToItem(self.topLevelItem(min(indices)))
+        self._updating = False
+
+    def selected_indices(self):
+        return sorted(item.data(0, Qt.UserRole) for item in self.selectedItems())
+
+    def _emit_selection(self):
+        if not self._updating:
+            self.selection_changed.emit(self.selected_indices())
+
+    def _item_changed(self, item, column):
+        if not self._updating and column == 0:
+            self.visibility_changed.emit(item.data(0, Qt.UserRole), item.checkState(0) == Qt.Checked)
+
+    def _context_menu(self, pos):
+        indices = self.selected_indices()
+        if not indices:
+            return
+        menu = QMenu(self)
+        assign = menu.addMenu("Assign role")
+        for role in ROLES:
+            action = assign.addAction(role_icon(role), role)
+            action.triggered.connect(lambda _=False, r=role: self.role_requested.emit(indices, r))
+        menu.addSeparator()
+        menu.addAction("Show only these").triggered.connect(lambda: self.show_only_requested.emit(indices))
+        menu.addAction("Show all").triggered.connect(self.show_all_requested.emit)
+        menu.exec(self.viewport().mapToGlobal(pos))
+
+
+# -----------------------------
+# Generic property form
+# -----------------------------
+
+class FieldForm(QWidget):
+    """Form generated from project.Field descriptors, editing a dict (or several dicts at once)."""
+    edited = Signal(str, object)  # key, value
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.layout_ = QFormLayout(self)
+        self.layout_.setContentsMargins(0, 0, 0, 0)
+        self.layout_.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
+    def build(self, fields, values: dict, context: dict = None):
+        while self.layout_.rowCount():
+            self.layout_.removeRow(0)
+        context = dict(context or {}, **values)
+        for f in fields:
+            if f.visible_if and context.get(f.visible_if[0]) not in f.visible_if[1]:
+                continue
+            value = values.get(f.key, f.default)
+            if f.kind == "choice":
+                widget = QComboBox()
+                widget.addItems(list(f.choices))
+                widget.setCurrentText(str(value))
+                widget.currentTextChanged.connect(lambda v, key=f.key: self.edited.emit(key, v))
+            elif f.kind == "int":
+                widget = QSpinBox()
+                widget.setRange(int(f.minimum), int(f.maximum))
+                widget.setValue(int(value))
+                widget.editingFinished.connect(lambda w=widget, key=f.key: self.edited.emit(key, w.value()))
+            else:
+                widget = QLineEdit(fmt(float(value)) if value is not None else "")
+                validator = QDoubleValidator(f.minimum, f.maximum, 12)
+                validator.setNotation(QDoubleValidator.ScientificNotation)
+                validator.setLocale(QLocale.c())
+                widget.setValidator(validator)
+                widget.editingFinished.connect(lambda w=widget, key=f.key: self._float_edited(key, w))
+            if f.tooltip:
+                widget.setToolTip(f.tooltip)
+            row = widget
+            if f.unit:
+                row = QWidget()
+                h = QHBoxLayout(row)
+                h.setContentsMargins(0, 0, 0, 0)
+                h.addWidget(widget, 1)
+                unit = QLabel(f.unit)
+                unit.setMinimumWidth(52)
+                h.addWidget(unit)
+            label = QLabel(f.label)
+            if f.tooltip:
+                label.setToolTip(f.tooltip)
+            self.layout_.addRow(label, row)
+
+    def _float_edited(self, key, widget):
+        text = widget.text().replace(",", ".")
+        try:
+            self.edited.emit(key, float(text))
+        except ValueError:
+            pass
+
+
+# -----------------------------
+# Part properties
+# -----------------------------
+
+class PropertyPanel(QWidget):
+    role_changed = Signal(list, str)
+    props_changed = Signal(list, str, object)  # indices, key, value
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        self.title = QLabel("Select a part in the view or the model tree.")
+        self.title.setWordWrap(True)
+        self.title.setStyleSheet("font-weight: 600; font-size: 13px;")
+        layout.addWidget(self.title)
+
+        self.info = QLabel()
+        self.info.setWordWrap(True)
+        self.info.setStyleSheet("color: #555;")
+        layout.addWidget(self.info)
+
+        self.role_box = QGroupBox("Role")
+        rl = QVBoxLayout(self.role_box)
+        self.role_combo = QComboBox()
+        for role in ROLES:
+            self.role_combo.addItem(role_icon(role), role)
+        self.role_combo.activated.connect(self._role_activated)
+        rl.addWidget(self.role_combo)
+        self.role_help = QLabel()
+        self.role_help.setWordWrap(True)
+        self.role_help.setStyleSheet("color: #555;")
+        rl.addWidget(self.role_help)
+        layout.addWidget(self.role_box)
+
+        self.props_box = QGroupBox("Properties")
+        pl = QVBoxLayout(self.props_box)
+        self.form = FieldForm()
+        self.form.edited.connect(self._edited)
+        pl.addWidget(self.form)
+        layout.addWidget(self.props_box)
+
+        self.coupling_box = QGroupBox("Pressure acts on")
+        cl = QVBoxLayout(self.coupling_box)
+        self.coupling_label = QLabel()
+        self.coupling_label.setWordWrap(True)
+        cl.addWidget(self.coupling_label)
+        layout.addWidget(self.coupling_box)
+        layout.addStretch(1)
+
+        self.indices, self.parts, self.bodies = [], [], []
+        self.set_selection([], [], [])
+
+    def set_selection(self, indices, parts, bodies, couplings_text=None):
+        self.indices, self.parts, self.bodies = list(indices), parts, bodies
+        has = bool(self.indices)
+        self.role_box.setVisible(has)
+        self.props_box.setVisible(False)
+        self.coupling_box.setVisible(False)
+        if not has:
+            self.title.setText("Select a part in the view or the model tree.\nCtrl+click selects several.")
+            self.info.setText("")
+            return
+
+        selected = [parts[i] for i in self.indices]
+        if len(selected) == 1:
+            body = bodies[self.indices[0]]
+            self.title.setText(selected[0].name)
+            size = " × ".join(f"{d:.4g}" for d in body.size)
+            self.info.setText(f"Volume {body.volume:.6g} mm³ · bounding box {size} mm · "
+                              f"thin-body thickness ≈ {body.thickness_estimate:.3g} mm")
+        else:
+            self.title.setText(f"{len(selected)} parts selected")
+            self.info.setText(", ".join(p.name for p in selected))
+
+        roles = {p.role for p in selected}
+        role = roles.pop() if len(roles) == 1 else None
+        self.role_combo.blockSignals(True)
+        if role is None:
+            self.role_combo.setCurrentIndex(-1)
+            self.role_help.setText("Mixed roles - choose one to assign it to all selected parts.")
+        else:
+            self.role_combo.setCurrentText(role)
+            self.role_help.setText(ROLE_HELP[role])
+        self.role_combo.blockSignals(False)
+
+        if role is not None and ROLE_FIELDS[role]:
+            self.props_box.setVisible(True)
+            self.form.build(ROLE_FIELDS[role], selected[0].props, {"__role__": role})
+        if role == CHAMBER and couplings_text is not None:
+            self.coupling_box.setVisible(True)
+            self.coupling_label.setText(couplings_text)
+
+    def _role_activated(self, _):
+        if self.indices:
+            self.role_changed.emit(self.indices, self.role_combo.currentText())
+
+    def _edited(self, key, value):
+        if self.indices:
+            self.props_changed.emit(self.indices, key, value)
+
+
+# -----------------------------
+# Solver settings
+# -----------------------------
+
+class SolverPanel(QWidget):
+    changed = Signal(str, object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        box = QGroupBox("Static Newton-Raphson solver")
+        bl = QVBoxLayout(box)
+        self.form = FieldForm()
+        self.form.edited.connect(self.changed.emit)
+        bl.addWidget(self.form)
+        note = QLabel("All chamber pressures are ramped from zero to their set values over the load "
+                      "steps; steps are subdivided automatically when Newton does not converge.\n\n"
+                      "Units: mm, N, MPa (pressures entered in kPa).")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #555;")
+        bl.addWidget(note)
+        layout.addWidget(box)
+        layout.addStretch(1)
+
+    def load(self, settings):
+        self.form.build(SOLVER_FIELDS, vars(settings))
+
+
+# -----------------------------
+# Results
+# -----------------------------
+
+class ResultsPanel(QWidget):
+    display_changed = Signal()
+    export_vtk = Signal()
+    export_csv = Signal()
+    screenshot = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        self.status = QLabel("No results yet. Press Solve (F5).")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        display = QGroupBox("Display")
+        form = QFormLayout(display)
+        self.field = QComboBox()
+        self.field.addItems(RESULT_FIELDS)
+        self.field.currentTextChanged.connect(lambda _: self.display_changed.emit())
+        form.addRow("Field", self.field)
+        self.scale = QDoubleSpinBox()
+        self.scale.setRange(0.0, 1000.0)
+        self.scale.setDecimals(2)
+        self.scale.setValue(1.0)
+        self.scale.setSingleStep(0.25)
+        self.scale.valueChanged.connect(lambda _: self.display_changed.emit())
+        form.addRow("Deformation scale", self.scale)
+        step_row = QWidget()
+        sl = QHBoxLayout(step_row)
+        sl.setContentsMargins(0, 0, 0, 0)
+        self.step = QSlider(Qt.Horizontal)
+        self.step.valueChanged.connect(self._step_changed)
+        self.step_label = QLabel("")
+        self.step_label.setMinimumWidth(60)
+        sl.addWidget(self.step, 1)
+        sl.addWidget(self.step_label)
+        form.addRow("Load step", step_row)
+        self.fixed_range = QCheckBox("Same colour range for all load steps")
+        self.fixed_range.setChecked(True)
+        self.fixed_range.toggled.connect(lambda _: self.display_changed.emit())
+        form.addRow(self.fixed_range)
+        layout.addWidget(display)
+
+        chambers = QGroupBox("Chambers")
+        cl = QVBoxLayout(chambers)
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Chamber", "P [kPa]", "ΔV [mm³]", "V [mm³]"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        cl.addWidget(self.table)
+        self.shell_label = QLabel()
+        self.shell_label.setWordWrap(True)
+        cl.addWidget(self.shell_label)
+        layout.addWidget(chambers, 1)
+
+        buttons = QHBoxLayout()
+        for text, signal in (("Export VTK…", self.export_vtk), ("Export CSV…", self.export_csv),
+                             ("Screenshot…", self.screenshot)):
+            b = QPushButton(text)
+            b.clicked.connect(signal.emit)
+            buttons.addWidget(b)
+        layout.addLayout(buttons)
+        self.history = []
+
+    def set_results(self, history, status_text):
+        self.history = history
+        self.status.setText(status_text)
+        self.step.blockSignals(True)
+        self.step.setRange(0, max(0, len(history) - 1))
+        self.step.setValue(len(history) - 1)
+        self.step.blockSignals(False)
+        self._update_step_label()
+
+    def current_step(self):
+        return self.history[self.step.value()] if self.history else None
+
+    def _step_changed(self, _):
+        self._update_step_label()
+        self.display_changed.emit()
+
+    def _update_step_label(self):
+        step = self.current_step()
+        self.step_label.setText(f"{step['load_factor']:.0%}" if step else "")
+
+    def set_table(self, rows, shell_text=""):
+        self.table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            for c, value in enumerate(row):
+                item = QTableWidgetItem(value if isinstance(value, str) else fmt(value))
+                if c:
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.table.setItem(r, c, item)
+        self.shell_label.setText(shell_text)
+
+
+def separator():
+    line = QFrame()
+    line.setFrameShape(QFrame.HLine)
+    line.setFrameShadow(QFrame.Sunken)
+    return line

@@ -12,6 +12,8 @@ points out of the chamber. Pressure is a function of dV, and the pressure load o
 shells is P * d(dV)/dx, which is exactly the (follower) pressure load and gives a
 symmetric tangent: P * d2V/dx2 + P'(dV) * g g^T with g = d(dV)/dx.
 """
+import inspect
+
 import numpy as np
 import torch
 from torch.func import vmap, grad, hessian
@@ -45,14 +47,18 @@ class FluidVolume:
         """
         P0             : pressure at the rest volume.
         bulk_stiffness : K in P = P0 - K * dV (dP/dV). K = 0 gives a constant pressure reservoir.
-        pressure_law   : optional callable dV (torch scalar) -> P (torch scalar), replacing the
-                         linear law, e.g. an ideal gas lambda dV: P0 * V0 / (V0 + dV).
-                         Must be differentiable with torch.
+        pressure_law   : optional callable dV -> P or (dV, P0) -> P (torch scalars), replacing
+                         the linear law, e.g. an ideal gas lambda dV, P0: P0 * V0 / (V0 + dV).
+                         Must be differentiable with torch. Taking P0 as an argument lets P0 be
+                         changed later (sweeps, warm starts).
         initial_volume : optional rest volume, only used for reporting `volume`.
         """
         self.P0 = P0
         self.bulk_stiffness = bulk_stiffness
         self.pressure_law = pressure_law
+        self._law_takes_P0 = pressure_law is not None and len(inspect.signature(pressure_law).parameters) >= 2
+        self.start_P0 = None   # P0 the current load path starts from (None: from zero pressure)
+        self.solved_P0 = None  # P0 of the last converged solve
         self.initial_volume = initial_volume
         self.color = color
         self.name = name
@@ -86,24 +92,46 @@ class FluidVolume:
     # Pressure law
     # -----------------------------
 
-    def pressure(self, dV: float) -> float:
-        if self.pressure_law is None:
-            return self.P0 - self.bulk_stiffness * dV
-        return float(self.pressure_law(torch.tensor(dV, dtype=DTYPE)))
+    def _law(self, dV, P0):
+        if self._law_takes_P0:
+            return self.pressure_law(dV, P0)
+        return self.pressure_law(dV)
 
-    def pressure_slope(self, dV: float) -> float:
+    def pressure(self, dV: float, P0: float = None) -> float:
+        P0 = self.P0 if P0 is None else P0
+        if self.pressure_law is None:
+            return P0 - self.bulk_stiffness * dV
+        return float(self._law(torch.tensor(dV, dtype=DTYPE), P0))
+
+    def pressure_slope(self, dV: float, P0: float = None) -> float:
+        P0 = self.P0 if P0 is None else P0
         if self.pressure_law is None:
             return -self.bulk_stiffness
         t = torch.tensor(dV, dtype=DTYPE, requires_grad=True)
-        (slope,) = torch.autograd.grad(self.pressure_law(t), t)
+        (slope,) = torch.autograd.grad(self._law(t, P0), t)
         return float(slope)
 
-    def pressure_potential(self, dV: float) -> float:
+    def pressure_potential(self, dV: float, P0: float = None) -> float:
         """Integral of P from 0 to dV (the work done by the fluid)."""
+        P0 = self.P0 if P0 is None else P0
         if self.pressure_law is None:
-            return self.P0 * dV - 0.5 * self.bulk_stiffness * dV ** 2
+            return P0 * dV - 0.5 * self.bulk_stiffness * dV ** 2
         s = 0.5 * dV * (_GAUSS_X + 1.0)
-        return 0.5 * dV * sum(w * self.pressure(si) for si, w in zip(s, _GAUSS_W))
+        return 0.5 * dV * sum(w * self.pressure(si, P0) for si, w in zip(s, _GAUSS_W))
+
+    def load_state(self, dV: float, load_factor: float):
+        """
+        (P, dP/dV, potential) along the load path. A fresh solve ramps the pressure from zero:
+        lambda * P(dV). A warm-started solve blends from the previously solved P0 to the new one:
+        (1 - lambda) * P(dV; P0_start) + lambda * P(dV; P0).
+        """
+        lam = load_factor
+        P, slope, work = lam * self.pressure(dV), lam * self.pressure_slope(dV), lam * self.pressure_potential(dV)
+        if self.start_P0 is not None and lam < 1.0:
+            P += (1 - lam) * self.pressure(dV, self.start_P0)
+            slope += (1 - lam) * self.pressure_slope(dV, self.start_P0)
+            work += (1 - lam) * self.pressure_potential(dV, self.start_P0)
+        return P, slope, work
 
     # -----------------------------
     # State
@@ -111,10 +139,12 @@ class FluidVolume:
 
     def update(self, load_factor: float = 1.0):
         self.delta_volume = self.compute_delta_volume()
-        self.P = load_factor * self.pressure(self.delta_volume)
+        self.P = self.load_state(self.delta_volume, load_factor)[0]
 
     def reset(self):
         self.delta_volume = 0.0
+        self.start_P0 = None
+        self.solved_P0 = None
         self.P = self.pressure(0.0)
         self.pressure_hist = []
         self.volume_hist = []

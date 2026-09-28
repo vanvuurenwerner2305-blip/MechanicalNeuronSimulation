@@ -47,7 +47,7 @@ class NewtonSolver:
     def __init__(self, shells, fluid_volumes, obstacles,
                  contact_stiffness: float, contact_offset: float = 0.0,
                  rtol: float = 1e-8, atol: float = 1e-12, step_tol: float = 1e-10,
-                 max_iterations: int = 40, max_step: float = None, verbose: bool = False):
+                 max_iterations: int = 40, max_step: float = None, verbose: bool = False, callback=None):
         self.shells = list(shells)
         self.fluid_volumes = list(fluid_volumes)
         self.field = ObstacleField(obstacles) if obstacles else None
@@ -56,6 +56,7 @@ class NewtonSolver:
         self.rtol, self.atol, self.step_tol = rtol, atol, step_tol
         self.max_iterations = max_iterations
         self.verbose = verbose
+        self.callback = callback  # called as callback(load_factor, iteration, residual_norm)
         self.device = self.shells[0].device
 
         # Global dof layout: one block per shell, [node coords..., edge rotations...]
@@ -72,6 +73,19 @@ class NewtonSolver:
         is_coord = np.concatenate([np.r_[np.ones(3 * s.n_nodes, bool), np.zeros(s.n_edges, bool)]
                                    for s in self.shells])
         self._free_is_coord = torch.as_tensor(is_coord[self.free_dofs], device=self.device)
+
+        # Contact offset per free node: the shell's own `contact_offset` (e.g. half its thickness)
+        # or the global one, reduced where the rest geometry is already closer than that
+        # (nodes next to the part a shell is attached to must not start in contact).
+        self._contact_nodes, self._contact_offsets = {}, {}
+        for s in self.shells:
+            nodes = torch.nonzero(~s.fixed).flatten()
+            offset = torch.full((len(nodes),), float(getattr(s, "contact_offset", None) or contact_offset),
+                                dtype=DTYPE, device=self.device)
+            if self.field is not None and len(nodes):
+                rest_sd, _ = self.field.signed_distance(s.X[nodes], max_distance=offset.max().item() + 1e-9)
+                offset = torch.minimum(offset, rest_sd.clamp_min(0.0))
+            self._contact_nodes[id(s)], self._contact_offsets[id(s)] = nodes, offset
 
         X = torch.cat([s.X for s in self.shells])
         self.length_scale = (X.max(0).values - X.min(0).values).norm().item()
@@ -120,9 +134,8 @@ class NewtonSolver:
         f_pressure = torch.zeros_like(R)
         for v in self.fluid_volumes:
             dV = v.compute_delta_volume()
-            P = load_factor * v.pressure(dV)
-            dP = load_factor * v.pressure_slope(dV)
-            energy -= load_factor * v.pressure_potential(dV)
+            P, dP, work = v.load_state(dV, load_factor)
+            energy -= work
 
             g_vol = torch.zeros_like(R)
             for shell, side, _ in v.boundaries:
@@ -141,9 +154,12 @@ class NewtonSolver:
         f_contact = torch.zeros_like(R)
         if self.field is not None and self.contact_stiffness > 0:
             for s in self.shells:
-                nodes = torch.nonzero(~s.fixed).flatten()
-                sd, normal = self.field.signed_distance(s.x[nodes], max_distance=abs(self.contact_offset) + 1e-9)
-                gap = sd - self.contact_offset
+                nodes, offset = self._contact_nodes[id(s)], self._contact_offsets[id(s)]
+                if not len(nodes):
+                    continue
+                sd, normal, curvature = self.field.signed_distance(
+                    s.x[nodes], max_distance=offset.max().item() + 1e-9, hessian=True)
+                gap = sd - offset
                 active = gap < 0
                 if not active.any():
                     continue
@@ -153,7 +169,8 @@ class NewtonSolver:
                 dofs = self.dof_offset[id(s)] + 3 * nodes[:, None] + torch.arange(3, device=self.device)
                 f_contact.index_add_(0, dofs.reshape(-1), ((ka * gap)[:, None] * normal).reshape(-1))
                 if tangent:
-                    add_block(dofs, ka[:, None, None] * normal[:, :, None] * normal[:, None, :])
+                    H = normal[:, :, None] * normal[:, None, :] + gap[:, None, None] * curvature[active]
+                    add_block(dofs, ka[:, None, None] * H)
         R += f_contact
 
         out = {
@@ -203,6 +220,8 @@ class NewtonSolver:
             tol = self.atol + self.rtol * state["reference_force"]
             if self.verbose:
                 print(f"    it {iteration:2d}  |R| = {r_norm:.3e}  (tol {tol:.1e})  damping {damping_rel:.1e}")
+            if self.callback is not None:
+                self.callback(load_factor, iteration, r_norm)
             if r_norm <= tol:
                 return True, iteration - 1
 

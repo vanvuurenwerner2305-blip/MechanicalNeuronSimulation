@@ -1,0 +1,220 @@
+"""
+Turns a CAD model plus a Project into a membrane_sim.Environment.
+
+  Membrane / Shell  -> Shell on the mid-surface of the thin solid (bending off / on)
+  Rigid body        -> Obstacle (closed surface mesh)
+  Fluid chamber     -> FluidVolume, coupled to every membrane/shell it touches
+
+Coupling detection: from every mid-surface triangle a probe point is placed just beyond
+each face of the thin solid (half the thickness plus a margin, along +-normal). A chamber
+acts on the side whose probes fall inside it (generalised winding number of its mesh).
+Units in the solver: mm, N, MPa.
+"""
+from dataclasses import dataclass, field
+
+import numpy as np
+import torch
+
+import membrane_sim as ms
+from membrane_sim.contact import ObstacleField, _winding_number
+
+from .project import (CHAMBER, CLAMPED, DEFORMABLE, IDEAL_GAS, IGNORE, LINEAR, MEMBRANE, NEO_HOOKEAN, RIGID,
+                      ROLE_COLORS, SHELL, TOUCHING_RIGID, UNASSIGNED)
+
+P_ATM = 0.101325  # MPa
+KPA = 1e-3        # kPa -> MPa
+
+
+# -----------------------------
+# Meshing (runs where gmsh may be used)
+# -----------------------------
+
+@dataclass
+class MeshData:
+    sizes: dict
+    surfaces: dict                                    # body index -> SurfaceMesh
+    midsurfaces: dict = field(default_factory=dict)   # body index -> MidSurface (deformable parts)
+
+    def element_count(self, parts):
+        n = 0
+        for i, mesh in self.surfaces.items():
+            n += len(self.midsurfaces[i].faces) if i in self.midsurfaces else 0
+        return n
+
+
+def auto_mesh_size(body, role):
+    if role in DEFORMABLE:
+        in_plane = np.sort(body.size)[::-1][:2]
+        return float(in_plane.min() / 15.0)
+    return body.diagonal / (12.0 if role == RIGID else 10.0)
+
+
+def mesh_sizes(cad, project):
+    sizes = {}
+    for body, part in zip(cad.bodies, project.parts):
+        size = float(part.props.get("mesh_size", 0.0) or 0.0)
+        sizes[body.index] = size if size > 0 else auto_mesh_size(body, part.role)
+    return sizes
+
+
+def generate_mesh(cad, project) -> MeshData:
+    sizes = mesh_sizes(cad, project)
+    data = MeshData(sizes, cad.mesh(sizes))
+    for body, part in zip(cad.bodies, project.parts):
+        if part.role in DEFORMABLE:
+            data.midsurfaces[body.index] = cad.midsurface(body, data.surfaces[body.index])
+    return data
+
+
+# -----------------------------
+# Environment
+# -----------------------------
+
+@dataclass
+class Coupling:
+    shell_index: int
+    side: int            # +1: chamber is behind the shell normal (pushes along +normal)
+    coverage: float      # fraction of the shell face that touches the chamber
+
+
+@dataclass
+class BuildResult:
+    env: ms.Environment
+    shells: dict                       # body index -> Shell
+    obstacles: dict                    # body index -> Obstacle
+    volumes: dict                      # body index -> FluidVolume
+    couplings: dict                    # chamber index -> [Coupling]
+    thickness: dict                    # body index -> thickness used (mm)
+    contact_stiffness: float
+    warnings: list = field(default_factory=list)
+
+    def solve(self, settings, callback=None, warm_start=False, load_steps=None):
+        if not warm_start:
+            self.env.reset()
+        return self.env.solve(load_steps=load_steps or settings.load_steps, max_iterations=settings.max_iterations,
+                              rtol=settings.tolerance, callback=callback, warm_start=warm_start)
+
+
+def chamber_pressure_law(props, initial_volume):
+    """(P0 [MPa], bulk stiffness [MPa/mm^3], pressure_law or None) for a chamber's properties."""
+    P0 = float(props.get("pressure", 0.0)) * KPA
+    model = props.get("model")
+    if model == IDEAL_GAS:
+        V0 = float(initial_volume)
+        return P0, 0.0, lambda dV, P0: (P_ATM + P0) * V0 / (V0 + dV) - P_ATM
+    if model == LINEAR:
+        return P0, float(props.get("stiffness", 0.0)) * KPA, None
+    return P0, 0.0, None
+
+
+def build_environment(cad, mesh: MeshData, project) -> BuildResult:
+    parts = project.parts
+    bodies = cad.bodies
+    warnings = []
+
+    rigid = [i for i, p in enumerate(parts) if p.role == RIGID]
+    deformable = [i for i, p in enumerate(parts) if p.role in DEFORMABLE]
+    chambers = [i for i, p in enumerate(parts) if p.role == CHAMBER]
+    unassigned = [parts[i].name for i, p in enumerate(parts) if p.role == UNASSIGNED]
+    if not deformable:
+        raise ValueError("Assign at least one part as Membrane or Shell.")
+    missing = [parts[i].name for i in deformable if i not in mesh.midsurfaces]
+    if missing:
+        raise ValueError(f"Mesh is out of date for: {', '.join(missing)}. Generate the mesh again.")
+    if unassigned:
+        warnings.append(f"Unassigned parts are ignored: {', '.join(unassigned)}")
+
+    env = ms.Environment()
+
+    obstacles = {}
+    for i in rigid:
+        m = mesh.surfaces[i]
+        obstacles[i] = env.add_obstacle(m.vertices, m.faces, color=ROLE_COLORS[RIGID])
+    rigid_field = ObstacleField(list(obstacles.values())) if obstacles else None
+
+    shells, thickness = {}, {}
+    for i in deformable:
+        part, mid = parts[i], mesh.midsurfaces[i]
+        t = float(part.props.get("thickness", 0.0) or 0.0) or mid.thickness
+        thickness[i] = t
+        boundary = ms.boundary_nodes(mid.faces, len(mid.vertices))
+        fixed = boundary
+        if part.props.get("fixed_edges") == TOUCHING_RIGID:
+            if rigid_field is None:
+                warnings.append(f"{part.name}: no rigid bodies to attach to, all boundary edges fixed.")
+            else:
+                sd, _ = rigid_field.signed_distance(torch.as_tensor(mid.vertices), max_distance=t)
+                fixed = boundary & (sd.numpy() <= 0.75 * t + 1e-6 * bodies[i].diagonal)
+        if not fixed.any():
+            warnings.append(f"{part.name}: no fixed nodes - the part is free to move as a rigid body.")
+        shells[i] = env.add_membrane(
+            mid.vertices, mid.faces, thickness=t,
+            youngs_modulus=float(part.props["youngs_modulus"]),
+            poisson_ratio=float(part.props.get("poisson_ratio", 0.45)),
+            material="neo_hookean" if part.props.get("material", NEO_HOOKEAN) == NEO_HOOKEAN else "svk",
+            bending=part.role == SHELL,
+            pretension=float(part.props.get("pretension", 0.0)),
+            fixed=fixed,
+            boundary_rotation="clamped" if part.props.get("edge_rotation", CLAMPED) == CLAMPED else "free",
+            contact_offset=0.5 * t,
+            color=ROLE_COLORS[part.role], name=part.name)
+
+    volumes, couplings = {}, {}
+    for c in chambers:
+        part, body = parts[c], bodies[c]
+        P0, K, law = chamber_pressure_law(part.props, body.volume)
+        volume = env.add_fluid_volume(P0=P0, bulk_stiffness=K, pressure_law=law, initial_volume=body.volume,
+                                      name=part.name, color=ROLE_COLORS[CHAMBER])
+        volumes[c] = volume
+        couplings[c] = []
+        cm = mesh.surfaces[c]
+        tri = torch.as_tensor(cm.vertices[cm.faces])
+        for i in deformable:
+            side, coverage = _detect_side(mesh.midsurfaces[i], thickness[i], tri)
+            if side == 0:
+                continue
+            if side == 2:
+                warnings.append(f"{part.name} lies on both sides of {parts[i].name}; no net pressure, ignored.")
+                continue
+            volume.add_boundary(shells[i], side)
+            couplings[c].append(Coupling(i, side, coverage))
+            if coverage < 0.9:
+                warnings.append(f"{part.name} touches only {coverage:.0%} of {parts[i].name}; "
+                                f"its pressure is applied to the whole face.")
+        if not couplings[c]:
+            warnings.append(f"{part.name} does not touch any membrane or shell.")
+
+    for i in deformable:
+        if not shells[i].fluid_volumes:
+            warnings.append(f"{parts[i].name} is not loaded by any fluid chamber.")
+
+    k = project.solver.contact_stiffness
+    if not k:
+        p_ref = max([abs(v.P0) for v in volumes.values()] + [1.0 * KPA])
+        k = p_ref / (0.05 * min(thickness.values()))  # penetration ~5% of the thinnest part
+    env.contact_stiffness = k
+
+    return BuildResult(env, shells, obstacles, volumes, couplings, thickness, k, warnings)
+
+
+def _detect_side(mid, t, chamber_triangles, threshold=0.3):
+    """0: not touching, +1: chamber behind the normal, -1: in front, 2: both sides."""
+    V, F = mid.vertices, mid.faces
+    centroid = V[F].mean(axis=1)
+    n = np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]])
+    n /= np.linalg.norm(n, axis=1, keepdims=True)
+    reach = 0.5 * t + max(0.25 * t, 1e-3)
+    a, b, c = chamber_triangles[:, 0], chamber_triangles[:, 1], chamber_triangles[:, 2]
+    fractions = []
+    for sign in (+1, -1):
+        probes = torch.as_tensor(centroid + sign * reach * n)
+        inside = torch.cat([_winding_number(p, a, b, c) > 0.5 for p in probes.split(256)])
+        fractions.append(inside.double().mean().item())
+    front, behind = fractions
+    if front >= threshold and behind >= threshold:
+        return 2, max(front, behind)
+    if behind >= threshold:
+        return +1, behind
+    if front >= threshold:
+        return -1, front
+    return 0, 0.0

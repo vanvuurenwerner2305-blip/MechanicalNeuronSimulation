@@ -211,3 +211,56 @@ def test_extruded_nonconvex_polygon_is_closed_and_consistent():
     obstacle = ms.Obstacle(V, F)
     sd, _ = obstacle.signed_distance(torch.tensor([[1.0, 0.5, 0.0], [1.0, 1.5, 0.0]], dtype=torch.float64), 1.0)
     assert sd[0] < 0 < sd[1]
+
+
+def _brute_force_signed_distance(vertices, faces, points):
+    from membrane_sim.contact import _closest_point_pairs, _winding_number
+    V = torch.as_tensor(vertices, dtype=torch.float64)
+    tri = V[torch.as_tensor(faces)]
+    n, T = len(points), len(tri)
+    pi = torch.arange(n).repeat_interleave(T)
+    ti = torch.arange(T).repeat(n)
+    q, _ = _closest_point_pairs(points[pi], tri[ti, 0], tri[ti, 1], tri[ti, 2])
+    dist = ((points[pi] - q) ** 2).sum(-1).reshape(n, T).min(1).values.sqrt()
+    inside = _winding_number(points, tri[:, 0], tri[:, 1], tri[:, 2]) > 0.5
+    return torch.where(inside, -dist, dist)
+
+
+@pytest.mark.parametrize("shape", ["prism", "hollow_box"])
+def test_signed_distance_matches_brute_force(shape):
+    if shape == "prism":
+        poly = np.array([[0, 0], [4, 0], [4, 3], [2, 1], [0, 3]], dtype=float)
+        V, F = ms.extrude_polygon(poly, 0.0, 2.0)
+    else:  # box with an inner cavity, like a CAD frame around fluid chambers
+        Vo, Fo = ms.box_mesh((0, 0, 0), (4, 3, 2))
+        Vi, Fi = ms.box_mesh((1, 1, 0.5), (3, 2, 1.5))
+        V, F = np.vstack([Vo, Vi]), np.vstack([Fo, Fi[:, ::-1] + len(Vo)])
+    g = torch.Generator().manual_seed(3)
+    points = torch.rand(400, 3, generator=g, dtype=torch.float64) * torch.tensor([5.0, 4.0, 3.0]) - 0.5
+    sd, grad = ms.Obstacle(V, F).signed_distance(points, max_distance=10.0)
+    reference = _brute_force_signed_distance(V, F, points)
+    assert torch.allclose(sd, reference, atol=1e-10)
+    assert torch.allclose(grad.norm(dim=1), torch.ones(len(points), dtype=torch.float64))
+
+
+def test_warm_start_reaches_the_same_state_as_a_fresh_solve():
+    def build():
+        env = ms.Environment(contact_stiffness=1e3)
+        shell = env.add_disk_membrane((0, 0, 0), (0, 0, 1), 1.0, rings=6, thickness=0.05, youngs_modulus=1.0)
+        drive = env.add_fluid_volume(P0=0.01)
+        gas = env.add_fluid_volume(P0=0.0, pressure_law=lambda dV, P0: (0.1 + P0) * 2.0 / (2.0 + dV) - 0.1,
+                                   initial_volume=2.0)
+        shell.fluid_volume_contacts((drive, gas))
+        env.add_obstacle(*ms.box_mesh((-2, -2, 0.08), (2, 2, 1)))
+        return env, shell, drive, gas
+
+    env, shell, drive, gas = build()
+    assert env.solve().converged
+    drive.P0, gas.P0 = 0.02, 0.001
+    assert env.solve(load_steps=2, warm_start=True).converged
+
+    env2, shell2, drive2, gas2 = build()
+    drive2.P0, gas2.P0 = 0.02, 0.001
+    assert env2.solve().converged
+    assert torch.allclose(shell.x, shell2.x, atol=1e-7)
+    assert gas.P == pytest.approx(gas2.P, rel=1e-8)

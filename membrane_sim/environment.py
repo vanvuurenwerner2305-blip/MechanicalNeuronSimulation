@@ -81,22 +81,29 @@ class Environment:
 
     def solve(self, load_steps: int = 10, max_iterations: int = 40, rtol: float = 1e-8,
               atol: float = 1e-12, step_tol: float = 1e-10, max_step: float = None, min_load_increment: float = 1e-4,
-              verbose: bool = False) -> SolveResult:
+              verbose: bool = False, callback=None, warm_start: bool = False) -> SolveResult:
         """
         Find static equilibrium with all fluid pressures applied, ramping them from 0 to full
         over `load_steps` increments (cut automatically when Newton fails). Starts from the
         current shell positions, so call reset() first for a fresh solve.
+        callback(load_factor, iteration, residual_norm) is called every Newton iteration; raise
+        an exception from it to abort.
+        warm_start: continue from the last converged solution and ramp only the change in P0
+        (much faster for sweeps, where contact is already established).
         """
         start = time.time()
         k = self.contact_stiffness if self.contact_stiffness is not None else self.default_contact_stiffness()
         solver = NewtonSolver(self.membrane_list, self.fluid_volume_list, self.obstacle_list,
                               contact_stiffness=k, contact_offset=self.contact_offset,
                               rtol=rtol, atol=atol, step_tol=step_tol, max_iterations=max_iterations,
-                              max_step=max_step, verbose=verbose)
+                              max_step=max_step, verbose=verbose, callback=callback)
 
         lam, increment = 0.0, 1.0 / load_steps
         result = SolveResult(converged=False, load_factor=0.0)
-        if not self.history:
+        for volume in self.fluid_volume_list:
+            volume.start_P0 = volume.solved_P0 if warm_start else None
+        if not self.history or not warm_start:
+            self.history = []
             self._record(0.0)
 
         while lam < 1.0 - 1e-12:
@@ -125,6 +132,8 @@ class Environment:
         result.load_factor = lam
         for volume in self.fluid_volume_list:
             volume.update(lam)
+            if result.converged:
+                volume.solved_P0, volume.start_P0 = volume.P0, None
         self.last_result = result
         return result
 

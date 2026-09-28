@@ -103,6 +103,7 @@ class Shell:
                  pretension: float = 0.0,
                  fixed=None,
                  boundary_rotation: str = "clamped",
+                 contact_offset: float = None,
                  color: str = "red",
                  name: str = None,
                  device="cpu"):
@@ -117,10 +118,13 @@ class Shell:
         fixed             : bool mask or index list of pinned nodes. Default: all boundary nodes.
         boundary_rotation : "clamped" (boundary edges between pinned nodes keep their rest
                             slope) or "free" (hinged).
+        contact_offset    : distance the mid-surface keeps from obstacles, typically thickness / 2.
+                            None uses the Environment's contact_offset.
         """
         self.device = torch.device(device)
         self.color = color
         self.name = name
+        self.contact_offset = contact_offset
         self.faces_np = np.asarray(faces, dtype=np.int64)
         X_np = np.asarray(vertices, dtype=float)
         n_nodes = X_np.shape[0]
