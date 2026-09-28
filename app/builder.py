@@ -88,7 +88,21 @@ class BuildResult:
     contact_stiffness: float
     warnings: list = field(default_factory=list)
 
-    def solve(self, settings, callback=None, warm_start=False, load_steps=None):
+    auto_contact: bool = True
+
+    def set_contact_stiffness(self, pressure_ref=None):
+        """Automatic penalty stiffness: penetration ~5% of the thinnest part at pressure_ref
+        (default: the highest chamber pressure currently set)."""
+        if not self.auto_contact:
+            return
+        if pressure_ref is None:
+            pressure_ref = max(abs(v.P0) for v in self.volumes.values()) if self.volumes else 0.0
+        self.contact_stiffness = max(pressure_ref, 1.0 * KPA) / (0.05 * min(self.thickness.values()))
+        self.env.contact_stiffness = self.contact_stiffness
+
+    def solve(self, settings, callback=None, warm_start=False, load_steps=None, fixed_contact=False):
+        if not fixed_contact:
+            self.set_contact_stiffness()
         if not warm_start:
             self.env.reset()
         return self.env.solve(load_steps=load_steps or settings.load_steps, max_iterations=settings.max_iterations,
@@ -189,12 +203,10 @@ def build_environment(cad, mesh: MeshData, project) -> BuildResult:
             warnings.append(f"{parts[i].name} is not loaded by any fluid chamber.")
 
     k = project.solver.contact_stiffness
-    if not k:
-        p_ref = max([abs(v.P0) for v in volumes.values()] + [1.0 * KPA])
-        k = p_ref / (0.05 * min(thickness.values()))  # penetration ~5% of the thinnest part
     env.contact_stiffness = k
-
-    return BuildResult(env, shells, obstacles, volumes, couplings, thickness, k, warnings)
+    build = BuildResult(env, shells, obstacles, volumes, couplings, thickness, k, warnings, auto_contact=not k)
+    build.set_contact_stiffness()
+    return build
 
 
 def _detect_side(mid, t, chamber_triangles, threshold=0.3):

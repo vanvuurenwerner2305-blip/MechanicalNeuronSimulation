@@ -30,6 +30,10 @@ def run_sweep(worker, cad, project, mesh_data, a_index, a_values, b_index, b_val
         mesh_data = generate_mesh(cad, project)
     build = build_environment(cad, mesh_data, project)
     chambers = list(build.volumes.items())
+    # one contact stiffness for the whole sweep, sized for its highest pressure
+    p_max = max([abs(v.P0) for v in build.volumes.values()] + [abs(x) * KPA for x in a_values]
+                + ([abs(x) * KPA for x in b_values] if b_index is not None else []))
+    build.set_contact_stiffness(p_max)
     points = sweep_points(list(a_values), list(b_values) if b_index is not None else [None])
     first = True
     for k, (i, j, a, b) in enumerate(points):
@@ -39,9 +43,10 @@ def run_sweep(worker, cad, project, mesh_data, a_index, a_values, b_index, b_val
             build.volumes[b_index].P0 = b * KPA
         callback = lambda lam, it, r: worker.check()
         start = time.time()
-        result = None if first else build.solve(project.solver, callback, warm_start=True, load_steps=2)
+        result = None if first else build.solve(project.solver, callback, warm_start=True, load_steps=2,
+                                                 fixed_contact=True)
         if result is None or not result.converged:
-            result = build.solve(project.solver, callback)
+            result = build.solve(project.solver, callback, fixed_contact=True)
         first = False
         row = {"i": i, "j": j, "a": a, "b": b, "converged": result.converged, "time": time.time() - start,
                "P": {c: v.P / KPA for c, v in chambers}, "dV": {c: v.delta_volume for c, v in chambers}}

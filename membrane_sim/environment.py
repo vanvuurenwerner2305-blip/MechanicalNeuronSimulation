@@ -80,7 +80,7 @@ class Environment:
         return 1e3 * max(s.youngs_modulus * s.thickness for s in self.membrane_list) / L ** 2
 
     def solve(self, load_steps: int = 10, max_iterations: int = 40, rtol: float = 1e-8,
-              atol: float = 1e-12, step_tol: float = 1e-10, max_step: float = None, min_load_increment: float = 1e-4,
+              atol: float = 1e-12, step_tol: float = 1e-10, max_step: float = None, min_load_increment: float = 1e-3,
               verbose: bool = False, callback=None, warm_start: bool = False) -> SolveResult:
         """
         Find static equilibrium with all fluid pressures applied, ramping them from 0 to full
@@ -99,6 +99,7 @@ class Environment:
                               max_step=max_step, verbose=verbose, callback=callback)
 
         lam, increment = 0.0, 1.0 / load_steps
+        relaxed = False
         result = SolveResult(converged=False, load_factor=0.0)
         for volume in self.fluid_volume_list:
             volume.start_P0 = volume.solved_P0 if warm_start else None
@@ -121,6 +122,21 @@ class Environment:
                     increment = min(1.5 * increment, 1.0 / load_steps)
             else:
                 solver.set_u(u_saved)
+                if not relaxed and increment < 0.25 / load_steps:
+                    # Load stepping keeps failing: typically a snap-through, where no nearby
+                    # equilibrium exists. Let Newton (an energy descent with damping) run much
+                    # longer at the target load so the structure can move to the new state.
+                    relaxed = True
+                    solver.max_iterations = 5 * max_iterations
+                    ok, iterations = solver.newton(target)
+                    solver.max_iterations = max_iterations
+                    if ok:
+                        lam = target
+                        result.load_factors.append(lam)
+                        result.iterations.append(iterations)
+                        self._record(lam)
+                        continue
+                    solver.set_u(u_saved)
                 increment *= 0.5
                 if increment < min_load_increment:
                     result.message = f"load increment below {min_load_increment} at load factor {lam:.4g}"
