@@ -5,7 +5,7 @@ from pyvistaqt import QtInteractor
 from qtpy.QtCore import QTimer, Signal
 from qtpy.QtWidgets import QVBoxLayout, QWidget
 
-from .project import DEFORMABLE, RIGID, ROLE_COLORS, ROLE_OPACITY
+from .project import DEFORMABLE, RIGID, ROLE_COLORS, part_color, part_opacity
 
 SELECTED = "#ffcc00"
 AXES = {"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1)}
@@ -163,8 +163,8 @@ class Viewport(QWidget):
             selected = index in selection
             pd = polydata(mesh.vertices, mesh.faces)
             self._add(f"body{index}", pd, body=index,
-                      color=SELECTED if selected else ROLE_COLORS[part.role],
-                      opacity=self._selected_opacity() if selected else min(ROLE_OPACITY[part.role], self.opacity),
+                      color=SELECTED if selected else part_color(part),
+                      opacity=self._selected_opacity() if selected else min(part_opacity(part), self.opacity),
                       show_edges=self.show_edges, edge_color="#40464d", line_width=0.5,
                       smooth_shading=False, pickable=True)
             if selected:
@@ -179,7 +179,7 @@ class Viewport(QWidget):
             if not part.visible:
                 continue
             selected = index in selection
-            color = SELECTED if selected else ROLE_COLORS[part.role]
+            color = SELECTED if selected else part_color(part)
             if part.role in DEFORMABLE and index in mesh_data.midsurfaces:
                 mid = mesh_data.midsurfaces[index]
                 self._add(f"body{index}", polydata(mid.vertices, mid.faces), body=index, color=color,
@@ -193,7 +193,7 @@ class Viewport(QWidget):
             else:
                 self._add(f"body{index}", polydata(mesh.vertices, mesh.faces), body=index, color=color,
                           opacity=self._selected_opacity() if selected
-                          else min(ROLE_OPACITY[part.role], self.opacity, 0.35),
+                          else min(part_opacity(part), self.opacity, 0.35),
                           show_edges=True, edge_color="#40464d", line_width=0.4, pickable=True)
         self._finish()
 

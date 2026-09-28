@@ -18,8 +18,9 @@ import torch
 import membrane_sim as ms
 from membrane_sim.contact import ObstacleField, _winding_number
 
-from .project import (CHAMBER, CLAMPED, DEFORMABLE, IDEAL_GAS, IGNORE, LINEAR, MEMBRANE, NEO_HOOKEAN, RIGID,
-                      ROLE_COLORS, SHELL, TOUCHING_RIGID, UNASSIGNED)
+from .project import (CHAMBER, CLAMPED, DEFORMABLE, IDEAL_GAS, IGNORE, INCOMPRESSIBLE, MEMBRANE, NEO_HOOKEAN,
+                      RIGID, ROLE_COLORS, SHELL, TOUCHING_RIGID, UNASSIGNED, VENT, INCOMPRESSIBLE_STIFFNESS,
+                      part_color)
 
 P_ATM = 0.101325  # MPa
 KPA = 1e-3        # kPa -> MPa
@@ -116,8 +117,12 @@ def chamber_model(props, initial_volume):
     if model == IDEAL_GAS:
         liquid = min(max(float(props.get("incompressible", 0.0)), 0.0), 99.0) / 100.0
         kwargs.update(gas_volume=(1.0 - liquid) * float(initial_volume), atmospheric_pressure=P_ATM)
-    elif model == LINEAR:
-        kwargs.update(bulk_stiffness=float(props.get("stiffness", 0.0)) * KPA)
+    elif model == INCOMPRESSIBLE:
+        # stiffness is given per percent of volume change: dP/dV = s * 100 / V0
+        per_percent = float(props.get("stiffness", INCOMPRESSIBLE_STIFFNESS)) * KPA
+        kwargs.update(bulk_stiffness=per_percent * 100.0 / float(initial_volume))
+    elif model == VENT:
+        kwargs.update(P0=0.0)
     return kwargs
 
 
@@ -176,7 +181,7 @@ def build_environment(cad, mesh: MeshData, project) -> BuildResult:
     volumes, couplings = {}, {}
     for c in chambers:
         part, body = parts[c], bodies[c]
-        volume = env.add_fluid_volume(initial_volume=body.volume, name=part.name, color=ROLE_COLORS[CHAMBER],
+        volume = env.add_fluid_volume(initial_volume=body.volume, name=part.name, color=part_color(part),
                                       **chamber_model(part.props, body.volume))
         volumes[c] = volume
         couplings[c] = []

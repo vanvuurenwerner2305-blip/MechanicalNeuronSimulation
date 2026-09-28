@@ -6,14 +6,18 @@ from qtpy.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpin
                             QSpinBox, QTableWidget, QTableWidgetItem, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
                             QWidget)
 
-from .project import CHAMBER, DEFORMABLE, ROLE_COLORS, ROLE_FIELDS, ROLE_HELP, ROLES, SOLVER_FIELDS
+from .project import CHAMBER, DEFORMABLE, ROLE_COLORS, ROLE_FIELDS, ROLE_HELP, ROLES, SOLVER_FIELDS, part_color
 from .viewport import RESULT_FIELDS
 
 
-def role_icon(role, size=12):
+def color_icon(color, size=12):
     pixmap = QPixmap(size, size)
-    pixmap.fill(QColor(ROLE_COLORS[role]))
+    pixmap.fill(QColor(color))
     return QIcon(pixmap)
+
+
+def role_icon(role, size=12):
+    return color_icon(ROLE_COLORS[role], size)
 
 
 def fmt(value):
@@ -50,7 +54,7 @@ class ModelTree(QTreeWidget):
         for i, part in enumerate(parts):
             item = QTreeWidgetItem([part.name, part.role])
             item.setData(0, Qt.UserRole, i)
-            item.setIcon(1, role_icon(part.role))
+            item.setIcon(1, color_icon(part_color(part)))
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(0, Qt.Checked if part.visible else Qt.Unchecked)
             item.setToolTip(0, "Tick to show, untick to hide")
@@ -62,7 +66,7 @@ class ModelTree(QTreeWidget):
         for i in range(self.topLevelItemCount()):
             item, part = self.topLevelItem(i), parts[i]
             item.setText(1, part.role)
-            item.setIcon(1, role_icon(part.role))
+            item.setIcon(1, color_icon(part_color(part)))
             item.setCheckState(0, Qt.Checked if part.visible else Qt.Unchecked)
         self._updating = False
 

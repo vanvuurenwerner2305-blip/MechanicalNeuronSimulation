@@ -31,8 +31,14 @@ Requirements (Anaconda): numpy, scipy, torch, pyvista, pyvistaqt, PyQt5, matplot
 4. **Set properties:**
    - membranes/shells: material, Young's modulus, thickness (0 = measured from the CAD solid),
      element size, which edges are fixed;
-   - chambers: pressure model and pressure. *Constant pressure* chambers are the inputs.
-     *Closed* chambers (isothermal ideal gas, or linear stiffness) respond.
+   - chambers: pressure model and pressure (gauge: the surroundings are 0 kPa, and a membrane face
+     that touches no chamber sees 0 kPa):
+     - **Constant pressure** (green): the inputs.
+     - **Closed: ideal gas** (blue, darker = more liquid): sealed air, optionally partly filled
+       with incompressible liquid.
+     - **Closed: incompressible** (purple): sealed and full of liquid. Stiffness is in kPa per %
+       volume change; the default 1 000 kPa/% already gives results indistinguishable from water.
+     - **Vent** (transparent): open to the surroundings, always 0 kPa.
 5. **Mesh / Check model** (Ctrl+M / Ctrl+K). Membranes and shells are replaced by their
    mid-surfaces, and fixed nodes are shown in blue. The message log lists which chamber acts on
    which membrane.
@@ -94,7 +100,8 @@ tests/                  analytical benchmarks, consistency checks, application p
   - closed ideal gas (isothermal) with an optional incompressible share. With a fraction `f` of
     liquid the gas volume is `Vg = (1 - f) V0`, all volume change goes into the gas, and
     `P = (Patm + P0) Vg / (Vg + dV) - Patm`. The gas can never be compressed to zero volume;
-  - closed with linear stiffness `P = P0 - K dV` (e.g. a chamber completely full of liquid);
+  - closed incompressible: `P = P0 - s * 100 dV / V0` with `s` in pressure per % volume change;
+  - vent: always 0;
   - or any differentiable `pressure_law(dV, P0)` in scripts.
 
   Chamber walls are not meshed: shell edges are fixed, so `dV` follows from the shells alone.

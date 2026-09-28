@@ -113,3 +113,58 @@ def test_builder_creates_gas_chamber_with_liquid_share(neuron):
     volume = build.volumes[index]
     assert volume.gas_volume == pytest.approx(0.4 * cad.bodies[index].volume)
     part.props.update(model="Constant pressure (input)", incompressible=0.0)
+
+
+def test_incompressible_and_vent_chamber_models():
+    from app.builder import chamber_model
+    from app.project import INCOMPRESSIBLE, VENT
+    kw = chamber_model({"model": INCOMPRESSIBLE, "pressure": 2.0, "stiffness": 22000.0}, 1000.0)
+    # 1 % of 1000 mm3 = 10 mm3 must raise the pressure by 22000 kPa
+    assert kw["bulk_stiffness"] * 10.0 == pytest.approx(22.0)  # MPa
+    assert kw["P0"] == pytest.approx(2e-3)
+    assert chamber_model({"model": VENT, "pressure": 7.0}, 1000.0) == {"P0": 0.0}
+
+
+def test_legacy_linear_chambers_load_as_incompressible(tmp_path):
+    import json
+    from app.project import INCOMPRESSIBLE, INCOMPRESSIBLE_STIFFNESS
+    path = tmp_path / "old.mns"
+    path.write_text(json.dumps({"step_path": "x.step", "parts": [
+        {"name": "C", "role": CHAMBER, "props": {"model": "Closed: linear stiffness", "stiffness": 0.001}}]}))
+    part = Project.load(path).parts[0]
+    assert part.props["model"] == INCOMPRESSIBLE and part.props["stiffness"] == INCOMPRESSIBLE_STIFFNESS
+
+
+def test_chamber_colours_follow_the_model():
+    from app.project import CONSTANT, INCOMPRESSIBLE, PartSettings, VENT, part_color, part_opacity
+    def chamber(**props):
+        p = PartSettings("c")
+        p.set_role(CHAMBER)
+        p.props.update(props)
+        return p
+    brightness = lambda c: sum(int(c[k:k + 2], 16) for k in (1, 3, 5))
+    assert part_color(chamber(model=CONSTANT)) == "#2ca02c"
+    assert part_color(chamber(model=INCOMPRESSIBLE)) == "#7b2cbf"
+    assert brightness(part_color(chamber(model=IDEAL_GAS, incompressible=60.0))) < \
+        brightness(part_color(chamber(model=IDEAL_GAS, incompressible=0.0)))
+    assert part_opacity(chamber(model=VENT)) < 0.1
+
+
+def test_incompressible_chamber_keeps_its_volume(neuron):
+    from app.project import INCOMPRESSIBLE
+    cad, project, path = neuron
+    cad.load_step(path)
+    saved = {p.name: dict(p.props) for p in project.parts}
+    for p in project.parts:
+        if p.role == CHAMBER:
+            p.props.update({"Chamber_Left": dict(pressure=20.0), "Chamber_Right": dict(pressure=5.0),
+                            "Chamber_Middle": dict(model=INCOMPRESSIBLE)}[p.name])
+    try:
+        build = build_environment(cad, generate_mesh(cad, project), project)
+        assert build.solve(project.solver).converged
+        middle = next(v for c, v in build.volumes.items() if project.parts[c].name == "Chamber_Middle")
+        assert abs(middle.delta_volume) / middle.initial_volume < 5e-4  # below 0.05 %
+        assert 5.0 < middle.P / 1e-3 < 20.0  # between the two inputs
+    finally:
+        for p in project.parts:
+            p.props = saved[p.name]

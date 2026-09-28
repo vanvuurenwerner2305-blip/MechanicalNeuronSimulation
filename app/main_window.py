@@ -37,7 +37,16 @@ the <b>Transparency</b> slider); <b>click the same spot again</b> to select the 
 You can also hide parts with the tree check boxes, or use a <b>section cut</b>.
 <i>Edit → Auto-assign roles from names</i> guesses roles from names like "Membrane_1", "Chamber_A".</li>
 <li>Set properties: material and thickness of membranes/shells, pressure model and pressure of
-chambers. Constant-pressure chambers are the inputs; closed chambers (ideal gas or linear) respond.</li>
+chambers. All pressures are gauge: the surroundings are 0 kPa, and a membrane face that touches no
+chamber sees 0 kPa.
+<ul>
+<li><span style="color:#2ca02c"><b>Constant pressure</b></span>: the inputs.</li>
+<li><span style="color:#1f6fb4"><b>Ideal gas</b></span>: sealed air, optionally partly filled with
+incompressible liquid (darker blue = more liquid).</li>
+<li><span style="color:#7b2cbf"><b>Incompressible</b></span>: sealed and full of liquid
+(stiffness in kPa per % volume change).</li>
+<li><b>Vent</b> (transparent): open to the surroundings, always 0 kPa.</li>
+</ul></li>
 <li><b>Mesh</b> (Ctrl+M) shows the simulation mesh: membranes/shells become mid-surfaces, fixed
 nodes are blue. <b>Check model</b> reports which chamber acts on which membrane.</li>
 <li><b>Solve</b> (F5), then inspect the <b>Results</b> tab. <b>Sweep</b> maps the response over
@@ -415,6 +424,8 @@ class MainWindow(QMainWindow):
             mesh_field |= spec.mesh
             rebuild |= spec.kind == "choice"
         self._invalidate(mesh=mesh_field)
+        self.tree.refresh(self.project.parts)  # colours follow chamber models
+        QTimer.singleShot(0, self.refresh_view)
         if rebuild:  # choices can show or hide other fields; rebuild once this event is done
             QTimer.singleShot(0, lambda: self.properties.set_selection(
                 self.selection, self.project.parts, self.cad.bodies, self._couplings_text(self.selection)))

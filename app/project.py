@@ -27,18 +27,56 @@ ROLE_OPACITY = {UNASSIGNED: 1.0, MEMBRANE: 1.0, SHELL: 1.0, RIGID: 1.0, CHAMBER:
 
 ROLE_HELP = {
     UNASSIGNED: "Not used in the simulation until a role is assigned.",
-    MEMBRANE: "Thin deformable sheet without bending stiffness. Simulated on its mid-surface.",
-    SHELL: "Thin deformable sheet with bending stiffness. Simulated on its mid-surface.",
+    MEMBRANE: "Thin deformable sheet without bending stiffness. Simulated on its mid-surface. "
+              "A face that touches no chamber sees the surroundings (0 kPa).",
+    SHELL: "Thin deformable sheet with bending stiffness. Simulated on its mid-surface. "
+           "A face that touches no chamber sees the surroundings (0 kPa).",
     RIGID: "Fixed, undeformable part. Membranes and shells cannot pass through it.",
-    CHAMBER: "Fluid/gas region. Its pressure acts on every membrane or shell it touches.",
+    CHAMBER: "Fluid/gas region. Its pressure acts on every membrane or shell it touches. "
+             "Pressures are gauge: the surroundings are 0 kPa.",
     IGNORE: "Excluded from the simulation.",
 }
 
 # Chamber models
 CONSTANT = "Constant pressure (input)"
 IDEAL_GAS = "Closed: ideal gas (isothermal)"
-LINEAR = "Closed: linear stiffness"
-CHAMBER_MODELS = [CONSTANT, IDEAL_GAS, LINEAR]
+INCOMPRESSIBLE = "Closed: incompressible"
+VENT = "Vent (open to surroundings, 0 kPa)"
+CHAMBER_MODELS = [CONSTANT, IDEAL_GAS, INCOMPRESSIBLE, VENT]
+LEGACY_MODELS = {"Closed: linear stiffness": INCOMPRESSIBLE}
+INCOMPRESSIBLE_STIFFNESS = 1000.0  # kPa per % volume change (default for "incompressible")
+# Water is 22 000 kPa/% (bulk modulus 2.2 GPa). Against rubber membranes the results stop changing
+# above ~1 000 kPa/% (volume change ~0.01 %), while stiffer values only make the solve slower.
+
+CHAMBER_COLORS = {CONSTANT: "#2ca02c", INCOMPRESSIBLE: "#7b2cbf", VENT: "#e8e8e8"}
+GAS_LIGHT, GAS_DARK = (0.66, 0.85, 0.97), (0.03, 0.19, 0.42)  # 0% and 99% incompressible
+
+
+def _hex(rgb):
+    return "#" + "".join(f"{int(round(255 * c)):02x}" for c in rgb)
+
+
+def part_color(part) -> str:
+    """Display colour: by role, and for chambers by pressure model (gas: darker = more liquid)."""
+    if part.role != CHAMBER:
+        return ROLE_COLORS[part.role]
+    model = part.props.get("model", CONSTANT)
+    if model == IDEAL_GAS:
+        f = min(max(float(part.props.get("incompressible", 0.0)), 0.0), 99.0) / 99.0
+        return _hex([a + f * (b - a) for a, b in zip(GAS_LIGHT, GAS_DARK)])
+    return CHAMBER_COLORS.get(model, CHAMBER_COLORS[CONSTANT])
+
+
+def part_opacity(part) -> float:
+    if part.role == CHAMBER:
+        model = part.props.get("model", CONSTANT)
+        if model == VENT:
+            return 0.04
+        if model == IDEAL_GAS:
+            return 0.25 + 0.35 * min(float(part.props.get("incompressible", 0.0)), 99.0) / 99.0
+        return 0.3
+    return ROLE_OPACITY[part.role]
+
 
 NEO_HOOKEAN = "Neo-Hookean (incompressible rubber)"
 SVK = "St. Venant-Kirchhoff"
@@ -94,17 +132,25 @@ ROLE_FIELDS = {
               tooltip="0 = automatic. Only curved surfaces need a fine mesh.", mesh=True),
     ],
     CHAMBER: [
-        Field("model", "Pressure model", "choice", CONSTANT, choices=tuple(CHAMBER_MODELS)),
+        Field("model", "Pressure model", "choice", CONSTANT, choices=tuple(CHAMBER_MODELS),
+              tooltip="Constant pressure: an input held at a set pressure (green).\n"
+                      "Ideal gas: sealed air, optionally partly filled with liquid (blue, darker = more liquid).\n"
+                      "Incompressible: sealed and completely full of liquid (purple).\n"
+                      "Vent: open to the surroundings, always 0 kPa (transparent)."),
         Field("pressure", "Pressure (gauge)", "float", 0.0, "kPa", -1e6, 1e6, 4,
-              tooltip="Gauge pressure: 0 = atmospheric. For a constant-pressure chamber the applied "
-                      "pressure; for a closed chamber the pressure at the moment it was sealed."),
+              visible_if=("model", (CONSTANT, IDEAL_GAS, INCOMPRESSIBLE)),
+              tooltip="Gauge pressure: 0 = surroundings (atmospheric). For a constant-pressure chamber the "
+                      "applied pressure; for a closed chamber the pressure at the moment it was sealed."),
         Field("incompressible", "Incompressible fluid", "float", 0.0, "%", 0.0, 99.0, 3,
               visible_if=("model", (IDEAL_GAS,)),
               tooltip="Share of the chamber's initial volume filled with incompressible liquid; the rest "
                       "is gas. All volume change goes into the gas, so more liquid makes the chamber "
-                      "stiffer. For a chamber completely full of liquid use 'Closed: linear stiffness'."),
-        Field("stiffness", "Volume stiffness", "float", 1e-3, "kPa/mm³", 0.0, 1e9, 6,
-              visible_if=("model", (LINEAR,)), tooltip="dP/dV of the closed chamber."),
+                      "stiffer. For a chamber completely full of liquid use 'Closed: incompressible'."),
+        Field("stiffness", "Stiffness", "float", INCOMPRESSIBLE_STIFFNESS, "kPa per % ΔV", 1e-9, 1e12, 6,
+              visible_if=("model", (INCOMPRESSIBLE,)),
+              tooltip="Pressure rise per percent of volume decrease. 1 000 kPa/% keeps the volume "
+                      "change around 0.01 % - effectively incompressible next to rubber membranes. Water "
+                      "is 22 000 kPa/%: higher values give practically the same result but solve slower."),
     ],
 }
 
@@ -196,6 +242,11 @@ class Project:
         step = Path(data["step_path"])
         project.step_path = str(step if step.is_absolute() else (path.parent / step).resolve())
         project.parts = [PartSettings(**p) for p in data["parts"]]
+        for part in project.parts:  # projects saved with older chamber models
+            model = part.props.get("model")
+            if part.role == CHAMBER and model in LEGACY_MODELS:
+                part.props["model"] = LEGACY_MODELS[model]
+                part.props["stiffness"] = INCOMPRESSIBLE_STIFFNESS
         project.solver = SolverSettings(**data.get("solver", {}))
         project.path = str(path)
         return project
