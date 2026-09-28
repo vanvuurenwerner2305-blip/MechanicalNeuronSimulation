@@ -13,7 +13,7 @@ except ImportError:
 from qtpy.QtWidgets import (QApplication, QComboBox, QDockWidget, QFileDialog, QLabel, QMainWindow, QMessageBox,
                             QPlainTextEdit, QProgressBar, QPushButton, QSlider, QStyle, QTabWidget, QToolBar)
 
-from .builder import KPA, build_environment, generate_mesh, mesh_sizes
+from .builder import KPA, build_environment, generate_mesh, measure_thickness, mesh_sizes
 from .cad import CadModel
 from .panels import ModelTree, PropertyPanel, ResultsPanel, SolverPanel
 from .project import CHAMBER, DEFORMABLE, ROLE_FIELDS, Project
@@ -322,6 +322,7 @@ class MainWindow(QMainWindow):
                 project.match_bodies(bodies)
             self.project = project
             self.surfaces = self.cad.mesh(mesh_sizes(self.cad, self.project))
+            self._detect_thickness(range(len(self.project.parts)))
         except Exception as exc:
             QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, "Import", f"Could not import the STEP file:\n{exc}")
@@ -404,9 +405,21 @@ class MainWindow(QMainWindow):
             self.results_outdated = True
         self._update_actions()
 
+    def _detect_thickness(self, indices):
+        """Give membranes/shells without a thickness the one measured from their CAD solid."""
+        for i in indices:
+            part = self.project.parts[i]
+            if part.role in DEFORMABLE and not float(part.props.get("thickness", 0.0) or 0.0):
+                try:
+                    part.props["thickness"] = round(measure_thickness(self.cad, self.surfaces, i), 6)
+                    self.log_message(f"{part.name}: measured thickness {part.props['thickness']:.4g} mm")
+                except Exception as exc:  # leave 0: measured again during meshing
+                    self.log_message(f"{part.name}: could not measure the thickness ({exc})")
+
     def _on_role_changed(self, indices, role):
         for i in indices:
             self.project.parts[i].set_role(role)
+        self._detect_thickness(indices)
         self.log_message(f"{', '.join(self.project.parts[i].name for i in indices)} → {role}")
         self.tree.refresh(self.project.parts)
         self._invalidate(mesh=True)
@@ -436,6 +449,7 @@ class MainWindow(QMainWindow):
 
     def auto_assign(self):
         changed = self.project.auto_assign_from_names()
+        self._detect_thickness(range(len(self.project.parts)))
         self.log_message(f"Auto-assigned {changed} part(s) from their names. Check the roles in the model tree.")
         self.tree.refresh(self.project.parts)
         self._invalidate(mesh=True)

@@ -109,9 +109,11 @@ _DEFORMABLE_FIELDS = [
     Field("poisson_ratio", "Poisson's ratio", "float", 0.45, "", 0.0, 0.499, 3,
           visible_if=("material", (SVK,)), tooltip="The neo-Hookean model is incompressible (0.5)."),
     Field("thickness", "Thickness", "float", 0.0, "mm", 0.0, 1e6, 4,
-          tooltip="0 = measured from the CAD solid.", mesh=True),
-    Field("mesh_size", "Element size", "float", 0.0, "mm", 0.0, 1e6, 3,
-          tooltip="0 = automatic (1/15 of the smaller in-plane dimension).", mesh=True),
+          tooltip="Measured from the CAD solid when the role is assigned. Type a value to override it.",
+          mesh=True),
+    Field("elements_per_side", "Elements per shortest side", "int", 10, "", 1, 1000,
+          tooltip="Mesh density: number of elements along the shorter in-plane side of the sheet.",
+          mesh=True),
     Field("fixed_edges", "Fixed edges", "choice", ALL_EDGES, choices=(ALL_EDGES, TOUCHING_RIGID)),
     Field("edge_rotation", "Edge support", "choice", CLAMPED, choices=(CLAMPED, PINNED),
           tooltip="Clamped edges keep their slope, pinned edges can rotate. Only affects shells.",
@@ -128,8 +130,9 @@ ROLE_FIELDS = {
     SHELL: [Field(f.key, f.label, f.kind, 1.0 if f.key == "youngs_modulus" else f.default, f.unit, f.minimum,
                   f.maximum, f.decimals, f.choices, f.tooltip, f.visible_if, f.mesh) for f in _DEFORMABLE_FIELDS],
     RIGID: [
-        Field("mesh_size", "Element size", "float", 0.0, "mm", 0.0, 1e6, 3,
-              tooltip="0 = automatic. Only curved surfaces need a fine mesh.", mesh=True),
+        Field("elements_per_side", "Elements per shortest side", "int", 10, "", 1, 1000,
+              tooltip="Mesh density along the part's shortest side. Only curved surfaces need a fine mesh.",
+              mesh=True),
     ],
     CHAMBER: [
         Field("model", "Pressure model", "choice", CONSTANT, choices=tuple(CHAMBER_MODELS),
@@ -141,11 +144,16 @@ ROLE_FIELDS = {
               visible_if=("model", (CONSTANT, IDEAL_GAS, INCOMPRESSIBLE)),
               tooltip="Gauge pressure: 0 = surroundings (atmospheric). For a constant-pressure chamber the "
                       "applied pressure; for a closed chamber the pressure at the moment it was sealed."),
+        Field("ghost_volume", "Ghost volume", "float", 0.0, "mm³", 0.0, 1e15, 4,
+              visible_if=("model", (IDEAL_GAS,)),
+              tooltip="Extra volume connected to the chamber but not modelled in CAD (tubing, reservoir). "
+                      "It is added to the body's volume; the incompressible share applies to the total."),
         Field("incompressible", "Incompressible fluid", "float", 0.0, "%", 0.0, 99.0, 3,
               visible_if=("model", (IDEAL_GAS,)),
-              tooltip="Share of the chamber's initial volume filled with incompressible liquid; the rest "
-                      "is gas. All volume change goes into the gas, so more liquid makes the chamber "
-                      "stiffer. For a chamber completely full of liquid use 'Closed: incompressible'."),
+              tooltip="Share of the chamber's total initial volume (body + ghost volume) filled with "
+                      "incompressible liquid; the rest is gas. All volume change goes into the gas, so more "
+                      "liquid makes the chamber stiffer. For a chamber completely full of liquid use "
+                      "'Closed: incompressible'."),
         Field("stiffness", "Stiffness", "float", INCOMPRESSIBLE_STIFFNESS, "kPa per % ΔV", 1e-9, 1e12, 6,
               visible_if=("model", (INCOMPRESSIBLE,)),
               tooltip="Pressure rise per percent of volume decrease. 1 000 kPa/% keeps the volume "

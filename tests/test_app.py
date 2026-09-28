@@ -122,7 +122,7 @@ def test_incompressible_and_vent_chamber_models():
     # 1 % of 1000 mm3 = 10 mm3 must raise the pressure by 22000 kPa
     assert kw["bulk_stiffness"] * 10.0 == pytest.approx(22.0)  # MPa
     assert kw["P0"] == pytest.approx(2e-3)
-    assert chamber_model({"model": VENT, "pressure": 7.0}, 1000.0) == {"P0": 0.0}
+    assert chamber_model({"model": VENT, "pressure": 7.0}, 1000.0)["P0"] == 0.0
 
 
 def test_legacy_linear_chambers_load_as_incompressible(tmp_path):
@@ -168,3 +168,31 @@ def test_incompressible_chamber_keeps_its_volume(neuron):
     finally:
         for p in project.parts:
             p.props = saved[p.name]
+
+
+def test_mesh_density_in_elements_per_shortest_side():
+    from types import SimpleNamespace
+    from app.builder import element_size
+    plate = SimpleNamespace(size=np.array([100.0, 100.0, 5.0]), diagonal=float(np.linalg.norm([100, 100, 5])))
+    assert element_size(plate, MEMBRANE) == pytest.approx(10.0)       # default 10 per shortest in-plane side
+    assert element_size(plate, MEMBRANE, 20) == pytest.approx(5.0)
+    strip = SimpleNamespace(size=np.array([200.0, 40.0, 2.0]), diagonal=float(np.linalg.norm([200, 40, 2])))
+    assert element_size(strip, MEMBRANE) == pytest.approx(4.0)        # the 40 mm side, not the thickness
+    thin_rigid = SimpleNamespace(size=np.array([1.0, 100.0, 100.0]), diagonal=float(np.linalg.norm([1, 100, 100])))
+    assert element_size(thin_rigid, RIGID) == pytest.approx(thin_rigid.diagonal / 30)  # guarded
+
+
+def test_membrane_thickness_is_measured_from_cad(neuron):
+    from app.builder import measure_thickness, mesh_sizes
+    cad, project, path = neuron
+    cad.load_step(path)
+    surfaces = cad.mesh(mesh_sizes(cad, project))
+    index = next(b.index for b in cad.bodies if b.name == "Membrane_Left")
+    assert measure_thickness(cad, surfaces, index) == pytest.approx(1.0)
+
+
+def test_ghost_volume_adds_to_the_chamber_and_liquid_share_applies_to_the_total():
+    from app.builder import chamber_model
+    kw = chamber_model({"model": IDEAL_GAS, "incompressible": 50.0, "ghost_volume": 20.0}, 10.0)
+    assert kw["initial_volume"] == pytest.approx(30.0)   # 10 mm3 body + 20 mm3 ghost
+    assert kw["gas_volume"] == pytest.approx(15.0)       # 15 mm3 of the 30 is incompressible

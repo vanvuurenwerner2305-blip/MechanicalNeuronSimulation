@@ -43,19 +43,30 @@ class MeshData:
         return n
 
 
-def auto_mesh_size(body, role):
+DEFAULT_ELEMENTS_PER_SIDE = 10
+
+
+def element_size(body, role, elements_per_side=DEFAULT_ELEMENTS_PER_SIDE):
+    """Target element size: the part's shortest side divided by the number of elements along it.
+    For membranes/shells the shortest in-plane side (the thickness is not a side of the sheet);
+    solids use their shortest side, but never finer than diagonal / (3 n) so thin rigid parts do
+    not explode into huge meshes."""
+    n = max(int(elements_per_side), 1)
+    sides = np.sort(body.size)[::-1]
     if role in DEFORMABLE:
-        in_plane = np.sort(body.size)[::-1][:2]
-        return float(in_plane.min() / 15.0)
-    return body.diagonal / (12.0 if role == RIGID else 10.0)
+        return float(sides[1] / n)
+    return float(max(sides[2] / n, body.diagonal / (3 * n)))
 
 
 def mesh_sizes(cad, project):
-    sizes = {}
-    for body, part in zip(cad.bodies, project.parts):
-        size = float(part.props.get("mesh_size", 0.0) or 0.0)
-        sizes[body.index] = size if size > 0 else auto_mesh_size(body, part.role)
-    return sizes
+    return {body.index: element_size(body, part.role,
+                                     part.props.get("elements_per_side", DEFAULT_ELEMENTS_PER_SIDE))
+            for body, part in zip(cad.bodies, project.parts)}
+
+
+def measure_thickness(cad, surfaces, index):
+    """Thickness of a thin solid measured through its largest face (mm)."""
+    return float(cad.midsurface(cad.bodies[index], surfaces[index]).thickness)
 
 
 def generate_mesh(cad, project) -> MeshData:
@@ -110,17 +121,18 @@ class BuildResult:
                               rtol=settings.tolerance, callback=callback, warm_start=warm_start)
 
 
-def chamber_model(props, initial_volume):
+def chamber_model(props, body_volume):
     """Keyword arguments for FluidVolume from a chamber's properties (pressures in MPa, gauge)."""
-    kwargs = dict(P0=float(props.get("pressure", 0.0)) * KPA)
+    kwargs = dict(P0=float(props.get("pressure", 0.0)) * KPA, initial_volume=float(body_volume))
     model = props.get("model")
     if model == IDEAL_GAS:
+        total = float(body_volume) + max(float(props.get("ghost_volume", 0.0)), 0.0)
         liquid = min(max(float(props.get("incompressible", 0.0)), 0.0), 99.0) / 100.0
-        kwargs.update(gas_volume=(1.0 - liquid) * float(initial_volume), atmospheric_pressure=P_ATM)
+        kwargs.update(initial_volume=total, gas_volume=(1.0 - liquid) * total, atmospheric_pressure=P_ATM)
     elif model == INCOMPRESSIBLE:
         # stiffness is given per percent of volume change: dP/dV = s * 100 / V0
         per_percent = float(props.get("stiffness", INCOMPRESSIBLE_STIFFNESS)) * KPA
-        kwargs.update(bulk_stiffness=per_percent * 100.0 / float(initial_volume))
+        kwargs.update(bulk_stiffness=per_percent * 100.0 / float(body_volume))
     elif model == VENT:
         kwargs.update(P0=0.0)
     return kwargs
@@ -181,8 +193,7 @@ def build_environment(cad, mesh: MeshData, project) -> BuildResult:
     volumes, couplings = {}, {}
     for c in chambers:
         part, body = parts[c], bodies[c]
-        volume = env.add_fluid_volume(initial_volume=body.volume, name=part.name, color=part_color(part),
-                                      **chamber_model(part.props, body.volume))
+        volume = env.add_fluid_volume(name=part.name, color=part_color(part), **chamber_model(part.props, body.volume))
         volumes[c] = volume
         couplings[c] = []
         cm = mesh.surfaces[c]
