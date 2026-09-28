@@ -252,17 +252,21 @@ class NewtonSolver:
         if biggest > self.max_step:
             du = du * (self.max_step / biggest)
 
+        # The potential energy is the merit function. Accepting on residual decrease as well would
+        # let the iteration cycle (e.g. a node flipping in and out of contact), so the residual is
+        # only used where energy differences are lost in round-off, close to the solution.
         slope = torch.dot(state["residual"], du).item()
         e0, r0 = state["energy"], state["residual"].norm().item()
+        noise = 1e-12 * (abs(e0) + state["reference_force"] * self.length_scale)
         alpha = 1.0
         for _ in range(max_halvings + 1):
             u = u0.clone()
             u[self._free_t] += alpha * du
             self.set_u(u)
             trial = self.evaluate(load_factor, tangent=False)
-            energy_ok = slope < 0 and trial["energy"] <= e0 + 1e-4 * alpha * slope
-            residual_ok = trial["residual"].norm().item() <= (1.0 - 1e-4 * alpha) * r0
-            if energy_ok or residual_ok:
+            if slope < 0 and trial["energy"] <= e0 + 1e-4 * alpha * slope:
+                return True
+            if abs(trial["energy"] - e0) <= noise and trial["residual"].norm().item() < r0:
                 return True
             alpha *= 0.5
         return False
