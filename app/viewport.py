@@ -2,8 +2,8 @@
 import numpy as np
 import pyvista as pv
 from pyvistaqt import QtInteractor
-from qtpy.QtCore import Qt, Signal
-from qtpy.QtWidgets import QApplication, QVBoxLayout, QWidget
+from qtpy.QtCore import QTimer, Signal
+from qtpy.QtWidgets import QVBoxLayout, QWidget
 
 from .project import DEFORMABLE, RIGID, ROLE_COLORS, ROLE_OPACITY
 
@@ -31,13 +31,18 @@ class Viewport(QWidget):
         self.plotter.set_background("#dfe5ec", top="#ffffff")
         self.plotter.add_axes(interactive=False)
         self.plotter.enable_depth_peeling()
-        self.plotter.enable_mesh_picking(self._on_pick, use_actor=True, show=False, show_message=False,
-                                         left_clicking=True)
+        # Click selection with our own ray cast: a click (press and release without dragging)
+        # picks the nearest visible part; clicking the same spot again picks the next one behind.
+        self.plotter.iren.add_observer("LeftButtonPressEvent", self._on_press)
+        self.plotter.iren.add_observer("LeftButtonReleaseEvent", self._on_release)
+        self._press_pos = None
+        self._last_click = None      # (position, ordered hit list, index in list)
 
         self.show_edges = False
+        self.opacity = 0.45          # opacity of parts that are not selected (transparency slider)
         self.section = None          # (axis name, fraction 0..1) or None
         self._names = []
-        self._actor_body = {}
+        self._pick_meshes = {}
         self._bounds = None
         self._has_camera = False
 
@@ -45,18 +50,54 @@ class Viewport(QWidget):
     # Helpers
     # -----------------------------
 
-    def _on_pick(self, actor):
-        index = self._actor_body.get(id(actor))
-        if index is not None:
-            add = bool(QApplication.keyboardModifiers() & Qt.ControlModifier)
-            self.picked.emit(index, add)
+    def _on_press(self, *_):
+        self._press_pos = np.array(self.plotter.iren.get_event_position(), dtype=float)
+
+    def _on_release(self, *_):
+        pos = np.array(self.plotter.iren.get_event_position(), dtype=float)
+        if self._press_pos is None or np.abs(pos - self._press_pos).max() > 4:
+            return  # that was a drag (rotate/pan), not a click
+        hits = self._bodies_under(pos)
+        add = bool(self.plotter.iren.interactor.GetControlKey())
+        if not hits:
+            self._last_click = None
+            if not add:
+                QTimer.singleShot(0, lambda: self.picked.emit(-1, False))
+            return
+        k = 0
+        if self._last_click is not None:
+            last_pos, last_hits, last_k = self._last_click
+            if np.abs(pos - last_pos).max() <= 4 and last_hits == hits:
+                k = (last_k + 1) % len(hits)
+        self._last_click = (pos, hits, k)
+        index = hits[k]
+        # leave VTK's event handler before the scene is rebuilt
+        QTimer.singleShot(0, lambda: self.picked.emit(index, add))
+
+    def _bodies_under(self, pos):
+        """Visible parts along the view ray through a display position, nearest first."""
+        renderer = self.plotter.renderer
+        ends = []
+        for depth in (0.0, 1.0):
+            renderer.SetDisplayPoint(pos[0], pos[1], depth)
+            renderer.DisplayToWorld()
+            w = np.array(renderer.GetWorldPoint())
+            ends.append(w[:3] / w[3])
+        start, end = ends
+        hits = []
+        for index, mesh in self._pick_meshes.items():
+            points, _ = mesh.ray_trace(start, end, first_point=True)
+            points = np.asarray(points).reshape(-1, 3)
+            if len(points):
+                hits.append((float(np.linalg.norm(points[0] - start)), index))
+        return [index for _, index in sorted(hits)]
 
     def _clear(self):
         for name in self._names:
             self.plotter.remove_actor(name, render=False)
         for title in list(self.plotter.scalar_bars.keys()):
             self.plotter.remove_scalar_bar(title, render=False)
-        self._names, self._actor_body = [], {}
+        self._names, self._pick_meshes = [], {}
 
     def _clip(self, mesh):
         if self.section is None or self._bounds is None:
@@ -74,8 +115,21 @@ class Viewport(QWidget):
         actor = self.plotter.add_mesh(mesh, name=name, render=False, **kwargs)
         self._names.append(name)
         if body is not None:
-            self._actor_body[id(actor)] = body
+            self._pick_meshes[body] = mesh
         return actor
+
+    def _selected_opacity(self):
+        """The selected part stays see-through (so selecting an enclosure does not hide what is
+        inside); its outline makes it stand out."""
+        return min(1.0, self.opacity + 0.3)
+
+    def _outline(self, index, pd):
+        edges = self._clip(pd).extract_feature_edges(feature_angle=30, boundary_edges=True,
+                                                     non_manifold_edges=False, manifold_edges=False)
+        if edges.n_points:
+            self.plotter.add_mesh(edges, name=f"outline{index}", color="#d35400", line_width=3,
+                                  render=False, pickable=False)
+            self._names.append(f"outline{index}")
 
     def set_bounds(self, meshes):
         pts = np.vstack([m.vertices for m in meshes.values()])
@@ -107,11 +161,14 @@ class Viewport(QWidget):
             if not part.visible:
                 continue
             selected = index in selection
-            self._add(f"body{index}", polydata(mesh.vertices, mesh.faces), body=index,
+            pd = polydata(mesh.vertices, mesh.faces)
+            self._add(f"body{index}", pd, body=index,
                       color=SELECTED if selected else ROLE_COLORS[part.role],
-                      opacity=1.0 if selected else ROLE_OPACITY[part.role],
+                      opacity=self._selected_opacity() if selected else min(ROLE_OPACITY[part.role], self.opacity),
                       show_edges=self.show_edges, edge_color="#40464d", line_width=0.5,
                       smooth_shading=False, pickable=True)
+            if selected:
+                self._outline(index, pd)
         self._finish()
 
     def show_mesh(self, surfaces, parts, selection, mesh_data, build=None):
@@ -126,7 +183,8 @@ class Viewport(QWidget):
             if part.role in DEFORMABLE and index in mesh_data.midsurfaces:
                 mid = mesh_data.midsurfaces[index]
                 self._add(f"body{index}", polydata(mid.vertices, mid.faces), body=index, color=color,
-                          show_edges=True, edge_color="#202020", line_width=0.6, pickable=True)
+                          opacity=1.0 if selected else max(self.opacity, 0.6), show_edges=True,
+                          edge_color="#202020", line_width=0.6, pickable=True)
                 if build is not None and index in build.shells:
                     fixed = build.shells[index].fixed.cpu().numpy()
                     if fixed.any():
@@ -134,7 +192,8 @@ class Viewport(QWidget):
                                   point_size=6, render_points_as_spheres=True, pickable=False)
             else:
                 self._add(f"body{index}", polydata(mesh.vertices, mesh.faces), body=index, color=color,
-                          opacity=1.0 if selected else min(ROLE_OPACITY[part.role], 0.35),
+                          opacity=self._selected_opacity() if selected
+                          else min(ROLE_OPACITY[part.role], self.opacity, 0.35),
                           show_edges=True, edge_color="#40464d", line_width=0.4, pickable=True)
         self._finish()
 
@@ -144,7 +203,7 @@ class Viewport(QWidget):
         for index, mesh in surfaces.items():
             if parts[index].role == RIGID and parts[index].visible:
                 self._add(f"body{index}", polydata(mesh.vertices, mesh.faces), body=index,
-                          color=ROLE_COLORS[RIGID], opacity=0.3, pickable=True)
+                          color=ROLE_COLORS[RIGID], opacity=min(0.3, self.opacity), pickable=True)
 
         values = self.result_values(build, step, field)
         if clim is None:

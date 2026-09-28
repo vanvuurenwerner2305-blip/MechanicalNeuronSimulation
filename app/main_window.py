@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pyvista as pv
-from qtpy.QtCore import QSettings, Qt
+from qtpy.QtCore import QSettings, Qt, QTimer
 from qtpy.QtGui import QKeySequence
 try:
     from qtpy.QtGui import QAction, QActionGroup          # Qt 6
@@ -32,8 +32,9 @@ solid, each fluid chamber as a solid filling the fluid space, frames/obstacles a
 Export the assembly (or multi-body part) as <b>STEP</b>, in millimetres.</li>
 <li><b>File → Open STEP</b>. Every solid appears in the model tree.</li>
 <li><b>Click a part</b> in the view (Ctrl+click for several) or in the tree and choose its
-<b>role</b>: Membrane, Shell, Rigid body, Fluid chamber or Ignore. Hide parts that block the view
-with the tree check boxes, or use a <b>section cut</b>.
+<b>role</b>: Membrane, Shell, Rigid body, Fluid chamber or Ignore. Parts are see-through (adjust with
+the <b>Transparency</b> slider); <b>click the same spot again</b> to select the next part behind.
+You can also hide parts with the tree check boxes, or use a <b>section cut</b>.
 <i>Edit → Auto-assign roles from names</i> guesses roles from names like "Membrane_1", "Chamber_A".</li>
 <li>Set properties: material and thickness of membranes/shells, pressure model and pressure of
 chambers. Constant-pressure chambers are the inputs; closed chambers (ideal gas or linear) respond.</li>
@@ -220,6 +221,16 @@ class MainWindow(QMainWindow):
         vb.addSeparator()
         vb.addAction(self.a_edges)
         vb.addSeparator()
+        vb.addWidget(QLabel(" Transparency: "))
+        self.transparency = QSlider(Qt.Horizontal)
+        self.transparency.setRange(0, 95)
+        self.transparency.setValue(55)
+        self.transparency.setFixedWidth(120)
+        self.transparency.setToolTip("Transparency of parts that are not selected. "
+                                     "Click the same spot again to select the part behind.")
+        self.transparency.valueChanged.connect(self._on_transparency)
+        vb.addWidget(self.transparency)
+        vb.addSeparator()
         vb.addWidget(QLabel(" Section: "))
         self.section_axis = QComboBox()
         self.section_axis.addItems(["Off", "X", "Y", "Z"])
@@ -351,6 +362,9 @@ class MainWindow(QMainWindow):
         self.refresh_view()
 
     def _on_pick(self, index, add):
+        if index < 0:  # clicked on empty space
+            self.set_selection([])
+            return
         if add:
             indices = set(self.selection) ^ {index}
         else:
@@ -401,9 +415,9 @@ class MainWindow(QMainWindow):
             mesh_field |= spec.mesh
             rebuild |= spec.kind == "choice"
         self._invalidate(mesh=mesh_field)
-        if rebuild:  # choices can show or hide other fields
-            self.properties.set_selection(self.selection, self.project.parts, self.cad.bodies,
-                                          self._couplings_text(self.selection))
+        if rebuild:  # choices can show or hide other fields; rebuild once this event is done
+            QTimer.singleShot(0, lambda: self.properties.set_selection(
+                self.selection, self.project.parts, self.cad.bodies, self._couplings_text(self.selection)))
 
     def _on_solver_changed(self, key, value):
         setattr(self.project.solver, key, value)
@@ -469,6 +483,10 @@ class MainWindow(QMainWindow):
 
     def _toggle_edges(self):
         self.viewport.show_edges = self.a_edges.isChecked()
+        self.refresh_view()
+
+    def _on_transparency(self, value):
+        self.viewport.opacity = 1.0 - value / 100.0
         self.refresh_view()
 
     def _on_section(self, axis):

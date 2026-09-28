@@ -115,8 +115,15 @@ class FieldForm(QWidget):
         self.layout_.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
     def build(self, fields, values: dict, context: dict = None):
+        # Detach and delete the old rows *later*: build() can be triggered from one of these
+        # widgets' own signals, and deleting a widget inside its signal crashes Qt.
         while self.layout_.rowCount():
-            self.layout_.removeRow(0)
+            row = self.layout_.takeRow(0)
+            for item in (row.labelItem, row.fieldItem):
+                if item is not None and item.widget() is not None:
+                    item.widget().blockSignals(True)
+                    item.widget().hide()
+                    item.widget().deleteLater()
         context = dict(context or {}, **values)
         for f in fields:
             if f.visible_if and context.get(f.visible_if[0]) not in f.visible_if[1]:
