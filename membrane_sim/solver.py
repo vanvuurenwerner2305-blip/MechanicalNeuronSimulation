@@ -21,6 +21,7 @@ Every candidate step is capped in size and accepted by a line search on the pote
 (Armijo condition, quadratic interpolation). Pressures are ramped with a load factor lambda in
 [0, 1] with automatic step cutting (see Environment.solve).
 """
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -28,8 +29,9 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 import torch
 
-from .contact import ObstacleField
+from .contact import CachedSignedDistance, ObstacleField
 from .fluid import cone_volume_grad, cone_volume_hess
+from .shell_contact import ShellContact
 
 DTYPE = torch.float64
 
@@ -81,21 +83,46 @@ class NewtonSolver:
         self._free_is_coord = torch.as_tensor(is_coord[self.free_dofs], device=self.device)
 
         # Contact offset per free node: the shell's own `contact_offset` (e.g. half its thickness)
-        # or the global one, reduced where the rest geometry is already closer than that
-        # (nodes next to the part a shell is attached to must not start in contact).
+        # or the global one, reduced where the rest geometry is already closer than that.
+        # Nodes sharing an element with a fixed node that start at a wall (within 1.25x their offset,
+        # i.e. at the wall the shell is clamped to) get no rigid contact: they sit right at the
+        # penalty's on/off kink, and flipping in and out of contact made Newton cycle
+        # (NeuronTest.mns stalled at 1% residual).
         self._contact_nodes, self._contact_offsets = {}, {}
         for s in self.shells:
+            fixed = s.fixed.cpu().numpy()
+            next_to_clamp = np.zeros_like(fixed)
+            next_to_clamp[s.faces_np[fixed[s.faces_np].any(axis=1)]] = True
+            next_to_clamp &= ~fixed
             nodes = torch.nonzero(~s.fixed).flatten()
             offset = torch.full((len(nodes),), float(getattr(s, "contact_offset", None) or contact_offset),
                                 dtype=DTYPE, device=self.device)
             if self.field is not None and len(nodes):
-                rest_sd, _ = self.field.signed_distance(s.X[nodes], max_distance=offset.max().item() + 1e-9)
+                rest_sd, _ = self.field.signed_distance(s.X[nodes], max_distance=1.25 * offset.max().item() + 1e-9)
+                at_clamp_wall = torch.as_tensor(next_to_clamp, device=self.device)[nodes] & (rest_sd <= 1.25 * offset)
+                nodes, offset, rest_sd = nodes[~at_clamp_wall], offset[~at_clamp_wall], rest_sd[~at_clamp_wall]
                 offset = torch.minimum(offset, rest_sd.clamp_min(0.0))
             self._contact_nodes[id(s)], self._contact_offsets[id(s)] = nodes, offset
 
         X = torch.cat([s.X for s in self.shells])
         self.length_scale = (X.max(0).values - X.min(0).values).norm().item()
         self.max_step = max_step if max_step is not None else 0.1 * self.length_scale
+
+        # Candidate lists for the rigid contact queries, rebuilt when a node has moved more than
+        # the skin (exact: the same result as searching every obstacle triangle each time)
+        self._rigid_cache = {}
+        if self.field is not None:
+            for s in self.shells:
+                offset = self._contact_offsets[id(s)]
+                if len(offset):
+                    reach = offset.max().item() + 1e-9
+                    self._rigid_cache[id(s)] = CachedSignedDistance(
+                        self.field, reach, skin=max(reach, 0.01 * self.length_scale))
+
+        # Contact between membranes/shells
+        self.shell_contact = None
+        if contact_stiffness > 0 and len(self.shells) > 1:
+            self.shell_contact = ShellContact(self.shells, contact_stiffness, search_distance=2 * self.max_step) or None
 
     # -----------------------------
     # State
@@ -164,8 +191,7 @@ class NewtonSolver:
                 nodes, offset = self._contact_nodes[id(s)], self._contact_offsets[id(s)]
                 if not len(nodes):
                     continue
-                sd, normal, curvature = self.field.signed_distance(
-                    s.x[nodes], max_distance=offset.max().item() + 1e-9, hessian=True)
+                sd, normal, curvature = self._rigid_cache[id(s)].signed_distance(s.x[nodes], hessian=True)
                 gap = sd - offset
                 active = gap < 0
                 if not active.any():
@@ -178,6 +204,16 @@ class NewtonSolver:
                 if tangent:
                     H = normal[:, :, None] * normal[:, None, :] + gap[:, None, None] * curvature[active]
                     add_block(dofs, ka[:, None, None] * H)
+        if self.shell_contact is not None:
+            for A, B, nodes, tri_nodes, e, g, H in self.shell_contact.terms(tangent):
+                arange = torch.arange(3, device=self.device)
+                dofs = torch.cat([(self.dof_offset[id(A)] + 3 * nodes[:, None] + arange),
+                                  (self.dof_offset[id(B)] + 3 * tri_nodes[:, :, None] + arange).reshape(-1, 9)],
+                                 dim=1)
+                energy += e.sum().item()
+                f_contact.index_add_(0, dofs.reshape(-1), g.reshape(-1))
+                if tangent:
+                    add_block(dofs, H)
         R += f_contact
 
         out = {
@@ -204,6 +240,7 @@ class NewtonSolver:
     def newton(self, load_factor: float):
         """Returns (converged, iterations) and leaves the shells in the final state."""
         damping = self._damping
+        best, stalled = np.inf, 0
         for iteration in range(1, self.max_iterations + 1):
             state = self.evaluate(load_factor, tangent=True)
             R = state["residual"]
@@ -214,6 +251,16 @@ class NewtonSolver:
             if self.callback is not None:
                 self.callback(load_factor, iteration, r_norm)
             if r_norm <= tol:
+                self._damping = damping
+                return True, iteration - 1
+            # Contact energies are only C1 where the closest point crosses a triangle edge, which
+            # puts a floor under the attainable residual: accept a stalled iteration that is
+            # already within 1000x of the tolerance.
+            if r_norm < 0.5 * best:
+                best, stalled = r_norm, 0
+            else:
+                stalled += 1
+            if stalled >= 3 and r_norm <= 1e3 * tol:
                 self._damping = damping
                 return True, iteration - 1
 
@@ -280,6 +327,14 @@ class NewtonSolver:
             linear_rate = state["U"].T @ step_np  # d(dV)/d(alpha) of each closed chamber
 
         alpha = 1.0
+        if self.shell_contact is not None:  # never let a node pass through another sheet
+            full = torch.zeros(self.n_dof, dtype=DTYPE, device=self.device)
+            full[self._free_t] = step
+            motion = {id(s): full[self.dof_offset[id(s)]:self.dof_offset[id(s)] + 3 * s.n_nodes].reshape(-1, 3)
+                      for s in self.shells}
+            alpha = min(1.0, self.shell_contact.safe_step(motion))
+            if alpha < 1e-10:
+                return 0.0
         for _ in range(max_backtracks):
             u = u0.clone()
             u[self._free_t] += alpha * step

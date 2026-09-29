@@ -390,7 +390,10 @@ class ResultsPanel(QWidget):
 
     def _update_step_label(self):
         step = self.current_step()
-        self.step_label.setText(f"{step['load_factor']:.0%}" if step else "")
+        if step and self.step.value() == 0:
+            self.step_label.setText("0 (start)")
+        else:
+            self.step_label.setText(f"{step['load_factor']:.0%}" if step else "")
 
     def set_table(self, rows, shell_text=""):
         self.table.setRowCount(len(rows))

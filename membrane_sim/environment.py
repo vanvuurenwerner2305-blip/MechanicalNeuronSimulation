@@ -32,6 +32,7 @@ class Environment:
         self.fluid_volume_list = []
         self.history = []  # one entry per converged load step
         self.last_result = None
+        self.solver = None  # NewtonSolver of the last solve (for post-processing the solved state)
 
     # -----------------------------
     # Building the model
@@ -58,14 +59,14 @@ class Environment:
         return obstacle
 
     def add_fluid_volume(self, boundaries=(), P0=0.0, bulk_stiffness=0.0, pressure_law=None,
-                         initial_volume=None, gas_volume=None, atmospheric_pressure=0.101325, color="blue",
-                         name=None) -> FluidVolume:
+                         initial_volume=None, gas_volume=None, liquid_volume=None, atmospheric_pressure=0.101325,
+                         color="blue", name=None) -> FluidVolume:
         """
         boundaries: iterable of (shell, side) with side = +1 if the shell normal points out of
         this volume. Boundaries can also be attached later with shell.fluid_volume_contacts.
         """
         volume = FluidVolume(P0=P0, bulk_stiffness=bulk_stiffness, pressure_law=pressure_law,
-                             initial_volume=initial_volume, gas_volume=gas_volume,
+                             initial_volume=initial_volume, gas_volume=gas_volume, liquid_volume=liquid_volume,
                              atmospheric_pressure=atmospheric_pressure, color=color, name=name)
         for shell, side in boundaries:
             volume.add_boundary(shell, side)
@@ -99,6 +100,7 @@ class Environment:
                               contact_stiffness=k, contact_offset=self.contact_offset,
                               rtol=rtol, atol=atol, step_tol=step_tol, max_iterations=max_iterations,
                               max_step=max_step, verbose=verbose, callback=callback)
+        self.solver = solver
 
         lam, increment = 0.0, 1.0 / load_steps
         relaxed = False
@@ -163,7 +165,9 @@ class Environment:
         self.history.append({
             "load_factor": load_factor,
             "shell_coords": [s.x.detach().cpu().clone() for s in self.membrane_list],
-            "pressures": [v.P for v in self.fluid_volume_list],
+            # step 0 is the undeformed state with the full chamber pressures acting on it (e.g. the
+            # suction of an under-filled liquid chamber), not the zero pressures of the load ramp
+            "pressures": [v.pressure(v.delta_volume) if load_factor == 0.0 else v.P for v in self.fluid_volume_list],
             "delta_volumes": [v.delta_volume for v in self.fluid_volume_list],
         })
 

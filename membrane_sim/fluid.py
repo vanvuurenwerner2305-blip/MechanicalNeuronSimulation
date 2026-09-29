@@ -44,6 +44,7 @@ class FluidVolume:
                  pressure_law=None,
                  initial_volume: float = None,
                  gas_volume: float = None,
+                 liquid_volume: float = None,
                  atmospheric_pressure: float = 0.101325,
                  color: str = "blue",
                  name: str = None):
@@ -60,6 +61,11 @@ class FluidVolume:
                          whole volume change goes into the gas:
                              P = (P_atm + P0) * V_gas / (V_gas + dV) - P_atm   (gauge)
                          The gas can not be compressed to zero volume (the energy becomes infinite).
+        liquid_volume  : with the linear law: the sealed chamber holds this much liquid (needs
+                         initial_volume), so the liquid is at rest at this volume, not at the chamber's:
+                             P = P0 - K * (initial_volume + dV - liquid_volume)
+                         Less liquid than the chamber gives suction (negative pressure) that pulls the
+                         walls in; more liquid inflates it.
         atmospheric_pressure : P_atm for the gas law, in the model's pressure units (default MPa).
         """
         self.P0 = P0
@@ -69,6 +75,12 @@ class FluidVolume:
         self.atmospheric_pressure = atmospheric_pressure
         if gas_volume is not None and gas_volume <= 0:
             raise ValueError("gas_volume must be positive.")
+        self.excess_volume = 0.0  # chamber volume - liquid volume at rest (linear law)
+        if liquid_volume is not None:
+            if liquid_volume <= 0 or initial_volume is None:
+                raise ValueError("liquid_volume must be positive and needs initial_volume.")
+            self.excess_volume = initial_volume - liquid_volume
+        self.liquid_volume = liquid_volume
         self._law_takes_P0 = pressure_law is not None and len(inspect.signature(pressure_law).parameters) >= 2
         self.start_P0 = None   # P0 the current load path starts from (None: from zero pressure)
         self.solved_P0 = None  # P0 of the last converged solve
@@ -98,6 +110,11 @@ class FluidVolume:
                    for shell, side, rest in self.boundaries)
 
     @property
+    def is_closed(self) -> bool:
+        """Sealed chamber whose pressure depends on its volume (not an input reservoir or vent)."""
+        return self.gas_volume is not None or self.pressure_law is not None or self.bulk_stiffness != 0
+
+    @property
     def volume(self):
         return None if self.initial_volume is None else self.initial_volume + self.delta_volume
 
@@ -118,7 +135,7 @@ class FluidVolume:
                 return math.inf
             return (self.atmospheric_pressure + P0) * self.gas_volume / gas - self.atmospheric_pressure
         if self.pressure_law is None:
-            return P0 - self.bulk_stiffness * dV
+            return P0 - self.bulk_stiffness * (dV + self.excess_volume)
         return float(self._law(torch.tensor(dV, dtype=DTYPE), P0))
 
     def pressure_slope(self, dV: float, P0: float = None) -> float:
@@ -144,7 +161,7 @@ class FluidVolume:
             return ((self.atmospheric_pressure + P0) * self.gas_volume * math.log(gas / self.gas_volume)
                     - self.atmospheric_pressure * dV)
         if self.pressure_law is None:
-            return P0 * dV - 0.5 * self.bulk_stiffness * dV ** 2
+            return P0 * dV - self.bulk_stiffness * (self.excess_volume * dV + 0.5 * dV ** 2)
         s = 0.5 * dV * (_GAUSS_X + 1.0)
         return 0.5 * dV * sum(w * self.pressure(si, P0) for si, w in zip(s, _GAUSS_W))
 

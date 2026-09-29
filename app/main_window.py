@@ -43,8 +43,8 @@ chamber sees 0 kPa.
 <li><span style="color:#2ca02c"><b>Constant pressure</b></span>: the inputs.</li>
 <li><span style="color:#1f6fb4"><b>Ideal gas</b></span>: sealed air, optionally partly filled with
 incompressible liquid (darker blue = more liquid).</li>
-<li><span style="color:#7b2cbf"><b>Incompressible</b></span>: sealed and full of liquid
-(stiffness in kPa per % volume change).</li>
+<li><span style="color:#7b2cbf"><b>Incompressible</b></span>: sealed liquid (stiffness in kPa per %
+volume change; less fluid volume than the chamber gives suction, more inflates it).</li>
 <li><b>Vent</b> (transparent): open to the surroundings, always 0 kPa.</li>
 </ul></li>
 <li><b>Mesh</b> (Ctrl+M) shows the simulation mesh: membranes/shells become mid-surfaces, fixed
@@ -406,9 +406,12 @@ class MainWindow(QMainWindow):
         self._update_actions()
 
     def _detect_thickness(self, indices):
-        """Give membranes/shells without a thickness the one measured from their CAD solid."""
+        """Give membranes/shells without a thickness the one measured from their CAD solid, and
+        chambers without a fluid volume the body's volume."""
         for i in indices:
             part = self.project.parts[i]
+            if part.role == CHAMBER and not float(part.props.get("fluid_volume", 0.0) or 0.0):
+                part.props["fluid_volume"] = round(self.cad.bodies[i].volume, 6)
             if part.role in DEFORMABLE and not float(part.props.get("thickness", 0.0) or 0.0):
                 try:
                     part.props["thickness"] = round(measure_thickness(self.cad, self.surfaces, i), 6)

@@ -125,6 +125,16 @@ def test_incompressible_and_vent_chamber_models():
     assert chamber_model({"model": VENT, "pressure": 7.0}, 1000.0)["P0"] == 0.0
 
 
+def test_incompressible_fluid_volume_defaults_to_the_body_and_can_differ():
+    from app.builder import chamber_model
+    from app.project import INCOMPRESSIBLE
+    full = chamber_model({"model": INCOMPRESSIBLE, "stiffness": 10.0}, 100.0)
+    assert full["liquid_volume"] == 100.0 and full["bulk_stiffness"] == pytest.approx(0.01)  # 10 kPa per mm3
+    half = chamber_model({"model": INCOMPRESSIBLE, "stiffness": 10.0, "fluid_volume": 50.0}, 100.0)
+    assert half["liquid_volume"] == 50.0 and half["bulk_stiffness"] == pytest.approx(0.02)   # per % of 50 mm3
+    over = chamber_model({"model": INCOMPRESSIBLE, "fluid_volume": 150.0}, 100.0)
+    assert over["liquid_volume"] == 150.0
+
 def test_legacy_linear_chambers_load_as_incompressible(tmp_path):
     import json
     from app.project import INCOMPRESSIBLE, INCOMPRESSIBLE_STIFFNESS
@@ -158,7 +168,7 @@ def test_incompressible_chamber_keeps_its_volume(neuron):
     for p in project.parts:
         if p.role == CHAMBER:
             p.props.update({"Chamber_Left": dict(pressure=20.0), "Chamber_Right": dict(pressure=5.0),
-                            "Chamber_Middle": dict(model=INCOMPRESSIBLE)}[p.name])
+                            "Chamber_Middle": dict(model=INCOMPRESSIBLE, stiffness=1000.0)}[p.name])
     try:
         build = build_environment(cad, generate_mesh(cad, project), project)
         assert build.solve(project.solver).converged
@@ -196,3 +206,38 @@ def test_ghost_volume_adds_to_the_chamber_and_liquid_share_applies_to_the_total(
     kw = chamber_model({"model": IDEAL_GAS, "incompressible": 50.0, "ghost_volume": 20.0}, 10.0)
     assert kw["initial_volume"] == pytest.approx(30.0)   # 10 mm3 body + 20 mm3 ghost
     assert kw["gas_volume"] == pytest.approx(15.0)       # 15 mm3 of the 30 is incompressible
+
+
+def test_sweep_reports_input_weights_that_rebuild_the_activation_pressure(neuron):
+    from types import SimpleNamespace
+    from app.project import INCOMPRESSIBLE
+    from app.sweep import FLUID, equation_fit, run_sweep
+    cad, project, path = neuron
+    cad.load_step(path)
+    saved = {p.name: dict(p.props) for p in project.parts}
+    rows = []
+    worker = SimpleNamespace(check=lambda: None, report=lambda *a: None, log=lambda *a: None,
+                             item=SimpleNamespace(emit=rows.append))
+    index = {p.name: i for i, p in enumerate(project.parts)}
+    for p in project.parts:
+        if p.role == CHAMBER:
+            p.props.update({"Chamber_Left": dict(pressure=5.0), "Chamber_Right": dict(pressure=5.0),
+                            "Chamber_Middle": dict(model=INCOMPRESSIBLE, stiffness=10.0)}[p.name])
+    try:
+        run_sweep(worker, cad, project, None, index["Chamber_Left"], np.array([10.0, 15.0, 20.0]), None, None,
+                  index["Chamber_Middle"])
+        middle = index["Chamber_Middle"]
+        assert len(rows) == 3 and all(r["converged"] for r in rows)
+        for r in rows:
+            assert set(r["W"]) == {"Chamber_Left", "Chamber_Right", FLUID}
+            for name in ("Chamber_Left", "Chamber_Right"):
+                w = r["W"][name]
+                assert w["dp"] == pytest.approx(r["P"][index[name]] - r["P"][middle], abs=1e-9) and w["W"] > 0
+            assert r["p_a_rebuilt"] == pytest.approx(r["P"][middle], rel=1e-6)
+        fit = equation_fit(rows, middle, 1.0)
+        assert fit["met"] and fit["error"] <= 1.0
+        assert set(fit["fits"]) == {"Chamber_Left", "Chamber_Right", FLUID}
+        assert all(w["kind"] == "piecewise" for w in fit["fits"].values())
+    finally:
+        for p in project.parts:
+            p.props = saved[p.name]

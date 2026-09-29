@@ -1,0 +1,155 @@
+{
+  "version": 1,
+  "step_path": "Example.step",
+  "parts": [
+    {
+      "name": "Body1",
+      "role": "Rigid body",
+      "props": {
+        "elements_per_side": 10
+      },
+      "visible": true
+    },
+    {
+      "name": "Body2",
+      "role": "Membrane",
+      "props": {
+        "material": "Neo-Hookean (incompressible rubber)",
+        "youngs_modulus": 0.1,
+        "poisson_ratio": 0.45,
+        "thickness": 5.0,
+        "elements_per_side": 10,
+        "fixed_edges": "All boundary edges",
+        "edge_rotation": "Clamped",
+        "pretension": 0.0
+      },
+      "visible": true
+    },
+    {
+      "name": "Body3",
+      "role": "Membrane",
+      "props": {
+        "material": "Neo-Hookean (incompressible rubber)",
+        "youngs_modulus": 0.1,
+        "poisson_ratio": 0.45,
+        "thickness": 5.0,
+        "elements_per_side": 10,
+        "fixed_edges": "All boundary edges",
+        "edge_rotation": "Clamped",
+        "pretension": 0.0
+      },
+      "visible": true
+    },
+    {
+      "name": "Body4",
+      "role": "Membrane",
+      "props": {
+        "material": "Neo-Hookean (incompressible rubber)",
+        "youngs_modulus": 0.1,
+        "poisson_ratio": 0.45,
+        "thickness": 5.0,
+        "elements_per_side": 10,
+        "fixed_edges": "All boundary edges",
+        "edge_rotation": "Clamped",
+        "pretension": 0.0
+      },
+      "visible": true
+    },
+    {
+      "name": "Body5",
+      "role": "Membrane",
+      "props": {
+        "material": "Neo-Hookean (incompressible rubber)",
+        "youngs_modulus": 0.1,
+        "poisson_ratio": 0.45,
+        "thickness": 5.0,
+        "elements_per_side": 10,
+        "fixed_edges": "All boundary edges",
+        "edge_rotation": "Clamped",
+        "pretension": 0.0
+      },
+      "visible": true
+    },
+    {
+      "name": "Body6",
+      "role": "Fluid chamber",
+      "props": {
+        "model": "Closed: incompressible",
+        "pressure": 0.0,
+        "ghost_volume": 0.0,
+        "incompressible": 0.0,
+        "stiffness": 100.0
+      },
+      "visible": true
+    },
+    {
+      "name": "Body7",
+      "role": "Fluid chamber",
+      "props": {
+        "model": "Closed: ideal gas (isothermal)",
+        "pressure": 0.0,
+        "ghost_volume": 0.0,
+        "incompressible": 80.0,
+        "stiffness": 1000.0
+      },
+      "visible": true
+    },
+    {
+      "name": "Body8",
+      "role": "Fluid chamber",
+      "props": {
+        "model": "Closed: ideal gas (isothermal)",
+        "pressure": 0.0,
+        "ghost_volume": 0.0,
+        "incompressible": 90.0,
+        "stiffness": 1000.0
+      },
+      "visible": true
+    },
+    {
+      "name": "Body9",
+      "role": "Fluid chamber",
+      "props": {
+        "model": "Constant pressure (input)",
+        "pressure": 20.0,
+        "ghost_volume": 0.0,
+        "incompressible": 0.0,
+        "stiffness": 1000.0
+      },
+      "visible": true
+    },
+    {
+      "name": "Body10",
+      "role": "Fluid chamber",
+      "props": {
+        "model": "Constant pressure (input)",
+        "pressure": 20.0,
+        "ghost_volume": 0.0,
+        "incompressible": 0.0,
+        "stiffness": 1000.0
+      },
+      "visible": true
+    },
+    {
+      "name": "Body13",
+      "role": "Membrane",
+      "props": {
+        "material": "Neo-Hookean (incompressible rubber)",
+        "youngs_modulus": 0.1,
+        "poisson_ratio": 0.45,
+        "thickness": 5.0,
+        "elements_per_side": 10,
+        "fixed_edges": "All boundary edges",
+        "edge_rotation": "Clamped",
+        "pretension": 0.0
+      },
+      "visible": true
+    }
+  ],
+  "solver": {
+    "load_steps": 10,
+    "max_iterations": 40,
+    "tolerance": 1e-06,
+    "contact_stiffness": 0.0
+  }
+}

@@ -44,9 +44,8 @@ INCOMPRESSIBLE = "Closed: incompressible"
 VENT = "Vent (open to surroundings, 0 kPa)"
 CHAMBER_MODELS = [CONSTANT, IDEAL_GAS, INCOMPRESSIBLE, VENT]
 LEGACY_MODELS = {"Closed: linear stiffness": INCOMPRESSIBLE}
-INCOMPRESSIBLE_STIFFNESS = 1000.0  # kPa per % volume change (default for "incompressible")
-# Water is 22 000 kPa/% (bulk modulus 2.2 GPa). Against rubber membranes the results stop changing
-# above ~1 000 kPa/% (volume change ~0.01 %), while stiffer values only make the solve slower.
+INCOMPRESSIBLE_STIFFNESS = 10.0  # kPa per % volume change (default for "incompressible")
+# Water is 22 000 kPa/% (bulk modulus 2.2 GPa); stiffer values make the solve slower.
 
 CHAMBER_COLORS = {CONSTANT: "#2ca02c", INCOMPRESSIBLE: "#7b2cbf", VENT: "#e8e8e8"}
 GAS_LIGHT, GAS_DARK = (0.66, 0.85, 0.97), (0.03, 0.19, 0.42)  # 0% and 99% incompressible
@@ -104,7 +103,7 @@ class Field:
 
 _DEFORMABLE_FIELDS = [
     Field("material", "Material model", "choice", NEO_HOOKEAN, choices=(NEO_HOOKEAN, SVK)),
-    Field("youngs_modulus", "Young's modulus", "float", 0.1, "MPa", 1e-9, 1e6, 5,
+    Field("youngs_modulus", "Young's modulus", "float", 0.5, "MPa", 1e-9, 1e6, 5,
           tooltip="Silicone rubbers are typically 0.05-1 MPa."),
     Field("poisson_ratio", "Poisson's ratio", "float", 0.45, "", 0.0, 0.499, 3,
           visible_if=("material", (SVK,)), tooltip="The neo-Hookean model is incompressible (0.5)."),
@@ -138,7 +137,7 @@ ROLE_FIELDS = {
         Field("model", "Pressure model", "choice", CONSTANT, choices=tuple(CHAMBER_MODELS),
               tooltip="Constant pressure: an input held at a set pressure (green).\n"
                       "Ideal gas: sealed air, optionally partly filled with liquid (blue, darker = more liquid).\n"
-                      "Incompressible: sealed and completely full of liquid (purple).\n"
+                      "Incompressible: sealed and filled with liquid (purple), completely or partly.\n"
                       "Vent: open to the surroundings, always 0 kPa (transparent)."),
         Field("pressure", "Pressure (gauge)", "float", 0.0, "kPa", -1e6, 1e6, 4,
               visible_if=("model", (CONSTANT, IDEAL_GAS, INCOMPRESSIBLE)),
@@ -156,9 +155,15 @@ ROLE_FIELDS = {
                       "'Closed: incompressible'."),
         Field("stiffness", "Stiffness", "float", INCOMPRESSIBLE_STIFFNESS, "kPa per % ΔV", 1e-9, 1e12, 6,
               visible_if=("model", (INCOMPRESSIBLE,)),
-              tooltip="Pressure rise per percent of volume decrease. 1 000 kPa/% keeps the volume "
-                      "change around 0.01 % - effectively incompressible next to rubber membranes. Water "
-                      "is 22 000 kPa/%: higher values give practically the same result but solve slower."),
+              tooltip="Pressure rise per percent of volume decrease (default 10 kPa/%). Water is "
+                      "22 000 kPa/%; around 1 000 kPa/% the volume change is already ~0.01 %, and stiffer "
+                      "values mainly make the solve slower."),
+        Field("fluid_volume", "Fluid volume", "float", 0.0, "mm³", 0.0, 1e15, 4,
+              visible_if=("model", (INCOMPRESSIBLE,)),
+              tooltip="Volume of liquid sealed in the chamber; defaults to the body's volume (exactly "
+                      "full). Less liquid than the chamber gives negative pressure (suction) that pulls the "
+                      "walls in towards the fluid volume; more liquid pressurises it. The stiffness is per % "
+                      "of the fluid volume. 0 = the body's volume."),
     ],
 }
 

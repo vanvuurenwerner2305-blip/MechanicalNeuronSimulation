@@ -243,6 +243,50 @@ def test_signed_distance_matches_brute_force(shape):
     assert torch.allclose(grad.norm(dim=1), torch.ones(len(points), dtype=torch.float64))
 
 
+def test_cached_contact_queries_match_the_full_search():
+    from membrane_sim.contact import CachedSignedDistance, ObstacleField
+    from membrane_sim.shell_contact import ShellContact, pairs_within
+    g = torch.Generator().manual_seed(4)
+
+    field = ObstacleField([ms.Obstacle(*ms.box_mesh((0, 0, 0), (1, 1, 1))),
+                           ms.Obstacle(*ms.box_mesh((-2, -2, -2), (3, 3, 3)), inverted=True)])
+    points = torch.rand(200, 3, generator=g, dtype=torch.float64) * 1.6 - 0.3
+    cache = CachedSignedDistance(field, 0.2, skin=0.1)
+    for k in range(20):  # small moves reuse the lists, every 5th move forces a rebuild
+        points = points + torch.randn(points.shape, generator=g, dtype=torch.float64) * (0.3 if k % 5 == 0 else 0.01)
+        sd, grad, H = cache.signed_distance(points, hessian=True)
+        ref_sd, ref_grad, ref_H = field.signed_distance(points, 0.2, hessian=True)
+        near = ref_sd < 0.2
+        assert torch.equal(sd < 0.2, near)
+        assert torch.equal(sd[near], ref_sd[near]) and torch.equal(grad[near], ref_grad[near])
+        assert torch.equal(H[near], ref_H[near])
+    assert cache.rebuilds < 20
+
+    env = ms.Environment()
+    lower = env.add_rectangular_membrane((0, 0, 0), (1, 0, 0), (0, 1, 0), divisions=(10, 10),
+                                         thickness=0.05, youngs_modulus=1.0)
+    upper = env.add_rectangular_membrane((0, 0, 0.08), (1, 0, 0), (0, 1, 0), divisions=(9, 9),
+                                         thickness=0.05, youngs_modulus=1.0)
+    contact = ShellContact([lower, upper], 1.0, search_distance=0.1)
+    for k in range(12):
+        for s in (lower, upper):
+            s.x = s.x + torch.randn(s.x.shape, generator=g, dtype=torch.float64) * 0.004 * (~s.fixed)[:, None]
+        for pair in contact.pairs:
+            radius = pair["h_max"] + contact.search_distance
+            pi, t, _, _ = contact._pairs_within(pair, radius)
+            ref_pi, ref_t, _, _ = pairs_within(pair["A"].x[pair["nodes"]], pair["B"].x, pair["B"].faces, radius)
+            assert sorted(zip(pi.tolist(), t.tolist())) == sorted(zip(ref_pi.tolist(), ref_t.tolist()))
+        step = {id(s): torch.randn(s.x.shape, generator=g, dtype=torch.float64) * 0.05 * (~s.fixed)[:, None]
+                for s in (lower, upper)}
+        reference = 1.0
+        for pair in contact.pairs:  # the unfiltered bound: every pair within the search radius
+            A, B, nodes = pair["A"], pair["B"], pair["nodes"]
+            pi, t, d, _ = pairs_within(A.x[nodes], B.x, B.faces, pair["h_max"] + contact.search_distance)
+            closing = step[id(A)][nodes[pi]].norm(dim=1) + step[id(B)][B.faces[t]].norm(dim=2).max(dim=1).values
+            reference = min(reference, (0.9 * d / closing).min().item())
+        assert contact.safe_step(step) == pytest.approx(reference, rel=1e-12)
+
+
 def test_warm_start_reaches_the_same_state_as_a_fresh_solve():
     def build():
         env = ms.Environment(contact_stiffness=1e3)
@@ -318,3 +362,275 @@ def test_gas_pocket_can_not_be_squeezed_to_zero():
     assert env.solve(load_steps=20).converged
     assert gas.gas_volume + gas.delta_volume > 0
     assert gas.P == pytest.approx(5.0, rel=1e-3)  # the gas pressure balances the drive
+
+
+
+def test_part_filled_liquid_chamber_law_is_consistent():
+    V = ms.FluidVolume(P0=0.01, bulk_stiffness=3.0, initial_volume=10.0, liquid_volume=6.0)
+    assert V.pressure(0.0) == pytest.approx(0.01 - 3.0 * 4.0)   # 4 mm3 too little liquid: suction
+    assert V.pressure(-4.0) == pytest.approx(0.01)              # shrunk to the liquid volume
+    h = 1e-6
+    for dV in (-5.0, -4.0, -1.0, 0.5):
+        assert (V.pressure_potential(dV + h) - V.pressure_potential(dV - h)) / (2 * h) ==             pytest.approx(V.pressure(dV), rel=1e-7)
+        assert V.pressure_slope(dV) == -3.0
+
+
+def test_liquid_chamber_is_pulled_to_its_fluid_volume():
+    def solve(liquid=None, V0=1.0, drive=0.0):
+        env = ms.Environment()
+        shell = env.add_disk_membrane((0, 0, 0), (0, 0, 1), 1.0, rings=6, thickness=0.05, youngs_modulus=1.0)
+        outside = env.add_fluid_volume(P0=drive)
+        kw = dict() if liquid is None else dict(bulk_stiffness=100.0, liquid_volume=liquid)
+        chamber = env.add_fluid_volume(initial_volume=V0, **kw)
+        shell.fluid_volume_contacts((outside, chamber))
+        assert env.solve().converged
+        chamber.start = env.history[0]['pressures'][1]
+        return chamber
+    stroke = -solve(drive=0.02).delta_volume   # volume scale the membrane sweeps at 20 kPa
+    assert stroke > 0
+    under = solve(liquid=1.0 - 0.5 * stroke)   # too little liquid: sucks the membrane in
+    assert under.start == pytest.approx(-100.0 * 0.5 * stroke)  # step 0: full suction, nothing moved yet
+    assert under.P < 0 and under.delta_volume == pytest.approx(-0.5 * stroke, rel=0.02)
+    over = solve(liquid=1.0 + 0.5 * stroke)    # too much liquid: inflates it
+    assert over.P > 0 and over.delta_volume == pytest.approx(0.5 * stroke, rel=0.02)
+
+# -----------------------------
+# Contact between membranes
+# -----------------------------
+
+def _below(lower, upper):
+    """True if every free node of `lower` is on the -normal side of `upper` (normals are +z)."""
+    from membrane_sim.shell_contact import _face_normals, closest_on_mesh
+    points = lower.x[~lower.fixed]
+    _, q, t = closest_on_mesh(points, upper.x, upper.faces, 10.0)
+    return bool((((points - q) * _face_normals(upper.x, upper.faces)[t]).sum(-1) < 0).all())
+
+
+def _stacked_sheets(gap=0.2, pressure=0.05, k=1e3, with_upper=True):
+    env = ms.Environment(contact_stiffness=k)
+    lower = env.add_rectangular_membrane((0, 0, 0), (1, 0, 0), (0, 1, 0), divisions=(10, 10), thickness=0.05,
+                                         youngs_modulus=1.0, contact_offset=0.025, name="lower")
+    upper = None
+    if with_upper:  # a different mesh, so nodes do not sit exactly above the other sheet's vertices
+        upper = env.add_rectangular_membrane((0, 0, gap), (1, 0, 0), (0, 1, 0), divisions=(7, 9), thickness=0.05,
+                                             youngs_modulus=1.0, contact_offset=0.025, name="upper")
+    drive = env.add_fluid_volume(P0=pressure)
+    lower.fluid_volume_contacts((drive, None))  # pushes the lower sheet up (+z) into the upper one
+    return env, lower, upper
+
+
+def test_sheet_contact_energy_residual_and_tangent_are_consistent():
+    from membrane_sim.shell_contact import closest_on_mesh
+    env, lower, upper = _stacked_sheets()
+    free = ~lower.fixed
+    lower.x = lower.X.clone()
+    lower.x[free, 2] += 0.17 * torch.sin(np.pi * lower.X[free, 0]) * torch.sin(np.pi * lower.X[free, 1])
+    # break the symmetry: a node exactly over a triangle edge sits where the pair energy is only C1
+    lower.x[free] += 1e-3 * torch.randn(int(free.sum()), 3, generator=torch.Generator().manual_seed(1),
+                                        dtype=torch.float64)
+    solver = NewtonSolver(env.membrane_list, env.fluid_volume_list, [], 1e3)
+    d, _, _ = closest_on_mesh(lower.x[free], upper.x, upper.faces, 1.0)
+    assert (d < 0.05).any()  # contact is active
+    state = solver.evaluate(1.0)
+    K = state["K"].toarray() + state["U"] @ np.diag(state["c"]) @ state["U"].T
+    u0, h = solver.get_u().clone(), 1e-7
+    direction = torch.as_tensor(np.random.default_rng(2).standard_normal(solver.n_free))
+    out = []
+    for sign in (1, -1):
+        u = u0.clone()
+        u[solver._free_t] += sign * h * direction
+        solver.set_u(u)
+        out.append(solver.evaluate(1.0, tangent=False))
+    solver.set_u(u0)
+    assert (out[0]["energy"] - out[1]["energy"]) / (2 * h) == pytest.approx(state["residual"] @ direction, rel=1e-5)
+    dR = (out[0]["residual"] - out[1]["residual"]).numpy() / (2 * h)
+    assert np.linalg.norm(dR - K @ direction.numpy()) <= 1e-4 * np.linalg.norm(dR)
+
+
+def test_inflating_sheet_pushes_the_sheet_above_without_passing_through():
+    from membrane_sim.shell_contact import closest_on_mesh
+    env, lower, _ = _stacked_sheets(with_upper=False)
+    assert env.solve().converged
+    free_rise = lower.displacement()[:, 2].max().item()
+    assert free_rise > 0.3  # alone, the lower sheet would pass the upper one's position
+
+    env, lower, upper = _stacked_sheets()
+    assert env.solve().converged
+    assert upper.displacement()[:, 2].max().item() > 0.05          # the upper sheet is lifted
+    assert lower.displacement()[:, 2].max().item() < free_rise
+    d, _, _ = closest_on_mesh(lower.x[~lower.fixed], upper.x, upper.faces, 1.0)
+    assert d.min().item() > 0.05 - 0.02                            # separation ~ thickness, small penetration
+    assert _below(lower, upper)                                    # never crossed
+
+
+def test_sheets_do_not_cross_under_a_hard_push():
+    env, lower, upper = _stacked_sheets(gap=0.1, pressure=0.5, k=50.0)  # soft penalty, strong push
+    result = env.solve()
+    assert result.converged
+    assert _below(lower, upper)
+
+
+# -----------------------------
+# Mechanical weights of input paths (membrane_sim.characterise)
+# -----------------------------
+
+def _disk(env, x, z=0.0, radius=1.0, name=None):
+    return env.add_disk_membrane((x, 0, z), (0, 0, 1), radius, rings=6, thickness=0.05, youngs_modulus=1.0, name=name)
+
+
+def test_direct_paths_rebuild_the_activation_pressure():
+    env = ms.Environment()
+    a = env.add_fluid_volume(P0=0.002, bulk_stiffness=0.05, name="act")
+    for x, r, p, name in ((0, 1.0, 0.02, "in1"), (3, 0.8, 0.008, "in2")):
+        _disk(env, x, radius=r, name=f"m_{name}").fluid_volume_contacts((env.add_fluid_volume(P0=p, name=name), a))
+    assert env.solve().converged
+    w = ms.input_weights(env, a)
+    by = {i["input"]: i for i in w["inputs"]}
+    assert set(by) == {"in1", "in2"} and by["in1"]["shells"] == ["m_in1"]
+    for name, p in (("in1", 0.02), ("in2", 0.008)):
+        assert by[name]["dp"] == pytest.approx(p - a.P, rel=1e-12) and by[name]["W"] > 0
+    assert sum(i["dV"] for i in w["inputs"]) == pytest.approx(w["chamber"]["dV"])  # volume balance
+    assert w["chamber"]["W"] == pytest.approx(1 / 0.05) and w["chamber"]["p"] == pytest.approx(0.002)
+    assert ms.rebuild_activation_pressure(w) == pytest.approx(a.P, rel=1e-9)
+
+
+def test_bulk_modulus_path_is_one_weight_and_stiffer_fluid_transfers_more():
+    def solve(liquid_fraction):
+        env = ms.Environment()
+        a = env.add_fluid_volume(P0=0.0, bulk_stiffness=0.02, name="act")
+        inp = env.add_fluid_volume(P0=0.01, name="input")
+        weight = env.add_fluid_volume(P0=0.0, initial_volume=2.0, gas_volume=(1 - liquid_fraction) * 2.0,
+                                      name="weight")
+        _disk(env, 0, 0.0, name="outer").fluid_volume_contacts((inp, weight))
+        _disk(env, 0, 0.6, name="inner").fluid_volume_contacts((weight, a))
+        _disk(env, 4, 0.0, name="bias_m").fluid_volume_contacts((env.add_fluid_volume(P0=0.004, name="bias"), a))
+        assert env.solve().converged
+        w = ms.input_weights(env, a)
+        assert ms.rebuild_activation_pressure(w) == pytest.approx(a.P, rel=1e-9)
+        return {i["input"]: i for i in w["inputs"]}
+
+    soft, stiff = solve(0.0), solve(0.9)
+    assert set(soft) == {"input", "bias"}
+    assert soft["input"]["shells"] == ["inner"]  # the weight chamber and outer membrane are inside the path
+    assert stiff["input"]["W"] > soft["input"]["W"] > 0
+
+
+def test_membrane_to_the_surroundings_is_an_ambient_input():
+    env = ms.Environment()
+    a = env.add_fluid_volume(P0=0.01, bulk_stiffness=0.05, name="act")
+    _disk(env, 0, name="window").fluid_volume_contacts((None, a))  # nothing behind: 0 gauge
+    assert env.solve().converged
+    (path,) = ms.input_weights(env, a)["inputs"]
+    assert path["input"] == "ambient" and path["p"] == 0.0 and path["dp"] == pytest.approx(-a.P)
+    assert path["W"] > 0
+
+
+def test_tangent_weight_matches_finite_difference():
+    def solve(p):
+        env = ms.Environment()
+        a = env.add_fluid_volume(P0=0.002, name="act")  # held at a fixed pressure
+        _disk(env, 0).fluid_volume_contacts((env.add_fluid_volume(P0=p, name="in"), a))
+        assert env.solve(rtol=1e-11).converged
+        return ms.input_weights(env, a)["inputs"][0]
+
+    p, h = 0.01, 1e-5
+    w = solve(p)
+    fd = (solve(p + h)["dV"] - solve(p - h)["dV"]) / (2 * h)
+    assert w["W_tan"] == pytest.approx(fd, rel=1e-4)
+    assert w["W_tan"] < w["W"]  # a membrane stiffens as it inflates
+
+
+def _synthetic_samples(w1=([2.0, 0.5], [2.0, 0.5])):
+    """A neuron with W1(dp) given per side (dp > 0, dp < 0), W2 = 3 and W0 = 1 about p0 = 0, sampled on an
+    input grid that gives dp1 both signs."""
+    samples = []
+    for p1 in np.linspace(0, 20, 6):
+        for p2 in (0.0, 10.0):
+            terms = [(p1, w1, False), (p2, [3.0], False), (0.0, [1.0], True)]
+            pa = ms.solve_activation(terms)
+            samples.append({"p_a": pa, "terms": {"in1": (p1, p1 - pa, float(ms.evaluate_weight(w1, p1 - pa))),
+                                                 "in2": (p2, p2 - pa, 3.0), "W0": (0.0, pa, 1.0)}})
+    return samples
+
+
+def _degrees(result):
+    return {k: {side: f["degree"] for side, f in w["sides"].items() if f is not None}
+            for k, w in result["fits"].items()}
+
+
+def test_solve_activation_is_the_weighted_average_for_constant_weights():
+    pa = ms.solve_activation([(10.0, [2.0], False), (4.0, [1.0], False), (0.0, [1.0], True)])
+    assert pa == pytest.approx((2 * 10 + 1 * 4 + 0) / 4)
+    # a piecewise weight uses the side of its own dp: dp1 = 10 - pa > 0 picks 2, not 7
+    pa = ms.solve_activation([(10.0, ([2.0], [7.0]), False), (4.0, [1.0], False), (0.0, [1.0], True)])
+    assert pa == pytest.approx((2 * 10 + 1 * 4 + 0) / 4)
+
+
+def test_equation_fit_uses_the_lowest_degrees_that_meet_the_tolerance():
+    samples = _synthetic_samples()
+    exact = ms.fit_neuron_equation(samples, tolerance=1e-6)
+    assert exact["met"] and exact["error"] < 1e-6
+    assert _degrees(exact) == {"in1": {"+": 1, "-": 1}, "in2": {"+": 0, "-": 0}, "W0": {"+": 0}}
+    for side in "+-":
+        assert exact["fits"]["in1"]["sides"][side]["coefficients"] == pytest.approx([2.0, 0.5], rel=1e-8)
+    loose = ms.fit_neuron_equation(samples, tolerance=100.0)
+    assert all(d == 0 for w in _degrees(loose).values() for d in w.values())  # constants are enough
+    assert loose["error"] == pytest.approx(max(loose["errors"]))
+
+
+def test_each_sign_of_dp_gets_its_own_polynomial():
+    # W1 jumps from 5 (dp < 0) to 2 (dp > 0): one constant per side is exact, one polynomial is not
+    samples = _synthetic_samples(w1=([2.0], [5.0]))
+    result = ms.fit_neuron_equation(samples, tolerance=1e-9)
+    assert result["met"] and _degrees(result)["in1"] == {"+": 0, "-": 0}
+    assert result["fits"]["in1"]["sides"]["+"]["coefficients"] == pytest.approx([2.0])
+    assert result["fits"]["in1"]["sides"]["-"]["coefficients"] == pytest.approx([5.0])
+    assert set(result["weight_errors"]["in1"]) == {"+", "-"}
+
+
+def test_lowest_total_order_is_never_above_the_greedy_rule():
+    for samples in (_synthetic_samples(), _synthetic_samples(w1=([2.0, 0.3, 0.01], [5.0, -0.2]))):
+        for tolerance in (1e-6, 1e-3, 0.1, 1.0):
+            lowest = ms.fit_neuron_equation(samples, tolerance, ms.LOWEST_TOTAL)
+            greedy = ms.fit_neuron_equation(samples, tolerance, ms.BIGGEST_ERROR)
+            assert lowest["met"] and greedy["met"]
+            order = lambda r: sum(ms.weight_degree(f) for f in r["fits"].values())
+            assert order(lowest) <= order(greedy)
+
+
+def test_weight_without_usable_points_is_left_out():
+    fit = ms.polyfit_weight([0.0, np.nan], [1.0, 2.0], 0)  # dp = 0 is left out
+    assert fit["kind"] == "none"
+    samples = [{"p_a": 5.0, "terms": {"in": (10.0, 5.0, 1.0), "out": (0.0, -5.0, 1.0),
+                                      "W0": (0.0, 0.0, float("nan"))}}]
+    result = ms.fit_neuron_equation(samples, tolerance=1e-9)
+    assert set(result["fits"]) == {"in", "out"} and result["error"] < 1e-9
+    assert result["fits"]["in"]["sides"]["-"] is None  # only sampled with dp > 0
+
+
+def test_neuron_equation_latex():
+    poly = lambda *c: {"kind": "polynomial", "degree": len(c) - 1, "coefficients": list(c)}
+    pw = lambda positive, negative: {"kind": "piecewise", "sides": {"+": positive, "-": negative}}
+    equation = ms.neuron_equation_latex(
+        [("Chamber_Left", pw(poly(1.5e4, -83.6, 0.0, 2.3e-5), poly(3000.0))), ("Chamber_Right", pw(None, poly(2000.0)))],
+        (pw(poly(35.2), None), 0.0), "Chamber_Middle")
+    assert equation["main"] == (r"p_{\mathrm{Chamber\_Middle}} = \frac{W_{1}\,p_{\mathrm{Chamber\_Left}} + "
+                                r"W_{2}\,p_{\mathrm{Chamber\_Right}} + W_{0}\,p_{0}}{W_{1} + W_{2} + W_{0}}")
+    w1, w2, w0 = equation["weights"]
+    assert w1["pieces"] == [(r"15000-83.6\,\Delta p_{1}+2.3 \times 10^{-5}\,\Delta p_{1}^{3}", r"\Delta p_{1} > 0"),
+                            ("3000", r"\Delta p_{1} < 0")]
+    assert w1["definition"] == r"\Delta p_{1} = p_{\mathrm{Chamber\_Left}} - p_{\mathrm{Chamber\_Middle}}"
+    assert w2["pieces"][0][0] == "2000" and r"\mathrm{sampled\ only}\ \Delta p_{2} < 0" in w2["pieces"][0][1]
+    align = ms.equation_align(equation)
+    assert r"W_{1}(\Delta p_{1}) &= \begin{cases} 15000" in align and r"3000, & \Delta p_{1} < 0 \end{cases}" in align
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    figure = Figure()
+    lines = ms.equation_lines(equation)
+    assert [(n, level) for _, n, level in lines] == [(None, 0), (0, 1), (0, 1), (0, 2), (1, 1), (1, 2), (2, 1), (2, 2),
+                                                     (None, 2)]
+    for k, (line, _, _) in enumerate(lines):
+        figure.text(0, k / len(lines), f"${line}$")
+    FigureCanvasAgg(figure).draw()  # mathtext can render every line

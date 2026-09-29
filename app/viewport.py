@@ -18,6 +18,55 @@ def polydata(vertices, faces):
     return pv.PolyData(np.asarray(vertices, dtype=float), np.hstack([np.full((len(faces), 1), 3), faces]).ravel())
 
 
+def solid_shell(x, faces, thickness, values=None, on_cells=False):
+    """Closed solid of a deformed mid-surface: top and bottom faces half a thickness either side
+    along the vertex normals, joined by side walls along the boundary. thickness is a scalar or
+    per vertex. values (per vertex or per face) are carried over to the solid."""
+    x, F = np.asarray(x, dtype=float), np.asarray(faces, dtype=np.int64)
+    n = len(x)
+    face_n = np.cross(x[F[:, 1]] - x[F[:, 0]], x[F[:, 2]] - x[F[:, 0]])  # area weighted
+    normals = np.zeros_like(x)
+    for k in range(3):
+        np.add.at(normals, F[:, k], face_n)
+    normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-300)
+    half = 0.5 * np.broadcast_to(np.asarray(thickness, dtype=float), (n,))[:, None]
+    points = np.vstack([x + half * normals, x - half * normals])
+
+    # Boundary edges (used by one face), kept in that face's winding direction
+    edges = np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]])
+    owner = np.tile(np.arange(len(F)), 3)
+    key = np.sort(edges, axis=1)
+    _, inverse, counts = np.unique(key, axis=0, return_inverse=True, return_counts=True)
+    boundary = counts[inverse.ravel()] == 1
+    a, b = edges[boundary, 0], edges[boundary, 1]
+    sides = np.concatenate([np.stack([a, b, b + n], 1), np.stack([a, b + n, a + n], 1)])
+    solid_faces = np.vstack([F, F[:, ::-1] + n, sides[:, ::-1]])
+    pd = polydata(points, solid_faces)
+    if values is not None:
+        values = np.asarray(values)
+        if on_cells:
+            side_values = np.tile(values[owner[boundary]], 2)
+            pd.cell_data["values"] = np.concatenate([values, values, side_values])
+        else:
+            pd.point_data["values"] = np.concatenate([values, values])
+    return pd
+
+
+def current_thickness(shell, x):
+    """Per-vertex thickness of the deformed shell: incompressible rubber thins as it stretches
+    (t = t0 * A0 / A with nodal areas); other materials keep the rest thickness."""
+    t0 = float(shell.thickness)
+    if shell.material != "neo_hookean":
+        return np.full(len(x), t0)
+    F = shell.faces.cpu().numpy()
+    area = 0.5 * np.linalg.norm(np.cross(x[F[:, 1]] - x[F[:, 0]], x[F[:, 2]] - x[F[:, 0]]), axis=1)
+    nodal = np.zeros(len(x))
+    for k in range(3):
+        np.add.at(nodal, F[:, k], area / 3.0)
+    rest = shell.nodal_area.cpu().numpy()
+    return t0 * rest / np.maximum(nodal, 1e-300)
+
+
 class Viewport(QWidget):
     picked = Signal(int, bool)  # body index, add to selection (Ctrl held)
 
@@ -218,12 +267,11 @@ class Viewport(QWidget):
                 continue
             X = shell.X.cpu().numpy()
             x = X + scale * (coords[index].numpy() - X)
-            pd = polydata(x, shell.faces.cpu().numpy())
             data, on_cells = values[index]
-            if on_cells:
-                pd.cell_data[field] = data
-            else:
-                pd.point_data[field] = data
+            # The whole membrane body (thickness from the true deformed state, not the scaled one)
+            pd = solid_shell(x, shell.faces.cpu().numpy(), current_thickness(shell, coords[index].numpy()),
+                             data, on_cells)
+            pd.rename_array("values", field)
             self._add(f"result{index}", pd, body=index, scalars=field, cmap="turbo", clim=clim,
                       show_edges=self.show_edges, edge_color="#303030", line_width=0.4,
                       show_scalar_bar=first, scalar_bar_args=dict(title=_field_title(field), vertical=True,

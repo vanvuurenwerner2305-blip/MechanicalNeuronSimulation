@@ -121,6 +121,11 @@ class BuildResult:
                               rtol=settings.tolerance, callback=callback, warm_start=warm_start)
 
 
+def fluid_volume(props, body_volume):
+    """Liquid in a 'Closed: incompressible' chamber (mm3); 0 or unset = the whole body volume."""
+    return float(props.get("fluid_volume", 0.0) or 0.0) or float(body_volume)
+
+
 def chamber_model(props, body_volume):
     """Keyword arguments for FluidVolume from a chamber's properties (pressures in MPa, gauge)."""
     kwargs = dict(P0=float(props.get("pressure", 0.0)) * KPA, initial_volume=float(body_volume))
@@ -130,9 +135,11 @@ def chamber_model(props, body_volume):
         liquid = min(max(float(props.get("incompressible", 0.0)), 0.0), 99.0) / 100.0
         kwargs.update(initial_volume=total, gas_volume=(1.0 - liquid) * total, atmospheric_pressure=P_ATM)
     elif model == INCOMPRESSIBLE:
-        # stiffness is given per percent of volume change: dP/dV = s * 100 / V0
+        # stiffness is given per percent of the liquid's volume: dP/dV = s * 100 / V_liquid.
+        # Less liquid than the body volume gives suction, more liquid inflates the chamber.
+        liquid = fluid_volume(props, body_volume)
         per_percent = float(props.get("stiffness", INCOMPRESSIBLE_STIFFNESS)) * KPA
-        kwargs.update(bulk_stiffness=per_percent * 100.0 / float(body_volume))
+        kwargs.update(bulk_stiffness=per_percent * 100.0 / liquid, liquid_volume=liquid)
     elif model == VENT:
         kwargs.update(P0=0.0)
     return kwargs

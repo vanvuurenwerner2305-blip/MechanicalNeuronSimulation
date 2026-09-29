@@ -92,49 +92,59 @@ class Obstacle:
             idx = candidates[start:start + chunk]
             p = points[idx]
 
-            # Broad phase: the nearest mesh vertex bounds the distance; keep triangles whose
-            # bounding box is within that bound.
-            bound2 = torch.cdist(p, self.vertices).min(dim=1).values ** 2
-            box2 = ((self._lo - p[:, None]).clamp_min(0) ** 2 + (p[:, None] - self._hi).clamp_min(0) ** 2).sum(-1)
-            pi, ti = torch.nonzero(box2 <= bound2[:, None] * (1 + 1e-9) + 1e-18, as_tuple=True)
-
-            # Narrow phase on the candidate pairs, keep the closest per point
-            q, feature = _closest_point_pairs(p[pi], self._a[ti], self._b[ti], self._c[ti])
-            d2 = ((p[pi] - q) ** 2).sum(-1)
-            order = torch.argsort(d2, stable=True)
-            order = order[torch.argsort(pi[order], stable=True)]
-            first = torch.ones_like(order, dtype=torch.bool)
-            first[1:] = pi[order][1:] != pi[order][:-1]
-            best = order[first]                                   # one pair per point, in point order
-
-            q, dist = q[best], d2[best].sqrt()
-            normal = self._feature_normals[ti[best], feature[best]]
-            diff = p - q
-            sign = torch.where((diff * normal).sum(-1) < 0, -1.0, 1.0).to(DTYPE)
-            sd[idx] = sign * dist
-            unit = torch.where((dist > 1e-12)[:, None], diff / dist.clamp_min(1e-300)[:, None], sign[:, None] * normal)
-            gradient[idx] = sign[:, None] * unit
-
+            pi, ti = self._candidates(p, margin=0.0)
+            out = self._closest(p, pi, ti, hessian)
+            sd[idx], gradient[idx] = out[0], out[1]
             if hessian:
-                # d2|p - q|/dp2: 0 on a face, (I - uu^T - tt^T)/d on an edge, (I - uu^T)/d at a vertex
-                f = feature[best]
-                eye = torch.eye(3, dtype=DTYPE, device=p.device).expand(len(idx), 3, 3)
-                proj = eye - unit[:, :, None] * unit[:, None, :]
-                tri = torch.stack([self._a[ti[best]], self._b[ti[best]], self._c[ti[best]]], dim=1)
-                start_v = torch.gather(tri, 1, ((f - 1).clamp(0, 2))[:, None, None].expand(-1, 1, 3))[:, 0]
-                end_v = torch.gather(tri, 1, (f % 3)[:, None, None].expand(-1, 1, 3))[:, 0]
-                t = end_v - start_v
-                t = t / t.norm(dim=1, keepdim=True).clamp_min(1e-300)
-                on_edge = ((f >= 1) & (f <= 3))[:, None, None]
-                proj = torch.where(on_edge, proj - t[:, :, None] * t[:, None, :], proj)
-                curved = ((f >= 1) & (dist > 1e-12))[:, None, None]
-                H[idx] = torch.where(curved, sign[:, None, None] * proj / dist.clamp_min(1e-300)[:, None, None],
-                                     torch.zeros_like(proj))
+                H[idx] = out[2]
 
         if self.inverted:
             sd, gradient = -sd, -gradient
             H = -H if hessian else None
         return (sd, gradient, H) if hessian else (sd, gradient)
+
+    def _candidates(self, p, margin: float):
+        """Broad phase: (point, triangle) pairs that can hold a point's closest triangle, also after
+        every point and nothing else moved by up to margin/2. The nearest mesh vertex bounds the
+        distance d; triangles whose bounding box is further than d + margin are left out."""
+        bound = torch.cdist(p, self.vertices).min(dim=1).values + margin
+        box2 = ((self._lo - p[:, None]).clamp_min(0) ** 2 + (p[:, None] - self._hi).clamp_min(0) ** 2).sum(-1)
+        return torch.nonzero(box2 <= (bound ** 2)[:, None] * (1 + 1e-9) + 1e-18, as_tuple=True)
+
+    def _closest(self, p, pi, ti, hessian: bool):
+        """Narrow phase: signed distance (solid = inside the mesh), gradient and Hessian of every
+        point p[i] from its closest triangle among the pairs (pi, ti). Every point needs a pair."""
+        q, feature = _closest_point_pairs(p[pi], self._a[ti], self._b[ti], self._c[ti])
+        d2 = ((p[pi] - q) ** 2).sum(-1)
+        order = torch.argsort(d2, stable=True)
+        order = order[torch.argsort(pi[order], stable=True)]
+        first = torch.ones_like(order, dtype=torch.bool)
+        first[1:] = pi[order][1:] != pi[order][:-1]
+        best = order[first]                                   # one pair per point, in point order
+
+        q, dist = q[best], d2[best].sqrt()
+        normal = self._feature_normals[ti[best], feature[best]]
+        diff = p - q
+        sign = torch.where((diff * normal).sum(-1) < 0, -1.0, 1.0).to(DTYPE)
+        unit = torch.where((dist > 1e-12)[:, None], diff / dist.clamp_min(1e-300)[:, None], sign[:, None] * normal)
+        if not hessian:
+            return sign * dist, sign[:, None] * unit, None
+
+        # d2|p - q|/dp2: 0 on a face, (I - uu^T - tt^T)/d on an edge, (I - uu^T)/d at a vertex
+        f = feature[best]
+        eye = torch.eye(3, dtype=DTYPE, device=p.device).expand(len(p), 3, 3)
+        proj = eye - unit[:, :, None] * unit[:, None, :]
+        tri = torch.stack([self._a[ti[best]], self._b[ti[best]], self._c[ti[best]]], dim=1)
+        start_v = torch.gather(tri, 1, ((f - 1).clamp(0, 2))[:, None, None].expand(-1, 1, 3))[:, 0]
+        end_v = torch.gather(tri, 1, (f % 3)[:, None, None].expand(-1, 1, 3))[:, 0]
+        t = end_v - start_v
+        t = t / t.norm(dim=1, keepdim=True).clamp_min(1e-300)
+        on_edge = ((f >= 1) & (f <= 3))[:, None, None]
+        proj = torch.where(on_edge, proj - t[:, :, None] * t[:, None, :], proj)
+        curved = ((f >= 1) & (dist > 1e-12))[:, None, None]
+        H = torch.where(curved, sign[:, None, None] * proj / dist.clamp_min(1e-300)[:, None, None],
+                        torch.zeros_like(proj))
+        return sign * dist, sign[:, None] * unit, H
 
     def to(self, device):
         self.__init__(self.vertices.cpu().numpy(), self.faces.cpu().numpy(), self.inverted, self.color, device)
@@ -158,6 +168,68 @@ class ObstacleField:
             gradient = torch.where(closer[:, None], out[1], gradient)
             if hessian:
                 H = torch.where(closer[:, None, None], out[2], H)
+        return (sd, gradient, H) if hessian else (sd, gradient)
+
+
+class CachedSignedDistance:
+    """
+    ObstacleField.signed_distance for one fixed set of moving points (a shell's contact nodes),
+    with candidate lists (Verlet lists) instead of a search over every triangle on every call.
+
+    At a rebuild each point keeps the triangles within its current distance + 2 skin; the true
+    closest triangle is then among them for as long as no point has moved more than skin, so the
+    result is exactly that of the full search. Points further than max_distance + skin from every
+    obstacle are left out (+inf) until the next rebuild.
+    """
+
+    def __init__(self, field: ObstacleField, max_distance: float, skin: float):
+        self.field, self.max_distance, self.skin = field, float(max_distance), float(skin)
+        self._reference = None
+        self.rebuilds = 0
+
+    def _rebuild(self, points):
+        self._reference = points.clone()
+        self.rebuilds += 1
+        self._lists = []
+        for obstacle in self.field.obstacles:
+            if obstacle.inverted:
+                idx = torch.arange(len(points), device=points.device)
+            else:
+                reach = self.max_distance + self.skin
+                near = ((points >= obstacle.lower - reach) & (points <= obstacle.upper + reach)).all(dim=1)
+                idx = torch.nonzero(near).flatten()
+            if not len(idx):
+                continue
+            pi, ti = obstacle._candidates(points[idx], margin=2.0 * self.skin)
+            sd, _, _ = obstacle._closest(points[idx], pi, ti, hessian=False)
+            if obstacle.inverted:
+                sd = -sd
+            keep = sd <= self.max_distance + self.skin
+            if not keep.any():
+                continue
+            renumber = torch.full((len(idx),), -1, dtype=torch.long, device=points.device)
+            renumber[keep] = torch.arange(int(keep.sum()), device=points.device)
+            pair = keep[pi]
+            self._lists.append((obstacle, idx[keep], renumber[pi[pair]], ti[pair]))
+
+    def signed_distance(self, points: torch.Tensor, hessian: bool = False):
+        if self._reference is None or len(points) != len(self._reference) or \
+                (points - self._reference).norm(dim=1).max().item() > self.skin:
+            self._rebuild(points)
+        n = len(points)
+        sd = torch.full((n,), math.inf, dtype=DTYPE, device=points.device)
+        gradient = torch.zeros_like(points)
+        H = torch.zeros((n, 3, 3), dtype=DTYPE, device=points.device) if hessian else None
+        for obstacle, idx, pi, ti in self._lists:
+            o_sd, o_gradient, o_H = obstacle._closest(points[idx], pi, ti, hessian)
+            if obstacle.inverted:
+                o_sd, o_gradient = -o_sd, -o_gradient
+                o_H = -o_H if hessian else None
+            closer = o_sd < sd[idx]
+            sd[idx] = torch.where(closer, o_sd, sd[idx])
+            gradient[idx] = torch.where(closer[:, None], o_gradient, gradient[idx])
+            if hessian:
+                H[idx] = torch.where(closer[:, None, None], o_H, H[idx])
         return (sd, gradient, H) if hessian else (sd, gradient)
 
 
