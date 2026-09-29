@@ -15,6 +15,22 @@ IGNORE = "Ignore"
 ROLES = [UNASSIGNED, MEMBRANE, SHELL, RIGID, CHAMBER, IGNORE]
 DEFORMABLE = (MEMBRANE, SHELL)
 
+# Activation-function space: a membrane squeezes a soft tube (the channel), through whatever is bonded
+# to it (a free rigid body or a deformable solid)
+CHANNEL = "Channel (tube)"
+FLUID = "Fluid"
+SOLID = "Solid"
+ACTIVATION_ROLES = [UNASSIGNED, MEMBRANE, SHELL, CHANNEL, FLUID, SOLID, RIGID, IGNORE]
+CONSTANT_FLUID, DYNAMIC_FLUID = "Constant pressure", "Dynamic pressure"
+# flow connections between fluids (and from a dynamic fluid to the outside)
+OPENING, ORIFICE, CLOSED = "Opening (no resistance)", "Orifice", "Closed"
+CONNECTION_TYPES = (OPENING, ORIFICE, CLOSED)
+LEGACY_ROLES = {"Channel input side": "Fluid", "Channel output side": "Fluid"}
+FIXED, FREE = "Fixed", "Free (moves as a rigid body)"
+SOLID_FREE, SOLID_FIXED = "Free (held by what it is bonded to)", "Fixed where it touches fixed rigid bodies"
+NEURON_SPACE, ACTIVATION_SPACE = "neuron", "activation"
+SPACE_ROLES = {NEURON_SPACE: ROLES, ACTIVATION_SPACE: ACTIVATION_ROLES}
+
 ROLE_COLORS = {
     UNASSIGNED: "#c8c8c8",
     MEMBRANE: "#e4572e",
@@ -22,8 +38,13 @@ ROLE_COLORS = {
     RIGID: "#6c7a89",
     CHAMBER: "#29a0d6",
     IGNORE: "#eeeeee",
+    CHANNEL: "#c77dff",
+    FLUID: "#1f77b4",
+    SOLID: "#b5838d",
 }
-ROLE_OPACITY = {UNASSIGNED: 1.0, MEMBRANE: 1.0, SHELL: 1.0, RIGID: 1.0, CHAMBER: 0.25, IGNORE: 0.1}
+FREE_RIGID_COLOR = "#8d6e63"
+ROLE_OPACITY = {UNASSIGNED: 1.0, MEMBRANE: 1.0, SHELL: 1.0, RIGID: 1.0, CHAMBER: 0.25, IGNORE: 0.1,
+                CHANNEL: 1.0, FLUID: 0.35, SOLID: 1.0}
 
 ROLE_HELP = {
     UNASSIGNED: "Not used in the simulation until a role is assigned.",
@@ -31,10 +52,19 @@ ROLE_HELP = {
               "A face that touches no chamber sees the surroundings (0 kPa).",
     SHELL: "Thin deformable sheet with bending stiffness. Simulated on its mid-surface. "
            "A face that touches no chamber sees the surroundings (0 kPa).",
-    RIGID: "Fixed, undeformable part. Membranes and shells cannot pass through it.",
+    RIGID: "Undeformable part. Membranes and shells cannot pass through it. In the activation-function space it "
+           "can also be free: it then moves and tilts as a rigid body, bonded to the membrane that touches it "
+           "(e.g. a pusher), and presses on the tube and solids by contact.",
     CHAMBER: "Fluid/gas region. Its pressure acts on every membrane or shell it touches. "
              "Pressures are gauge: the surroundings are 0 kPa.",
     IGNORE: "Excluded from the simulation.",
+    CHANNEL: "The soft tube that is squeezed shut. Simulated as a 3D solid (tetrahedra), held fixed at its "
+             "two end faces. A dynamic fluid body fills its inside.",
+    FLUID: "A body of gas. Constant pressure: a supply or sink held at a set pressure (e.g. the inlet, or 0 kPa at "
+           "the far end). Dynamic pressure: its pressure follows from the flow; inside the tube it is split into "
+           "segments, each a flow resistance. Where two fluids touch there is a flow connection (Flow tab).",
+    SOLID: "Deformable 3D solid (tetrahedra), e.g. a soft pusher. A membrane touching it is bonded to it; it "
+           "touches the tube and other solids by contact. Free by default, or fixed where it touches fixed rigid bodies.",
 }
 
 # Chamber models
@@ -57,6 +87,10 @@ def _hex(rgb):
 
 def part_color(part) -> str:
     """Display colour: by role, and for chambers by pressure model (gas: darker = more liquid)."""
+    if part.role == RIGID and part.props.get("motion") == FREE:
+        return FREE_RIGID_COLOR
+    if part.role == FLUID:
+        return CHAMBER_COLORS[CONSTANT] if part.props.get("model") == CONSTANT_FLUID else ROLE_COLORS[FLUID]
     if part.role != CHAMBER:
         return ROLE_COLORS[part.role]
     model = part.props.get("model", CONSTANT)
@@ -168,6 +202,67 @@ ROLE_FIELDS = {
 }
 
 
+from membrane_sim.flow import LAW_VARIABLES, ORIFICE_LAW, SEGMENT_LAW  # noqa: E402
+
+FLOW_LAW_HELP = ("Pressure drop in Pa for a positive mass flow, SI units:\n"
+                 "  mdot  mass flow (kg/s)          rho  gas density (kg/m³, ideal gas at the local pressure)\n"
+                 "  mu    viscosity (Pa s)           p    mean absolute pressure (Pa)\n"
+                 "  p_up, p_down  absolute pressures either side (Pa)   rho_up  density upstream (kg/m³)\n"
+                 "  A     cross-sectional area (m²)  P    wetted perimeter (m)   Dh = 4A/P (m)\n"
+                 "  h, w  height and width of the section (m)   L  length of the segment (m)\n"
+                 "Numpy functions (sqrt, exp, ...) are allowed. A segment uses the smallest section in it.\n"
+                 "A connection's A, P, h, w are those of the contact face between the two bodies; for a smaller\n"
+                 "orifice type its area as a number, e.g. (mdot/(0.61*0.05e-6))**2/(2*rho_up) for 0.05 mm².\n"
+                 "Laminar (default): 32*mu*L*mdot/(rho*A*Dh**2)    Orifice: (mdot/(0.61*A))**2/(2*rho_up)")
+
+ROLE_FIELDS.update({
+    CHANNEL: [
+        Field("youngs_modulus", "Young's modulus", "float", 0.5, "MPa", 1e-9, 1e6, 5),
+        Field("poisson_ratio", "Poisson's ratio", "float", 0.45, "", 0.0, 0.499, 3,
+              tooltip="Compressible neo-Hookean solid. Silicone is nearly incompressible (0.45-0.49); values "
+                      "close to 0.5 make the elements too stiff (locking)."),
+        Field("element_order", "Elements", "choice", "Quadratic (10-node)",
+              choices=("Quadratic (10-node)", "Linear (4-node)"), mesh=True,
+              tooltip="Quadratic tetrahedra bend correctly with one or two elements through a wall; linear "
+                      "ones are far too stiff in bending unless the mesh is very fine."),
+        Field("elements_per_side", "Elements per shortest side", "int", 6, "", 1, 1000, mesh=True,
+              tooltip="Mesh density: number of elements along the tube's shortest outside dimension."),
+    ],
+    FLUID: [
+        Field("model", "Pressure", "choice", DYNAMIC_FLUID, choices=(CONSTANT_FLUID, DYNAMIC_FLUID),
+              tooltip="Constant pressure: held at the pressure you set (a supply, or 0 kPa for the far end).\n"
+                      "Dynamic pressure: follows from the flow through the connections and segments."),
+        Field("pressure", "Pressure (gauge)", "float", 0.0, "kPa", -1e6, 1e6, 4,
+              visible_if=("model", (CONSTANT_FLUID,))),
+        Field("segments", "Segments", "int", 10, "", 1, 1000, visible_if=("model", (DYNAMIC_FLUID,)),
+              tooltip="Inside a tube: the number of slices along the tube, each a flow resistance in series with "
+                      "its own pressure on the tube wall. Elsewhere a dynamic fluid is one pressure."),
+        Field("segment_law", "Segment resistance Δp", "text", SEGMENT_LAW, "Pa",
+              visible_if=("model", (DYNAMIC_FLUID,)), tooltip=FLOW_LAW_HELP),
+    ],
+    SOLID: [
+        Field("youngs_modulus", "Young's modulus", "float", 0.5, "MPa", 1e-9, 1e6, 5),
+        Field("poisson_ratio", "Poisson's ratio", "float", 0.45, "", 0.0, 0.499, 3,
+              tooltip="Compressible neo-Hookean solid; values close to 0.5 make the elements too stiff."),
+        Field("support", "Support", "choice", SOLID_FREE, choices=(SOLID_FREE, SOLID_FIXED),
+              tooltip="Free: held only by the membrane bonded to it (and contact).\n"
+                      "Fixed: its nodes that touch a fixed rigid body are held in place."),
+        Field("element_order", "Elements", "choice", "Quadratic (10-node)",
+              choices=("Quadratic (10-node)", "Linear (4-node)"), mesh=True),
+        Field("elements_per_side", "Elements per shortest side", "int", 4, "", 1, 1000, mesh=True),
+    ],
+})
+
+# The rigid body of the activation-function space can also move
+ACTIVATION_ROLE_FIELDS = dict(ROLE_FIELDS)
+ACTIVATION_ROLE_FIELDS[RIGID] = [
+    Field("motion", "Motion", "choice", FIXED, choices=(FIXED, FREE),
+          tooltip="Fixed: held in place.\nFree: moves and tilts as a rigid body (6 degrees of freedom), bonded to "
+                  "the membrane that touches it, e.g. a pusher."),
+] + ROLE_FIELDS[RIGID]
+SPACE_ROLE_FIELDS = {NEURON_SPACE: ROLE_FIELDS, ACTIVATION_SPACE: ACTIVATION_ROLE_FIELDS}
+
+
 def default_props(role: str) -> dict:
     return {f.key: f.default for f in ROLE_FIELDS[role]}
 
@@ -181,10 +276,13 @@ class PartSettings:
 
     def set_role(self, role: str):
         if role != self.role:
-            old = self.props
+            old, same_kind = self.props, self.role in DEFORMABLE and role in DEFORMABLE
             self.role = role
             self.props = default_props(role)
-            self.props.update({k: v for k, v in old.items() if k in self.props})
+            # keep shared settings (material, thickness...); the mesh density only between membrane and
+            # shell: a rigid body's or tube's density would give a solid part a far too fine mesh
+            self.props.update({k: v for k, v in old.items()
+                               if k in self.props and (same_kind or k != "elements_per_side")})
 
 
 @dataclass
@@ -212,11 +310,23 @@ class Project:
         self.solver = SolverSettings()
         self.path = None
 
+    space = NEURON_SPACE
+    suffix = ".mns"
+
     def auto_assign_from_names(self, only_unassigned: bool = True):
         """Guess roles from part names (membrane, shell, chamber/fluid/cavity, ...)."""
         rules = [(("membrane", "diaphragm", "skin"), MEMBRANE), (("shell",), SHELL),
                  (("chamber", "fluid", "cavity", "air", "gas", "volume"), CHAMBER),
                  (("ignore",), IGNORE)]
+        movers = ()  # names of parts that become free rigid bodies
+        if self.space == ACTIVATION_SPACE:
+            rules = [(("membrane", "diaphragm", "skin"), MEMBRANE), (("shell",), SHELL),
+                     (("fluid", "cavity", "inlet", "input", "outlet", "output", "source", "supply", "sink",
+                       "ambient", "outside", "air", "gas"), FLUID),
+                     (("tube", "channel", "hose"), CHANNEL),
+                     (("pusher", "squisher", "plunger", "piston"), RIGID),
+                     (("solid", "pad"), SOLID), (("ignore",), IGNORE)]
+            movers = ("pusher", "squisher", "plunger", "piston")
         changed = 0
         for part in self.parts:
             if only_unassigned and part.role != UNASSIGNED:
@@ -224,9 +334,24 @@ class Project:
             name = part.name.lower()
             role = next((r for keys, r in rules if any(k in name for k in keys)), RIGID)
             if role != part.role:
-                part.set_role(role)
+                self.set_role(part, role)
                 changed += 1
+            if self.space == ACTIVATION_SPACE and role == RIGID and any(k in name for k in movers):
+                part.props["motion"] = FREE
+            if role == FLUID:  # supplies and sinks hold their pressure; the fluid inside the tube is dynamic
+                sources = ("inlet", "input", "source", "supply", "outlet", "sink", "ambient", "outside")
+                part.props["model"] = CONSTANT_FLUID if any(k in name for k in sources) else DYNAMIC_FLUID
         return changed
+
+    @property
+    def role_fields(self):
+        return SPACE_ROLE_FIELDS[self.space]
+
+    def set_role(self, part, role):
+        """Assign a role, with the defaults of this space's property fields."""
+        part.set_role(role)
+        for f in self.role_fields[role]:
+            part.props.setdefault(f.key, f.default)
 
     # -----------------------------
     # Persistence

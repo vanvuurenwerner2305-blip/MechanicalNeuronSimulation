@@ -51,6 +51,14 @@ class SurfaceMesh:
 
 
 @dataclass
+class VolumeMesh:
+    vertices: np.ndarray        # (N, 3)
+    tets: np.ndarray            # (T, 4) or (T, 10)
+    faces: np.ndarray           # (F, 3) boundary sub-triangles, outward oriented
+    face_surface: np.ndarray    # (F,) CAD surface tag of every boundary triangle
+
+
+@dataclass
 class MidSurface:
     vertices: np.ndarray
     faces: np.ndarray           # normal points out of the solid through the primary CAD face
@@ -58,10 +66,19 @@ class MidSurface:
     node_thickness: np.ndarray
 
 
+_ACTIVE = None  # the CadModel whose STEP file is currently in gmsh's (single, global) model
+
+
 class CadModel:
     def __init__(self):
         self.path = None
         self.bodies = []
+
+    def _ensure_active(self):
+        """gmsh holds one model: if another CadModel (the other space) loaded a file since, load ours again.
+        Re-importing the same file gives the same entity tags."""
+        if _ACTIVE is not self and self.path:
+            self.load_step(self.path)
 
     # -----------------------------
     # Import
@@ -77,6 +94,8 @@ class CadModel:
         gmsh.model.occ.importShapes(str(path), highestDimOnly=True)
         gmsh.model.occ.synchronize()
 
+        global _ACTIVE
+        _ACTIVE = self
         self.path = str(path)
         self.bodies = []
         entities = gmsh.model.getEntities(3)
@@ -116,6 +135,7 @@ class CadModel:
         Triangulate the boundary of every body. sizes: {body index: target element size (mm)}.
         Returns {body index: SurfaceMesh}.
         """
+        self._ensure_active()
         gmsh.model.mesh.clear()
         gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 1)
         gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 1)
@@ -144,6 +164,62 @@ class CadModel:
             faces = orient_outward(vertices, inverse.reshape(-1, 3))
             meshes[body.index] = SurfaceMesh(vertices, faces, np.concatenate(owner))
         return meshes
+
+    def volume_mesh(self, index: int, size: float, order: int = 2) -> "VolumeMesh":
+        """
+        Tetrahedral mesh of one body (e.g. a soft tube), 10-node tetrahedra for order 2.
+        Boundary triangles come back split into flat sub-triangles (4 per 6-node triangle),
+        outward oriented, each with its CAD surface tag. Clears any other mesh in gmsh.
+        """
+        self._ensure_active()
+        body = self.bodies[index]
+        gmsh.model.mesh.clear()
+        gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 1)
+        gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 1)
+        gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+        gmsh.option.setNumber("Mesh.Algorithm", 6)
+        gmsh.option.setNumber("Mesh.Algorithm3D", 1)
+        gmsh.option.setNumber("Mesh.ElementOrder", 1)
+        gmsh.option.setNumber("Mesh.MeshOnlyVisible", 1)
+        try:
+            gmsh.model.setVisibility(gmsh.model.getEntities(3), 0, recursive=True)
+            gmsh.model.setVisibility([(3, body.tag)], 1, recursive=True)
+            points = gmsh.model.getBoundary([(3, body.tag)], recursive=True)
+            gmsh.model.mesh.setSize(points, float(size))
+            gmsh.model.mesh.generate(3)
+            if order == 2:
+                gmsh.model.mesh.setOrder(2)
+            node_tags, coords, _ = gmsh.model.mesh.getNodes()
+            lookup = np.zeros(int(node_tags.max()) + 1, dtype=np.int64)
+            lookup[node_tags.astype(np.int64)] = np.arange(len(node_tags))
+            coords = coords.reshape(-1, 3)
+            tet_type = 11 if order == 2 else 4
+            tets = lookup[gmsh.model.mesh.getElementsByType(tet_type, body.tag)[1].astype(np.int64)]
+            tets = tets.reshape(-1, 10 if order == 2 else 4)
+            tri_type = 9 if order == 2 else 2
+            faces, owner = [], []
+            for surface, _ in body.surfaces:
+                tri = lookup[gmsh.model.mesh.getElementsByType(tri_type, surface)[1].astype(np.int64)]
+                tri = tri.reshape(-1, 6 if order == 2 else 3)
+                if order == 2:  # corners 0 1 2, mid-edge nodes 3 (01), 4 (12), 5 (20)
+                    tri = np.concatenate([tri[:, [0, 3, 5]], tri[:, [3, 1, 4]], tri[:, [5, 4, 2]],
+                                          tri[:, [3, 4, 5]]])
+                faces.append(tri)
+                owner.append(np.full(len(tri), surface))
+        finally:
+            gmsh.model.setVisibility(gmsh.model.getEntities(3), 1, recursive=True)
+            gmsh.option.setNumber("Mesh.MeshOnlyVisible", 0)
+            gmsh.option.setNumber("Mesh.ElementOrder", 1)
+            gmsh.model.mesh.clear()
+        used, inverse = np.unique(tets, return_inverse=True)
+        renumber = np.full(len(coords), -1, dtype=np.int64)
+        renumber[used] = np.arange(len(used))
+        faces = renumber[np.vstack(faces)]
+        if (faces < 0).any():
+            raise ValueError(f"{body.name}: surface and volume meshes do not match.")
+        vertices = coords[used]
+        return VolumeMesh(vertices, inverse.reshape(tets.shape), orient_outward(vertices, faces),
+                          np.concatenate(owner))
 
     # -----------------------------
     # Thin bodies

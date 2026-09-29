@@ -16,7 +16,7 @@ from qtpy.QtWidgets import (QApplication, QComboBox, QDockWidget, QFileDialog, Q
 from .builder import KPA, build_environment, generate_mesh, measure_thickness, mesh_sizes
 from .cad import CadModel
 from .panels import ModelTree, PropertyPanel, ResultsPanel, SolverPanel
-from .project import CHAMBER, DEFORMABLE, ROLE_FIELDS, Project
+from .project import CHAMBER, DEFORMABLE, ROLE_FIELDS, ROLES, Project
 from .sweep import SweepDialog
 from .viewport import Viewport, polydata
 from .workers import Worker
@@ -64,13 +64,20 @@ rigid bodies). Their largest CAD face defines the mid-surface.</li>
 
 
 class MainWindow(QMainWindow):
+    """The neuron space (inputs -> activation). ActivationWindow subclasses it for the
+    activation-function space; these class attributes are what differs."""
+    SPACE_ROLES = ROLES
+    PROJECT_CLASS = Project
+    PROJECT_FILTER = "Project (*.mns)"
+    TITLE = APP_NAME
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_NAME)
+        self.setWindowTitle(self.TITLE)
         self.resize(1500, 900)
 
         self.cad = CadModel()
-        self.project = Project()
+        self.project = self.PROJECT_CLASS()
         self.surfaces = {}           # body index -> SurfaceMesh (display)
         self.mesh_data = None        # simulation mesh
         self.mesh_stale = True
@@ -97,7 +104,7 @@ class MainWindow(QMainWindow):
         self.viewport.picked.connect(self._on_pick)
         self.setCentralWidget(self.viewport)
 
-        self.tree = ModelTree()
+        self.tree = ModelTree(roles=self.SPACE_ROLES)
         self.tree.selection_changed.connect(lambda idx: self.set_selection(idx, from_tree=True))
         self.tree.visibility_changed.connect(self._on_visibility)
         self.tree.role_requested.connect(self._on_role_changed)
@@ -108,18 +115,20 @@ class MainWindow(QMainWindow):
         dock.setWidget(self.tree)
         self.addDockWidget(Qt.LeftDockWidgetArea, dock)
 
-        self.properties = PropertyPanel()
+        self.properties = PropertyPanel(roles=self.SPACE_ROLES, role_fields=self.PROJECT_CLASS().role_fields)
         self.properties.role_changed.connect(self._on_role_changed)
         self.properties.props_changed.connect(self._on_props_changed)
         self.solver_panel = SolverPanel()
         self.solver_panel.changed.connect(self._on_solver_changed)
-        self.results_panel = ResultsPanel()
+        self.results_panel = self._make_results_panel()
         self.results_panel.display_changed.connect(self._on_results_display)
         self.results_panel.export_vtk.connect(self.export_vtk)
         self.results_panel.export_csv.connect(self.export_csv)
         self.results_panel.screenshot.connect(self.save_screenshot)
         self.tabs = QTabWidget()
         self.tabs.addTab(self.properties, "Part")
+        for widget, title in self._extra_tabs():
+            self.tabs.addTab(widget, title)
         self.tabs.addTab(self.solver_panel, "Solver")
         self.tabs.addTab(self.results_panel, "Results")
         dock = QDockWidget("Properties", self)
@@ -147,6 +156,12 @@ class MainWindow(QMainWindow):
         self.statusBar().addWidget(self.status_label, 1)
         self.statusBar().addPermanentWidget(self.progress)
         self.statusBar().addPermanentWidget(self.cancel_button)
+
+    def _make_results_panel(self):
+        return ResultsPanel()
+
+    def _extra_tabs(self):
+        return []
 
     def _action(self, text, slot, shortcut=None, icon=None, tip=None):
         action = QAction(text, self)
@@ -264,7 +279,7 @@ class MainWindow(QMainWindow):
         self.view_actions[MESH].setEnabled(loaded)
         self.view_actions[RESULTS].setEnabled(self.build is not None)
         name = Path(self.project.path or self.cad.path or "").name
-        self.setWindowTitle(f"{APP_NAME} — {name}" if name else APP_NAME)
+        self.setWindowTitle(f"{self.TITLE} — {name}" if name else self.TITLE)
         mesh = "mesh up to date" if (self.mesh_data is not None and not self.mesh_stale) else "not meshed"
         if loaded:
             assigned = sum(p.role != "Unassigned" for p in self.project.parts)
@@ -298,12 +313,12 @@ class MainWindow(QMainWindow):
 
     def open_project(self, path=None):
         if not path:
-            path, _ = QFileDialog.getOpenFileName(self, "Open project", self._dialog_dir(), "Project (*.mns)")
+            path, _ = QFileDialog.getOpenFileName(self, "Open project", self._dialog_dir(), self.PROJECT_FILTER)
             if not path:
                 return
         self._remember_dir(path)
         try:
-            project = Project.load(path)
+            project = self.PROJECT_CLASS.load(path)
         except Exception as exc:
             QMessageBox.critical(self, "Open project", f"Could not read the project:\n{exc}")
             return
@@ -317,7 +332,7 @@ class MainWindow(QMainWindow):
         try:
             bodies = self.cad.load_step(step_path)
             if project is None:
-                project = Project(step_path, [b.name for b in bodies])
+                project = self.PROJECT_CLASS(step_path, [b.name for b in bodies])
             else:
                 project.match_bodies(bodies)
             self.project = project
@@ -343,13 +358,18 @@ class MainWindow(QMainWindow):
             self.log_message("Click a part to assign its role, or use Edit → Auto-assign roles from names.")
         self.set_mode(MODEL)
         self.set_selection([])
+        self._after_load()
         self._update_actions()
+
+    def _after_load(self):
+        pass
 
     def save_project(self, save_as=False):
         path = self.project.path
         if save_as or not path:
-            default = str(Path(self.cad.path).with_suffix(".mns")) if self.cad.path else "project.mns"
-            path, _ = QFileDialog.getSaveFileName(self, "Save project", default, "Project (*.mns)")
+            suffix = self.PROJECT_CLASS.suffix
+            default = str(Path(self.cad.path).with_suffix(suffix)) if self.cad.path else "project" + suffix
+            path, _ = QFileDialog.getSaveFileName(self, "Save project", default, self.PROJECT_FILTER)
             if not path:
                 return
         self.project.step_path = self.cad.path
@@ -421,7 +441,7 @@ class MainWindow(QMainWindow):
 
     def _on_role_changed(self, indices, role):
         for i in indices:
-            self.project.parts[i].set_role(role)
+            self.project.set_role(self.project.parts[i], role)
         self._detect_thickness(indices)
         self.log_message(f"{', '.join(self.project.parts[i].name for i in indices)} → {role}")
         self.tree.refresh(self.project.parts)
@@ -433,7 +453,7 @@ class MainWindow(QMainWindow):
         rebuild = False
         for i in indices:
             part = self.project.parts[i]
-            spec = {f.key: f for f in ROLE_FIELDS[part.role]}.get(key)
+            spec = {f.key: f for f in self.project.role_fields[part.role]}.get(key)
             if spec is None or part.props.get(key) == value:
                 continue
             part.props[key] = value

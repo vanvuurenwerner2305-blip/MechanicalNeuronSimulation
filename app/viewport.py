@@ -5,7 +5,7 @@ from pyvistaqt import QtInteractor
 from qtpy.QtCore import QTimer, Signal
 from qtpy.QtWidgets import QVBoxLayout, QWidget
 
-from .project import DEFORMABLE, RIGID, ROLE_COLORS, part_color, part_opacity
+from .project import DEFORMABLE, FREE_RIGID_COLOR, RIGID, ROLE_COLORS, part_color, part_opacity
 
 SELECTED = "#ffcc00"
 AXES = {"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1)}
@@ -50,6 +50,15 @@ def solid_shell(x, faces, thickness, values=None, on_cells=False):
         else:
             pd.point_data["values"] = np.concatenate([values, values])
     return pd
+
+
+def body_kind(body):
+    """'shell' (mid-surface sheet), 'solid' (tetrahedra) or 'rigid' (moving rigid body)."""
+    if getattr(body, "is_rigid", False):
+        return "rigid"
+    if hasattr(body, "tets"):
+        return "solid"
+    return "shell"
 
 
 def current_thickness(shell, x):
@@ -239,6 +248,20 @@ class Viewport(QWidget):
                     if fixed.any():
                         self._add(f"fixed{index}", pv.PolyData(mid.vertices[fixed]), color="#1b4f9c",
                                   point_size=6, render_points_as_spheres=True, pickable=False)
+                    tied = getattr(build, "tie_nodes", {}).get(index)
+                    if tied is not None and len(tied):
+                        self._add(f"tied{index}", pv.PolyData(mid.vertices[tied]), color=FREE_RIGID_COLOR,
+                                  point_size=6, render_points_as_spheres=True, pickable=False)
+            elif index in getattr(mesh_data, "volumes", {}):
+                vol = mesh_data.volumes[index]
+                self._add(f"body{index}", polydata(vol.vertices, vol.faces), body=index, color=color,
+                          opacity=1.0 if selected else max(self.opacity, 0.6), show_edges=True,
+                          edge_color="#202020", line_width=0.4, pickable=True)
+                if build is not None and index in build.shells:
+                    fixed = build.shells[index].fixed.cpu().numpy()
+                    if fixed.any():
+                        self._add(f"fixed{index}", pv.PolyData(vol.vertices[fixed]), color="#1b4f9c",
+                                  point_size=5, render_points_as_spheres=True, pickable=False)
             else:
                 self._add(f"body{index}", polydata(mesh.vertices, mesh.faces), body=index, color=color,
                           opacity=self._selected_opacity() if selected
@@ -268,9 +291,17 @@ class Viewport(QWidget):
             X = shell.X.cpu().numpy()
             x = X + scale * (coords[index].numpy() - X)
             data, on_cells = values[index]
-            # The whole membrane body (thickness from the true deformed state, not the scaled one)
-            pd = solid_shell(x, shell.faces.cpu().numpy(), current_thickness(shell, coords[index].numpy()),
-                             data, on_cells)
+            kind = body_kind(shell)
+            if kind == "shell":
+                # The whole membrane body (thickness from the true deformed state, not the scaled one)
+                pd = solid_shell(x, shell.faces.cpu().numpy(), current_thickness(shell, coords[index].numpy()),
+                                 data, on_cells)
+            else:
+                pd = polydata(x, shell.faces.cpu().numpy())
+                if on_cells:
+                    pd.cell_data["values"] = data
+                else:
+                    pd.point_data["values"] = data
             pd.rename_array("values", field)
             self._add(f"result{index}", pd, body=index, scalars=field, cmap="turbo", clim=clim,
                       show_edges=self.show_edges, edge_color="#303030", line_width=0.4,
@@ -293,6 +324,9 @@ class Viewport(QWidget):
             if field == "Area stretch":
                 F = shell.faces.cpu().numpy()
                 x = coords.numpy()
+                if body_kind(shell) == "rigid":
+                    out[index] = (np.ones(len(F)), True)
+                    continue
                 area = 0.5 * np.linalg.norm(np.cross(x[F[:, 1]] - x[F[:, 0]], x[F[:, 2]] - x[F[:, 0]]), axis=1)
                 out[index] = (area / shell.rest_area.cpu().numpy(), True)
             elif field == "Displacement magnitude":

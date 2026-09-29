@@ -30,7 +30,6 @@ import scipy.sparse.linalg as spla
 import torch
 
 from .contact import CachedSignedDistance, ObstacleField
-from .fluid import cone_volume_grad, cone_volume_hess
 from .shell_contact import ShellContact
 
 DTYPE = torch.float64
@@ -54,7 +53,16 @@ class NewtonSolver:
     def __init__(self, shells, fluid_volumes, obstacles,
                  contact_stiffness: float, contact_offset: float = 0.0,
                  rtol: float = 1e-8, atol: float = 1e-12, step_tol: float = 1e-10,
-                 max_iterations: int = 40, max_step: float = None, verbose: bool = False, callback=None):
+                 max_iterations: int = 40, max_step: float = None, verbose: bool = False, callback=None,
+                 couplings=(), surface_contacts=()):
+        """
+        shells           : the bodies with dofs: Shell, Solid (membrane_sim.solid) or RigidBody
+                           (membrane_sim.rigid); anything with the same interface.
+        couplings        : extra energy terms between bodies, e.g. RigidTie / MovingContact; each has
+                           bind(solver) and terms(tangent) -> [(global dofs, energy, gradient, Hessian)].
+        surface_contacts : extra ShellContact objects built from explicit node/face pairs (e.g. the
+                           inside walls of a tube touching each other).
+        """
         self.shells = list(shells)
         self.fluid_volumes = list(fluid_volumes)
         self.field = ObstacleField(obstacles) if obstacles else None
@@ -78,7 +86,8 @@ class NewtonSolver:
         self.global_to_free[self.free_dofs] = np.arange(self.n_free)
         self._free_t = torch.as_tensor(self.free_dofs, device=self.device)
 
-        is_coord = np.concatenate([np.r_[np.ones(3 * s.n_nodes, bool), np.zeros(s.n_edges, bool)]
+        is_coord = np.concatenate([np.asarray(s.coord_mask, bool) if hasattr(s, "coord_mask") else
+                                   np.r_[np.ones(3 * s.n_nodes, bool), np.zeros(s.n_edges, bool)]
                                    for s in self.shells])
         self._free_is_coord = torch.as_tensor(is_coord[self.free_dofs], device=self.device)
 
@@ -90,18 +99,26 @@ class NewtonSolver:
         # (NeuronTest.mns stalled at 1% residual).
         self._contact_nodes, self._contact_offsets = {}, {}
         for s in self.shells:
+            if getattr(s, "is_rigid", False):
+                continue
             fixed = s.fixed.cpu().numpy()
             next_to_clamp = np.zeros_like(fixed)
             next_to_clamp[s.faces_np[fixed[s.faces_np].any(axis=1)]] = True
             next_to_clamp &= ~fixed
-            nodes = torch.nonzero(~s.fixed).flatten()
+            candidates = torch.zeros_like(s.fixed)
+            candidates[getattr(s, "surface_nodes", torch.arange(s.n_nodes, device=self.device))] = True
+            nodes = torch.nonzero(candidates & ~s.fixed).flatten()
             offset = torch.full((len(nodes),), float(getattr(s, "contact_offset", None) or contact_offset),
                                 dtype=DTYPE, device=self.device)
             if self.field is not None and len(nodes):
-                rest_sd, _ = self.field.signed_distance(s.X[nodes], max_distance=1.25 * offset.max().item() + 1e-9)
+                overlap = getattr(s, "allow_initial_overlap", False)
+                reach = 1.25 * offset.max().item() + (0.01 * _size(s.X) if overlap else 1e-9)
+                rest_sd, _ = self.field.signed_distance(s.X[nodes], max_distance=reach)
                 at_clamp_wall = torch.as_tensor(next_to_clamp, device=self.device)[nodes] & (rest_sd <= 1.25 * offset)
                 nodes, offset, rest_sd = nodes[~at_clamp_wall], offset[~at_clamp_wall], rest_sd[~at_clamp_wall]
-                offset = torch.minimum(offset, rest_sd.clamp_min(0.0))
+                # Solids may start exactly on an obstacle (or overlap it by the faceting of curved CAD
+                # faces): that rest contact is neutral. Sheets keep at least a zero offset.
+                offset = torch.minimum(offset, rest_sd if overlap else rest_sd.clamp_min(0.0))
             self._contact_nodes[id(s)], self._contact_offsets[id(s)] = nodes, offset
 
         X = torch.cat([s.X for s in self.shells])
@@ -113,16 +130,27 @@ class NewtonSolver:
         self._rigid_cache = {}
         if self.field is not None:
             for s in self.shells:
-                offset = self._contact_offsets[id(s)]
+                offset = self._contact_offsets.get(id(s), ())
                 if len(offset):
                     reach = offset.max().item() + 1e-9
                     self._rigid_cache[id(s)] = CachedSignedDistance(
                         self.field, reach, skin=max(reach, 0.01 * self.length_scale))
 
-        # Contact between membranes/shells
-        self.shell_contact = None
-        if contact_stiffness > 0 and len(self.shells) > 1:
-            self.shell_contact = ShellContact(self.shells, contact_stiffness, search_distance=2 * self.max_step) or None
+        # Contact between membranes/shells (and any explicit surface contact pairs)
+        sheets = [s for s in self.shells if getattr(s, "sheet_contact", True)]
+        self.surface_contacts = []
+        if contact_stiffness > 0 and len(sheets) > 1:
+            contact = ShellContact(sheets, contact_stiffness, search_distance=2 * self.max_step)
+            if contact:
+                self.surface_contacts.append(contact)
+        for contact in surface_contacts:
+            if contact:
+                contact.search_distance = max(contact.search_distance, 2 * self.max_step)
+                self.surface_contacts.append(contact)
+        self.shell_contact = self.surface_contacts[0] if self.surface_contacts else None
+        self.couplings = list(couplings)
+        for coupling in self.couplings:
+            coupling.bind(self)
 
     # -----------------------------
     # State
@@ -171,12 +199,11 @@ class NewtonSolver:
             energy -= work
 
             g_vol = torch.zeros_like(R)
-            for shell, side, _ in v.boundaries:
-                xe = shell.x[shell.faces] - shell.volume_origin
-                dofs = shell.face_dofs + self.dof_offset[id(shell)]
-                g_vol.index_add_(0, dofs.reshape(-1), side * cone_volume_grad(xe).reshape(-1))
-                if tangent and P != 0.0:
-                    add_block(dofs, cone_volume_hess(xe).reshape(-1, 9, 9), -side * P)
+            for body, dofs, g, H in v.volume_terms(tangent and P != 0.0):
+                dofs = dofs + self.dof_offset[id(body)]
+                g_vol.index_add_(0, dofs.reshape(-1), g.reshape(-1))
+                if H is not None:
+                    add_block(dofs, H, -P)
             f_pressure += P * g_vol
             if tangent and dP != 0.0:
                 U.append(g_vol[self._free_t].cpu().numpy())
@@ -188,6 +215,8 @@ class NewtonSolver:
         f_contact = torch.zeros_like(R)
         if self.field is not None and self.contact_stiffness > 0:
             for s in self.shells:
+                if id(s) not in self._contact_nodes:
+                    continue
                 nodes, offset = self._contact_nodes[id(s)], self._contact_offsets[id(s)]
                 if not len(nodes):
                     continue
@@ -204,12 +233,18 @@ class NewtonSolver:
                 if tangent:
                     H = normal[:, :, None] * normal[:, None, :] + gap[:, None, None] * curvature[active]
                     add_block(dofs, ka[:, None, None] * H)
-        if self.shell_contact is not None:
-            for A, B, nodes, tri_nodes, e, g, H in self.shell_contact.terms(tangent):
+        for contact in self.surface_contacts:
+            for A, B, nodes, tri_nodes, e, g, H in contact.terms(tangent):
                 arange = torch.arange(3, device=self.device)
                 dofs = torch.cat([(self.dof_offset[id(A)] + 3 * nodes[:, None] + arange),
                                   (self.dof_offset[id(B)] + 3 * tri_nodes[:, :, None] + arange).reshape(-1, 9)],
                                  dim=1)
+                energy += e.sum().item()
+                f_contact.index_add_(0, dofs.reshape(-1), g.reshape(-1))
+                if tangent:
+                    add_block(dofs, H)
+        for coupling in self.couplings:
+            for dofs, e, g, H in coupling.terms(tangent):
                 energy += e.sum().item()
                 f_contact.index_add_(0, dofs.reshape(-1), g.reshape(-1))
                 if tangent:
@@ -327,12 +362,12 @@ class NewtonSolver:
             linear_rate = state["U"].T @ step_np  # d(dV)/d(alpha) of each closed chamber
 
         alpha = 1.0
-        if self.shell_contact is not None:  # never let a node pass through another sheet
+        if self.surface_contacts:  # never let a node pass through another sheet
             full = torch.zeros(self.n_dof, dtype=DTYPE, device=self.device)
             full[self._free_t] = step
             motion = {id(s): full[self.dof_offset[id(s)]:self.dof_offset[id(s)] + 3 * s.n_nodes].reshape(-1, 3)
                       for s in self.shells}
-            alpha = min(1.0, self.shell_contact.safe_step(motion))
+            alpha = min([1.0] + [c.safe_step(motion) for c in self.surface_contacts])
             if alpha < 1e-10:
                 return 0.0
         for _ in range(max_backtracks):
@@ -362,6 +397,10 @@ class NewtonSolver:
             if alpha < 1e-10:
                 break
         return 0.0
+
+
+def _size(X):
+    return (X.max(0).values - X.min(0).values).norm().item() if len(X) else 0.0
 
 
 class _Tangent:

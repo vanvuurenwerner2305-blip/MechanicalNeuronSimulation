@@ -35,8 +35,9 @@ class ModelTree(QTreeWidget):
     show_only_requested = Signal(list)
     show_all_requested = Signal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, roles=ROLES):
         super().__init__(parent)
+        self.roles = list(roles)
         self.setHeaderLabels(["Part", "Role"])
         self.setRootIsDecorated(False)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -61,9 +62,33 @@ class ModelTree(QTreeWidget):
             self.addTopLevelItem(item)
         self._updating = False
 
+    def set_connections(self, connections):
+        """Extra items under a 'Flow connections' group: [(label, detail, colour)]; selecting one emits the
+        negative index -1 - k."""
+        self._updating = True
+        for i in reversed(range(self.topLevelItemCount())):
+            if self.topLevelItem(i).data(0, Qt.UserRole) is None:
+                self.takeTopLevelItem(i)
+        if connections:
+            group = QTreeWidgetItem(["Flow connections", ""])
+            group.setFlags(Qt.ItemIsEnabled)
+            group.setData(0, Qt.UserRole, None)
+            font = group.font(0)
+            font.setBold(True)
+            group.setFont(0, font)
+            for k, (label, detail, color) in enumerate(connections):
+                item = QTreeWidgetItem([label, detail])
+                item.setData(0, Qt.UserRole, -1 - k)
+                item.setIcon(1, color_icon(color))
+                item.setToolTip(0, "Flow connection: click to set its type and resistance (Flow tab)")
+                group.addChild(item)
+            self.addTopLevelItem(group)
+            group.setExpanded(True)
+        self._updating = False
+
     def refresh(self, parts):
         self._updating = True
-        for i in range(self.topLevelItemCount()):
+        for i in range(min(self.topLevelItemCount(), len(parts))):
             item, part = self.topLevelItem(i), parts[i]
             item.setText(1, part.role)
             item.setIcon(1, color_icon(part_color(part)))
@@ -73,29 +98,34 @@ class ModelTree(QTreeWidget):
     def select(self, indices):
         self._updating = True
         for i in range(self.topLevelItemCount()):
-            self.topLevelItem(i).setSelected(i in indices)
-        if indices:
-            self.scrollToItem(self.topLevelItem(min(indices)))
+            top = self.topLevelItem(i)
+            top.setSelected(top.data(0, Qt.UserRole) in indices)
+            for c in range(top.childCount()):
+                top.child(c).setSelected(top.child(c).data(0, Qt.UserRole) in indices)
+        parts = [i for i in indices if i >= 0]
+        if parts and self.topLevelItem(min(parts)) is not None:
+            self.scrollToItem(self.topLevelItem(min(parts)))
         self._updating = False
 
     def selected_indices(self):
-        return sorted(item.data(0, Qt.UserRole) for item in self.selectedItems())
+        return sorted(item.data(0, Qt.UserRole) for item in self.selectedItems()
+                      if item.data(0, Qt.UserRole) is not None)
 
     def _emit_selection(self):
         if not self._updating:
             self.selection_changed.emit(self.selected_indices())
 
     def _item_changed(self, item, column):
-        if not self._updating and column == 0:
+        if not self._updating and column == 0 and (item.data(0, Qt.UserRole) or 0) >= 0:
             self.visibility_changed.emit(item.data(0, Qt.UserRole), item.checkState(0) == Qt.Checked)
 
     def _context_menu(self, pos):
-        indices = self.selected_indices()
+        indices = [i for i in self.selected_indices() if i >= 0]
         if not indices:
             return
         menu = QMenu(self)
         assign = menu.addMenu("Assign role")
-        for role in ROLES:
+        for role in self.roles:
             action = assign.addAction(role_icon(role), role)
             action.triggered.connect(lambda _=False, r=role: self.role_requested.emit(indices, r))
         menu.addSeparator()
@@ -138,6 +168,9 @@ class FieldForm(QWidget):
                 widget.addItems(list(f.choices))
                 widget.setCurrentText(str(value))
                 widget.currentTextChanged.connect(lambda v, key=f.key: self.edited.emit(key, v))
+            elif f.kind == "text":
+                widget = QLineEdit(str(value))
+                widget.editingFinished.connect(lambda w=widget, key=f.key: self.edited.emit(key, w.text()))
             elif f.kind == "int":
                 widget = QSpinBox()
                 widget.setRange(int(f.minimum), int(f.maximum))
@@ -182,8 +215,9 @@ class PropertyPanel(QWidget):
     role_changed = Signal(list, str)
     props_changed = Signal(list, str, object)  # indices, key, value
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, roles=ROLES, role_fields=ROLE_FIELDS):
         super().__init__(parent)
+        self.role_fields = role_fields
         layout = QVBoxLayout(self)
         self.title = QLabel("Select a part in the view or the model tree.")
         self.title.setWordWrap(True)
@@ -198,7 +232,7 @@ class PropertyPanel(QWidget):
         self.role_box = QGroupBox("Role")
         rl = QVBoxLayout(self.role_box)
         self.role_combo = QComboBox()
-        for role in ROLES:
+        for role in roles:
             self.role_combo.addItem(role_icon(role), role)
         self.role_combo.activated.connect(self._role_activated)
         rl.addWidget(self.role_combo)
@@ -259,9 +293,9 @@ class PropertyPanel(QWidget):
             self.role_help.setText(ROLE_HELP[role])
         self.role_combo.blockSignals(False)
 
-        if role is not None and ROLE_FIELDS[role]:
+        if role is not None and self.role_fields[role]:
             self.props_box.setVisible(True)
-            self.form.build(ROLE_FIELDS[role], selected[0].props, {"__role__": role})
+            self.form.build(self.role_fields[role], selected[0].props, {"__role__": role})
         if role == CHAMBER and couplings_text is not None:
             self.coupling_box.setVisible(True)
             self.coupling_label.setText(couplings_text)
@@ -282,17 +316,20 @@ class PropertyPanel(QWidget):
 class SolverPanel(QWidget):
     changed = Signal(str, object)
 
-    def __init__(self, parent=None):
+    NOTE = ("All chamber pressures are ramped from zero to their set values over the load "
+            "steps; steps are subdivided automatically when Newton does not converge.\n\n"
+            "Units: mm, N, MPa (pressures entered in kPa).")
+
+    def __init__(self, parent=None, title="Static Newton-Raphson solver", fields=SOLVER_FIELDS, note=None):
         super().__init__(parent)
+        self.fields = fields
         layout = QVBoxLayout(self)
-        box = QGroupBox("Static Newton-Raphson solver")
+        box = QGroupBox(title)
         bl = QVBoxLayout(box)
         self.form = FieldForm()
         self.form.edited.connect(self.changed.emit)
         bl.addWidget(self.form)
-        note = QLabel("All chamber pressures are ramped from zero to their set values over the load "
-                      "steps; steps are subdivided automatically when Newton does not converge.\n\n"
-                      "Units: mm, N, MPa (pressures entered in kPa).")
+        note = QLabel(self.NOTE if note is None else note)
         note.setWordWrap(True)
         note.setStyleSheet("color: #555;")
         bl.addWidget(note)
@@ -300,7 +337,7 @@ class SolverPanel(QWidget):
         layout.addStretch(1)
 
     def load(self, settings):
-        self.form.build(SOLVER_FIELDS, vars(settings))
+        self.form.build(self.fields, vars(settings))
 
 
 # -----------------------------

@@ -127,16 +127,31 @@ def _face_normals(x, faces):
 
 
 class ShellContact:
-    def __init__(self, shells, stiffness: float, search_distance: float):
+    def __init__(self, shells, stiffness: float, search_distance: float, pairs=None):
         """
         shells          : the Shell objects that can touch each other.
         stiffness       : penalty stiffness k (pressure per unit penetration).
         search_distance : pairs within this distance are checked when bounding a step; at least the
                           largest relative motion of a node and a triangle in one step.
+        pairs           : instead of all shell pairs, explicit (A, A's node indices, B, B's face indices, h)
+                          entries, e.g. the two opposite walls inside a tube (A may be B: the node and
+                          face sets then keep apart parts of one body; pairs that start closer than h,
+                          such as a node on a triangle it belongs to, never become active).
         """
         self.stiffness = stiffness
         self.search_distance = search_distance
         self.pairs = []
+        if pairs is not None:
+            for A, nodes, B, faces, h in pairs:
+                nodes = torch.as_tensor(nodes, device=A.device)
+                nodes = nodes[~A.fixed[nodes]]
+                faces = B.faces[torch.as_tensor(faces, device=B.device)]
+                if not len(nodes) or not len(faces) or h <= 0:
+                    continue
+                rest, _, _ = closest_on_mesh(A.X[nodes], B.X, faces, h)
+                self.pairs.append({"A": A, "B": B, "nodes": nodes, "faces": faces, "h_max": h,
+                                   "h": torch.clamp(rest, max=h), "skin": h, "lists": {}})
+            return
         for A in shells:
             for B in shells:
                 if A is B:
@@ -148,7 +163,7 @@ class ShellContact:
                 if not len(nodes):
                     continue
                 rest, _, _ = closest_on_mesh(A.X[nodes], B.X, B.faces, h)
-                self.pairs.append({"A": A, "B": B, "nodes": nodes, "h_max": h,
+                self.pairs.append({"A": A, "B": B, "nodes": nodes, "faces": B.faces, "h_max": h,
                                    "h": torch.clamp(rest, max=h), "skin": h, "lists": {}})
 
     def __bool__(self):
@@ -156,15 +171,15 @@ class ShellContact:
 
     def _pairs_within(self, pair, radius):
         """pairs_within(A's nodes, B, radius) at the current state, from the pair's candidate list."""
-        A, B, nodes, skin = pair["A"], pair["B"], pair["nodes"], pair["skin"]
+        A, B, nodes, skin, faces = pair["A"], pair["B"], pair["nodes"], pair["skin"], pair["faces"]
         points = A.x[nodes]
         cached = pair["lists"].get(radius)
         if cached is None or (points - cached["a"]).norm(dim=1).max().item() > skin or                 (B.x - cached["b"]).norm(dim=1).max().item() > skin:
-            pi, t, _, _ = pairs_within(points, B.x, B.faces, radius + 2.0 * skin)
+            pi, t, _, _ = pairs_within(points, B.x, faces, radius + 2.0 * skin)
             cached = pair["lists"][radius] = {"a": points.clone(), "b": B.x.clone(), "pi": pi, "t": t}
         pi, t = cached["pi"], cached["t"]
         if len(pi):  # cheap bounding-box test first, the exact distance only for what is left
-            tri = B.x[B.faces[t]]
+            tri = B.x[faces[t]]
             p = points[pi]
             near = ((p >= tri.min(dim=1).values - radius) & (p <= tri.max(dim=1).values + radius)).all(dim=1)
             pi, t, tri = pi[near], t[near], tri[near]
@@ -182,18 +197,21 @@ class ShellContact:
         """
         fraction = 1.0
         for pair in self.pairs:
-            A, B, nodes = pair["A"], pair["B"], pair["nodes"]
+            A, B, nodes, faces = pair["A"], pair["B"], pair["nodes"], pair["faces"]
             radius = pair["h_max"] + self.search_distance
             # The distance to a triangle's bounding box is a lower bound d_lb <= d, so a pair with
             # 0.9 d_lb >= fraction * closing cannot shorten the step: only the others need the exact
             # distance (same result as testing every pair within radius, at a fraction of the cost).
-            points, tri = A.x[nodes], B.x[B.faces]
+            points, tri = A.x[nodes], B.x[faces]
             gap = ((tri.min(dim=1).values - points[:, None]).clamp_min(0) ** 2 +
                    (points[:, None] - tri.max(dim=1).values).clamp_min(0) ** 2).sum(-1).sqrt()
             node_motion = displacement[id(A)][nodes].norm(dim=1)
-            tri_motion = displacement[id(B)][B.faces].norm(dim=2).max(dim=1).values
+            tri_motion = displacement[id(B)][faces].norm(dim=2).max(dim=1).values
             closing = node_motion[:, None] + tri_motion[None, :]
             pi, t = torch.nonzero((gap < radius) & (0.9 * gap < fraction * closing), as_tuple=True)
+            if A is B and len(pi):  # within one body a node never limits the step on its own triangles
+                own = (faces[t] == nodes[pi][:, None]).any(dim=1)
+                pi, t = pi[~own], t[~own]
             if not len(pi):
                 continue
             q, _ = _closest_point_pairs(points[pi], tri[t, 0], tri[t, 1], tri[t, 2])
@@ -220,7 +238,7 @@ class ShellContact:
             if not active.any():
                 continue
             pi, t = pi[active], t[active]
-            tri_nodes = B.faces[t]
+            tri_nodes = pair["faces"][t]
             x = torch.cat([points[pi], B.x[tri_nodes].reshape(-1, 9)], dim=1)
             kA = self.stiffness * A.nodal_area[nodes[pi]]
             h = pair["h"][pi]

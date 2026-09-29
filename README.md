@@ -4,10 +4,17 @@ Desktop simulation software for fluid-driven membranes and shells. You build the
 import it as STEP, click each solid to give it a role (membrane, shell, rigid body, fluid chamber),
 and solve for static equilibrium with a Newton–Raphson solver.
 
+The window has two **spaces** (tabs at the top), each with its own model:
+
+- **Neuron: inputs → activation** — membranes between fluid chambers, sweeps and the neuron equation.
+- **Activation function** — the valve that turns the activation pressure into a tube's open area:
+  simulate it once and save it as an activation-function design (`*.mad`) to use as a part.
+
 ```
 python run_app.py                    # start the application
 python run_app.py model.step         # ...and import a STEP file
-python run_app.py project.mns        # ...or open a saved project
+python run_app.py project.mns        # ...or open a saved neuron project
+python run_app.py valve.mad          # ...or an activation-function design
 python -m pytest tests               # solver benchmarks + application pipeline tests
 ```
 
@@ -93,6 +100,47 @@ STEP assembly, for trying the workflow.
 - Membrane edges are clamped: either every boundary edge, or only the edges that touch rigid bodies.
 - Chamber-membrane coupling is found geometrically: points just beyond each membrane face are
   tested against every chamber solid.
+
+## Activation function space
+
+The device is a valve: the pressure difference Δp across a membrane squeezes a soft tube, through a
+part bonded to the membrane (e.g. a pusher, rigid or deformable), against a rigid body. Gas flows
+through the tube from a supply to a sink, and the software computes how the tube's cross-section,
+the mass flow and the pressures along the tube change with Δp - how the pressure divides depending
+on how far the tube is clamped.
+
+1. In CAD, make solids for the membrane, the pusher (touching the membrane's face and the tube), the
+   tube, the rigid body behind it, and the gas: one body filling the tube, a supply body against its
+   inlet end and a sink body against its outlet end. `examples/make_activation_step.py` writes such
+   a device.
+2. Open the STEP file in the Activation function tab and assign roles (Edit → Auto-assign guesses them
+   from names like Membrane, Pusher, Tube, TubeFluid, InletFluid, OutletFluid).
+3. **Flow connections** appear in the model tree wherever two fluid bodies touch (and where a dynamic
+   fluid faces the outside). Click one to make it an **Opening** (no resistance), an **Orifice** (your
+   equation) or **Closed** (Flow tab).
+4. Set the Δp range and the gas (gas constant, temperature, atmospheric pressure, viscosity) in the
+   **Study** tab and press **Simulate** (F5). At every Δp the structure and the flow are iterated until
+   the pressures on the tube wall stop changing.
+5. **Save design** (Ctrl+S) stores the roles, connections, settings and the results in one `.mad`
+   file. Opening it shows the curves without simulating again; from Python,
+   `ActivationDesign.load("valve.mad")` gives `.area(dp)`, `.mass_flow(dp)` and `.end_pressure(dp)`.
+
+| Role | Simulated as |
+|---|---|
+| Membrane / Shell | As in the neuron space, clamped along its edges; Δp pushes it towards the tube; bonded to every free rigid body or solid its face touches |
+| Channel (tube) | 3D solid (10-node tetrahedra, compressible neo-Hookean), fixed at its two end faces |
+| Fluid, Constant pressure | A supply or sink held at a set pressure |
+| Fluid, Dynamic pressure | Pressure follows from the flow. The fluid filling the tube is cut into **Segments** along it, each a flow resistance in series with its own pressure on the tube wall |
+| Solid | Deformable 3D solid (e.g. a soft pusher); free, or fixed where it touches fixed rigid bodies; contact with the tube and other solids |
+| Rigid body, Motion = Fixed | Fixed obstacle |
+| Rigid body, Motion = Free | Moves and tilts as a rigid body (e.g. a rigid pusher); contact with the tube and solids |
+
+Resistance equations give the pressure drop in Pa for a mass flow `mdot` (kg/s), in SI units, with the
+variables `rho` (gas density at the mean pressure), `rho_up` (upstream density), `mu`, `A`, `P`
+(perimeter), `h`, `w`, `L`, `Dh = 4A/P`, `p`, `p_up`, `p_down`. A segment uses the smallest section in
+it; a connection uses its contact face. Defaults: laminar segments `32*mu*L*mdot/(rho*A*Dh**2)`, orifice
+`(mdot/(0.61*A))**2/(2*rho_up)`. The gas density follows the ideal gas law. A closed tube keeps a small
+area (about 2 % of A0) from the contact gap between its walls.
 
 ## Layout
 

@@ -37,6 +37,86 @@ def shell_cone_volume(shell, x) -> torch.Tensor:
     return cone_volume(x[shell.faces] - shell.volume_origin).sum()
 
 
+def _cap_volume(ring):
+    """Cone volume (apex at the origin) of the fan closing a boundary loop: triangles
+    (ring[k+1], ring[k], centroid), i.e. the loop's half-edges reversed."""
+    c = ring.mean(dim=0)
+    nxt = torch.roll(ring, -1, dims=0)
+    return (nxt * torch.linalg.cross(ring, c.expand_as(ring))).sum() / 6.0
+
+
+_cap_grad, _cap_hess = grad(_cap_volume), hessian(_cap_volume)
+
+
+class SurfacePatch:
+    """
+    Part of a body's boundary that walls a chamber (e.g. the inside of a tube, split into an
+    input and an output half). Unlike a clamped membrane, a patch can have boundary loops that
+    move (where the two halves of a tube meet); every loop with a free node is closed by a fan
+    of triangles to the loop's centroid, so the enclosed volume stays exact and independent of
+    the cone apex. The cap's share of the pressure goes to the loop's nodes: it stands for the
+    axial force that the pressure drop across a constriction puts on the walls (viscous shear in
+    steady flow), and cancels where both sides are at the same pressure.
+    """
+
+    def __init__(self, body, face_indices, side: int):
+        self.body, self.side = body, side
+        F = body.faces_np[np.asarray(face_indices, dtype=np.int64)]
+        self.faces = torch.as_tensor(F, device=body.device)
+        comp = torch.arange(3, device=body.device)
+        self.face_dofs = (3 * self.faces[:, :, None] + comp).reshape(-1, 9)
+        self.origin = body.X[torch.as_tensor(np.unique(F), device=body.device)].mean(dim=0)
+        fixed = body.fixed.cpu().numpy()
+        self.loops = [torch.as_tensor(loop, device=body.device)
+                      for loop in boundary_loops(F) if not fixed[loop].all()]
+        self.loop_dofs = [(3 * loop[:, None] + comp).reshape(-1) for loop in self.loops]
+        self.rest = self.volume(body.X)
+
+    def volume(self, x) -> float:
+        v = cone_volume(x[self.faces] - self.origin).sum()
+        for loop in self.loops:
+            v = v + _cap_volume(x[loop] - self.origin)
+        return float(v)
+
+    def terms(self, tangent: bool):
+        """[(body, dofs (E, d), gradient (E, d), Hessian (E, d, d) or None)] of side * volume."""
+        x = self.body.x
+        xe = x[self.faces] - self.origin
+        out = [(self.body, self.face_dofs, self.side * cone_volume_grad(xe).reshape(-1, 9),
+                self.side * cone_volume_hess(xe).reshape(-1, 9, 9) if tangent else None)]
+        for loop, dofs in zip(self.loops, self.loop_dofs):
+            ring = x[loop] - self.origin
+            g = self.side * _cap_grad(ring).reshape(1, -1)
+            H = self.side * _cap_hess(ring).reshape(1, len(dofs), len(dofs)) if tangent else None
+            out.append((self.body, dofs[None], g, H))
+        return out
+
+
+def boundary_loops(F):
+    """Boundary loops of an oriented triangle patch as node lists, following the half-edges that
+    have no twin (in the patch's orientation)."""
+    half = {}
+    for a, b, c in F:
+        for i, j in ((a, b), (b, c), (c, a)):
+            half[(int(i), int(j))] = True
+    nxt = {}
+    for i, j in half:
+        if (j, i) not in half:
+            nxt[i] = j
+    loops, seen = [], set()
+    for start in list(nxt):
+        if start in seen:
+            continue
+        loop, node = [], start
+        while node not in seen and node in nxt:
+            seen.add(node)
+            loop.append(node)
+            node = nxt[node]
+        if len(loop) >= 3:
+            loops.append(np.array(loop, dtype=np.int64))
+    return loops
+
+
 class FluidVolume:
     def __init__(self,
                  P0: float = 0.0,
@@ -89,6 +169,7 @@ class FluidVolume:
         self.name = name
 
         self.boundaries = []  # (shell, side, rest cone volume)
+        self.patches = []     # SurfacePatch walls of solid bodies
         self.delta_volume = 0.0
         self.P = self.pressure(0.0)
         self.pressure_hist = []
@@ -101,13 +182,34 @@ class FluidVolume:
         self.boundaries.append((shell, side, rest))
         shell.fluid_volumes.append(self)
 
+    def add_patch(self, body, face_indices, side: int) -> "SurfacePatch":
+        """Part of a solid's boundary walls this chamber. side = +1 when the faces' normals point
+        out of the chamber (a solid's outward normals point *into* a cavity it surrounds: -1)."""
+        if side not in (1, -1):
+            raise ValueError("side must be +1 (normal points out of the volume) or -1.")
+        patch = SurfacePatch(body, face_indices, side)
+        self.patches.append(patch)
+        body.fluid_volumes.append(self)
+        return patch
+
     # -----------------------------
     # Geometry
     # -----------------------------
 
     def compute_delta_volume(self) -> float:
-        return sum(side * (shell_cone_volume(shell, shell.x).item() - rest)
-                   for shell, side, rest in self.boundaries)
+        return (sum(side * (shell_cone_volume(shell, shell.x).item() - rest) for shell, side, rest in self.boundaries)
+                + sum(p.side * (p.volume(p.body.x) - p.rest) for p in self.patches))
+
+    def volume_terms(self, tangent: bool):
+        """[(body, local dofs (E, d), d(dV)/du (E, d), d2(dV)/du2 (E, d, d) or None)] over all walls."""
+        out = []
+        for shell, side, _ in self.boundaries:
+            xe = shell.x[shell.faces] - shell.volume_origin
+            out.append((shell, shell.face_dofs, side * cone_volume_grad(xe).reshape(-1, 9),
+                        side * cone_volume_hess(xe).reshape(-1, 9, 9) if tangent else None))
+        for patch in self.patches:
+            out.extend(patch.terms(tangent))
+        return out
 
     @property
     def is_closed(self) -> bool:

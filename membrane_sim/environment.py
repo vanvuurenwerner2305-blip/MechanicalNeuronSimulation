@@ -30,6 +30,8 @@ class Environment:
         self.membrane_list = []
         self.obstacle_list = []
         self.fluid_volume_list = []
+        self.couplings = []          # extra energy terms (RigidTie, MovingContact, ...)
+        self.surface_contacts = []   # explicit ShellContact pairs (e.g. inside a tube)
         self.history = []  # one entry per converged load step
         self.last_result = None
         self.solver = None  # NewtonSolver of the last solve (for post-processing the solved state)
@@ -99,7 +101,8 @@ class Environment:
         solver = NewtonSolver(self.membrane_list, self.fluid_volume_list, self.obstacle_list,
                               contact_stiffness=k, contact_offset=self.contact_offset,
                               rtol=rtol, atol=atol, step_tol=step_tol, max_iterations=max_iterations,
-                              max_step=max_step, verbose=verbose, callback=callback)
+                              max_step=max_step, verbose=verbose, callback=callback,
+                              couplings=self.couplings, surface_contacts=self.surface_contacts)
         self.solver = solver
 
         lam, increment = 0.0, 1.0 / load_steps

@@ -833,6 +833,182 @@ only be compared with each other.
 \end{remark}
 
 %=====================================================================
+\section{The activation-function device}\label{sec:activation}
+%=====================================================================
+
+The second space of the software simulates the output stage of a neuron: a valve in which the
+pressure difference $\Delta p$ across a membrane squeezes a soft tube (the \emph{channel}) against a
+fixed rigid body, through a part bonded to the membrane (a \emph{pusher}, rigid or deformable). Gas
+flows through the tube from a supply to a sink. The quantity of interest is how the pressure divides
+along the tube, and with it the mass flow, as the tube is clamped: the squeezed tube is a variable
+flow resistance in series with the rest of the gas path, a pressure divider. The result, the tube's
+smallest cross-section $A$, the mass flow $\dot m$ and the pressures along the tube as functions of
+$\Delta p$, is saved with the device as a design file, so that it can be used as a part without
+simulating it again. The model reuses the membranes, fluid chambers, rigid contact and Newton solver
+of the previous sections and adds a volumetric solid, moving rigid bodies, chamber walls on a solid,
+contact of a solid with itself, the cross-section measurement and a steady flow network.
+
+\subsection{Roles}
+Besides Membrane/Shell, a device has one \emph{Channel} (the tube) and \emph{Fluid} bodies: gas
+regions at a \emph{constant} pressure (a supply or a sink) or with a \emph{dynamic} pressure, which
+follows from the flow. The dynamic fluid lining the tube is cut into $N$ segments along the tube. A
+\emph{Rigid body} is either fixed or free (six rigid-body unknowns), and a \emph{Solid} is a deformable
+part meshed like the tube, free or fixed where it touches fixed rigid bodies. A membrane is bonded to
+every free rigid body or solid whose surface its face touches; that part (e.g. a pusher) carries the
+membrane's load to the tube. Every tube face belongs to the fluid whose mesh contains a probe point
+placed just inside the tube from it (generalised winding number, as in the chamber coupling of
+Section~\ref{sec:cad}). The channel axis $\bm a$ is the long principal direction of the fluid lining
+the tube, oriented from its higher-pressure end. The tube is held at its end faces: the planar CAD
+faces of the tube, normal to $\bm a$, that do not line the channel. $\Delta p$ acts on the membrane as
+a constant-pressure chamber on the face that points away from the tube, so that positive $\Delta p$
+closes it; the closing direction runs from the membranes' area-weighted centroid to the channel axis.
+
+\subsection{Solid tube}
+The tube is a volumetric solid meshed with 10-node (quadratic) tetrahedra. A tube is closed by
+bending its walls, and linear tetrahedra with one or two elements through a wall are far too stiff
+in bending; quadratic elements are not. The material is the compressible neo-Hookean
+solid~\cite{bonet2008}
+\begin{equation}
+  W(\bm F) = \frac{\mu}{2}\left(\operatorname{tr}\bm F^{\mathsf T}\bm F - 3 - 2\ln J\right)
+           + \frac{\lambda}{2}(\ln J)^2,\qquad J=\det\bm F,
+\end{equation}
+with $\mu$ and $\lambda$ from $E$ and $\nu$, integrated with the 4-point rule of the tetrahedron.
+$\bm F = \sum_a \bm x_a \otimes \nabla_{\bm X} N_a$ with the quadratic shape functions on the
+(curved) rest geometry, so the energy of a homogeneous deformation is exact. $J$ is computed as the
+triple product of the columns of $\bm F$: the second derivative of a general determinant routine
+was not finite at $\bm F=\bm I$. The element energy, gradient and Hessian come from automatic
+differentiation as for the shells (Section~\ref{sec:assembly}). Each 6-node boundary triangle is
+split into four flat triangles through its mid-edge nodes; these are the faces used for contact,
+chamber walls, cross-sections and display.
+
+\subsection{Free rigid bodies}
+A free rigid body, e.g. a rigid pusher, has six unknowns $\bm q = (\bm t, \bm\theta)$: a body point $\bm X$
+moves to
+\begin{equation}
+  \bm x(\bm X) = \bm c_0 + \bm t + \bm R(\bm\theta)(\bm X - \bm c_0),
+\end{equation}
+with $\bm c_0$ the rest centroid and $\bm R$ Rodrigues' rotation, evaluated with Taylor series for
+small $|\bm\theta|$ so that it is smooth, with its derivatives, through $\bm\theta=\bm 0$. The body
+stores no energy; it is moved by two couplings.
+
+\paragraph{Bond to the membrane.} Membrane nodes within $0.6\,t$ of the body's surface at rest
+(the mid-surface lies $t/2$ above the face it is bonded to) are tied to the point of the body they
+started on,
+\begin{equation}
+  \Pi_\mathrm{tie} = \sum_i \tfrac12\, k_\mathrm{tie} A_i\,\bigl|\bm x_i - \bm x(\bm X_i)\bigr|^2,
+  \qquad k_\mathrm{tie} = 10\,k,
+\end{equation}
+a stiff penalty on the 9 unknowns $(\bm x_i, \bm t, \bm\theta)$ of each tie.
+
+\paragraph{Contact with the tube.} The surface nodes of the tube and of every solid are kept outside
+the body's closed surface with the penalty of Section~\ref{sec:rigid}, the signed distance being evaluated in the
+body frame, $d(\bm x) = d_0\bigl(\bm c_0 + \bm R^{\mathsf T}(\bm x - \bm c_0 - \bm t)\bigr)$. For
+exact derivatives with respect to both the node and the body, $d_0$ is replaced by its
+second-order expansion around the current point $\bm y^\ast$ (value, gradient $\bm n$ and Hessian
+$\bm H$ from the exact distance query),
+\begin{equation}
+  \tilde d(\bm y) = d_0(\bm y^\ast) + \bm n\cdot(\bm y - \bm y^\ast)
+                 + \tfrac12(\bm y - \bm y^\ast)^{\mathsf T}\bm H(\bm y - \bm y^\ast),
+\end{equation}
+which has the same value, gradient and Hessian at $\bm y^\ast$, and the energy
+$\tfrac12 k A_i \min(\tilde d - g_i, 0)^2$ is differentiated automatically. The offset
+$g_i = \min(0, d_i^\mathrm{rest})$ makes the rest contact neutral: the tube and the pusher start
+touching, and the facets of their curved CAD faces overlap by a few $\mu$m. The same rule applies to
+the tube against fixed rigid bodies.
+
+\subsection{Deformable parts}
+A solid part (e.g. a soft pusher) is meshed and modelled like the tube. A membrane node bonded to it
+follows the material point of the solid's surface it started on,
+$\Pi = \tfrac12 k_\mathrm{tie} A_i |\bm x_i - \sum_k w_k \bm x_k - \bm r_0|^2$ with the barycentric
+weights $w_k$ of its closest triangle and its rest offset $\bm r_0$ (not rotated with the surface,
+which is exact for the small rotations of a bonded face). Two solids (the part and the tube) touch
+through a node-to-surface penalty in both directions: each surface node of one is paired with its
+closest triangle of the other, and its signed distance is the plane distance when the closest point
+is inside the triangle, else the distance to the closest edge or vertex signed by the triangle's
+normal; $\tfrac12 k A_i \min(d - g_i, 0)^2$ with the neutral rest offset $g_i$ as above. The closest
+triangle can change from one evaluation to the next, so this energy is only continuous where a
+node crosses between triangles; on the test valve it converges, 2 to 4 times slower than a rigid
+pusher.
+
+\subsection{Chamber walls on a solid}
+The inside of the tube is not bounded by clamped membranes, so the cone volumes of
+Section~\ref{sec:fluid} would depend on the apex: where the input and output halves meet, the wall
+has a boundary loop that moves. Each patch of wall (a set of oriented boundary triangles; the
+solid's outward normals point into the channel, so its side is $-1$) is therefore closed by a fan
+of triangles from every boundary loop that has a free node to the loop's centroid
+$\bm c_\ell = \frac1{m}\sum_{k}\bm x_{\ell k}$:
+\begin{equation}
+  V = \sum_{f\in\text{wall}} V_\mathrm{cone}(\bm x_f)
+    + \sum_{\ell}\sum_{k} \tfrac16\,\bm x_{\ell,k+1}\cdot\bigl(\bm x_{\ell k}\times\bm c_\ell\bigr),
+\end{equation}
+the loop taken in the direction of the wall's boundary half-edges. The volume of a closed surface
+is independent of the cone apex, and loops of fixed nodes (the tube ends) contribute a constant
+that drops out of $\Delta V$. Each cap is one element over the $3m$ coordinates of its loop, with
+its gradient and Hessian from automatic differentiation. The cap carries the pressure difference of
+the two halves as an axial force on the nodes of the loop; in steady flow through a constriction
+that force is real, transmitted by viscous shear to the walls, and it vanishes when both halves are
+at the same pressure. Two neighbouring patches (e.g. two segments of the tube) that share a loop split the tube's volume
+exactly.
+
+\subsection{The tube closing on itself}
+When the tube closes, its inner walls touch. The node-to-triangle penalty of
+Section~\ref{sec:sheet} is used with explicit node and face sets on one body: the wall triangles on
+the membrane's side of the channel against those on the far side, and the reverse, with contact
+distance $h = 0.02\,H$ ($H$ the smallest inside dimension of the tube), reduced to the rest
+distance as before. A node lying on a triangle of the other set (on the line where the two sets
+meet) has zero rest distance and never becomes active; it is also left out of the step bound,
+which would otherwise allow no step at all.
+
+\subsection{Cross-sectional area}
+Sections are planes normal to $\bm a$ at $n$ positions along the channel, placed in the rest
+configuration (a vertex on a plane counts as above it). Every wall triangle a plane cuts gives a
+segment between two material points on its edges, oriented by the triangle's normal. In the
+deformed configuration the loop encloses, projected on the plane,
+\begin{equation}
+  A = \tfrac12 \sum_{\text{segments } (\bm p,\bm q)} (\bm p \times \bm q)\cdot\bm a ,
+\end{equation}
+so the segments need not be ordered. Walls pressed through each other (the penalty's penetration)
+count negatively and the area is clipped at zero. The sections cut every tube face that lines a fluid,
+not only the dynamic fluid's, so that a section near the junction of two fluids keeps all its
+triangles. The reported $A$ is the smallest section: the
+constriction that sets the flow. $A_0$ is the same measure at rest, so the faceting of curved walls
+affects $A$ and $A_0$ alike. With the walls in contact the area does not reach zero: the contact
+gap $h$ and the corners of the lumen leave a floor of roughly $h$ times the width of the channel.
+
+\subsection{Flow network}
+Where two fluid bodies touch, and where a dynamic fluid faces the outside (a face whose probe lies in
+no body, checked again further out so that the thin gaps between the facets of two curved CAD faces do
+not count), there is a \emph{flow connection}: an opening (no resistance), an orifice with a
+user-defined law, or closed. The gas is a network of pressure nodes: the $N+1$ ends of the tube's
+segments, one node per other fluid (fixed for constant fluids) and the outside at 0\,kPa. Its edges
+are the segments and the orifices, each with a law for the pressure drop at a positive mass flow,
+\begin{equation}
+  \Delta p = f(\dot m,\ \rho,\ \mu,\ A,\ P,\ h,\ w,\ L,\ D_h,\ p,\ p_\mathrm{up},\ p_\mathrm{down},\
+  \rho_\mathrm{up}),
+\end{equation}
+in SI units, the flow following the sign of the pressure difference. The gas is ideal,
+$\rho = p_\mathrm{abs}/(R_s T)$, taken at the mean pressure of the edge ($\rho$) or upstream
+($\rho_\mathrm{up}$, for orifices); $R_s$, $T$, the atmospheric pressure and the viscosity $\mu$ are
+settings. A segment's geometry is its smallest cross-section (area $A$, wetted perimeter $P$, height
+$h$ along the closing direction, width $w$, $D_h = 4A/P$) and its length $L$; an orifice's is its
+contact face. Defaults: laminar segments, $\Delta p = 32\mu L\dot m/(\rho A D_h^2)$, and a sharp-edged
+orifice, $\Delta p = (\dot m/(0.61 A))^2/(2\rho_\mathrm{up})$. Openings join nodes. The unknown pressures
+satisfy the steady mass balance $\sum \dot m = 0$ at every free node; each edge's flow for a given
+pressure difference comes from inverting its law (Brent's method on $|\dot m|$), and the balance is
+solved with a Powell hybrid method.
+
+\subsection{Structure--flow iteration}
+The flow sets the pressures on the tube wall (segment $k$ at the mean of its two end nodes; the wall
+facing another fluid at that fluid's pressure, as constant-pressure chambers on the wall patches), the
+wall pressures change the tube's shape, and the shape changes the flow. At each $\Delta p$ they are
+iterated: solve the structure (warm-started, ramping only the change of the pressures), measure the
+segments, solve the network, update the wall pressures, under-relaxed when the change grows (the
+iteration can oscillate between an open and a shut tube), until no wall pressure changes by more
+than a tolerance (default $0.01$\,kPa). Contact and tie penalties are sized at the start of the sweep:
+$k = 4\,p_\mathrm{ref}/(0.02\,H)$ with $p_\mathrm{ref}$ the largest of $|\Delta p|$ and the constant
+fluid pressures, so contact penetrations are about $1\,\%$ of $H$.
+
+%=====================================================================
 \section{Verification}\label{sec:verification}
 %=====================================================================
 
@@ -862,7 +1038,17 @@ they establish, the tests check that:
       multivalued equation is judged by its worst root; the search stops at its budget and can be
       cancelled; cancelling weight sums give no sensitivity;
 \item \textbf{the CAD pipeline works}: part names, closed outward meshes, mid-surfaces, measured
-      thickness, chamber--membrane coupling and project save/load on a generated test assembly.
+      thickness, chamber--membrane coupling and project save/load on a generated test assembly;
+\item \textbf{the activation-function model is consistent}: the solid's energy of a homogeneous
+      deformation is exact for linear and quadratic tetrahedra, and its Hessian is finite at rest and
+      matches finite differences; the rotation is smooth through zero; the energy, residual and
+      tangent of the assembled device (tube, membrane, pusher with its bond and contact, capped chamber
+      walls) agree with finite differences to $10^{-9}$, including the six rigid-body unknowns; two
+      capped halves split a channel's volume exactly; the section area of a polygonal tube and of its
+      flattened shape is exact; the flow network reproduces a linear pressure divider exactly and an
+      orifice's flow matches its law by hand; on a generated round-tube valve the flow connections are
+      found without false openings, the pressure falls along the tube, squeezing reduces the mass
+      flow, and the design file round-trips.
 \end{itemize}
 
 %=====================================================================
@@ -884,6 +1070,12 @@ they establish, the tests check that:
 \item \textbf{Material models.} Only incompressible neo-Hookean and St.\ Venant--Kirchhoff sheets are
       available, with no viscoelasticity or damage, and there is no check that stretches stay
       within the material's limits.
+\item \textbf{Activation-function device.} The tube is a compressible neo-Hookean solid on
+      displacement-based tetrahedra, which stiffen (lock) as $\nu \to 0.5$; use $\nu \le 0.49$. The
+      area of a closed tube does not reach zero (contact gap and lumen corners, about $2\,\%$ of $A_0$
+      on the test device). The flow is steady, isothermal and lumped (one pressure per segment); choked
+      or compressible orifice flow is only modelled if the user's law does it. Squeezing far past closure makes the
+      solve slow (tens of seconds per point).
 \item \textbf{Robustness.} The globalised Newton method has no convergence guarantee. Snap-through
       and hard contact cases can still stall before full load; the solve then reports the last
       converged load factor rather than a result at full load.

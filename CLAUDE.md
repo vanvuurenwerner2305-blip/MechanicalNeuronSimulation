@@ -11,17 +11,18 @@ equilibrium with Newton–Raphson**. It replaced the explicit-dynamics 2D code i
 (`simulation.py` + notebooks — legacy context only, not maintained).
 
 GitHub remote `origin` = https://github.com/vanvuurenwerner2305-blip/MechanicalNeuronSimulation.git
-(empty remote, **nothing pushed yet** — ask before pushing). The global git user.name is the placeholder
+(pushed on the user's request, last 2026-09-29 — ask before pushing again). The global git user.name is the placeholder
 "Your Name"; commits use the configured identity. Files in `cad_models/` are the user's — do not
 commit/modify them unless asked.
 
 ## Commands
 
 ```
-python run_app.py [file.step | project.mns]      # GUI (or double-click "Membrane Neuron Simulator.bat" / desktop shortcut)
-python -m pytest tests                          # ~35 tests, 2-7 min (solver benchmarks + app pipeline)
+python run_app.py [file.step | project.mns | design.mad]   # GUI (or double-click "Membrane Neuron Simulator.bat" / desktop shortcut)
+python -m pytest tests                          # ~70 tests, ~10 min (solver benchmarks + app pipeline + activation)
 python -m pytest tests/test_app.py -k ghost     # single test
 python examples/make_neuron_step.py             # writes examples/soft_neuron.step (named test assembly)
+python examples/make_activation_step.py         # writes examples/squeeze_valve.step (round-tube valve: TubeFluid, InletFluid, OutletFluid)
 python examples/soft_neuron_3d.py               # solver core used from a script
 ```
 
@@ -111,6 +112,88 @@ PyQt5, matplotlib, `gmsh` pip-installed). Windows.
   chamber combo, "p_a from weights" check column, "Neuron equation" tab (rendered + Copy LaTeX),
   export `<name>.csv`, `_weights.csv`, `_equation.tex`.
 
+**Two spaces** (user, 2026-09-29): the window (`app/spaces.py` `AppWindow`) has two tabs, each a full embedded
+QMainWindow with its own CAD model/project: **Neuron** (`MainWindow`, everything above) and **Activation function**
+(`app/activation_window.py` `ActivationWindow(MainWindow)`, overriding role list / project class / results panel /
+jobs via class attributes and hooks `_make_results_panel`, `_extra_tabs`, `_after_load`). The hidden tab's shortcuts
+don't fire (hidden widgets). gmsh's single global model: `CadModel._ensure_active()` re-imports its own STEP when the
+other space loaded one since (module global `_ACTIVE`).
+
+Activation-function space (user's workflow: import CAD → simulate → save as a design that is used as a part,
+no re-simulation): a membrane squeezes a soft **tube** against a rigid body through a part bonded to it, and gas
+flows through the tube. The user's goal (2026-09-29): see **how the pressure divides along the tube depending on how
+far it is clamped** - a lumped flow network (pressure divider), not a guessed p_out = f(A) formula (that first
+version, with "Channel input/output side" roles, was replaced; `ActivationProject.load` migrates old files and
+drops their results).
+Roles (`ACTIVATION_ROLES`): Membrane/Shell, `CHANNEL` (tube, TET10 solid fixed at its planar end faces normal to
+the axis), `FLUID` (**Constant pressure** = supply/sink, or **Dynamic pressure**; the dynamic fluid lining the tube is
+cut into `segments` (default 10) along the tube, each a series resistor with its own wall pressure), `SOLID`
+(deformable part, free or fixed where it touches fixed rigid bodies), Rigid body with **Motion: Fixed / Free**
+(activation space only: `ACTIVATION_ROLE_FIELDS`, `Project.role_fields`, `Project.set_role` fills the space's
+defaults). **No "Pusher" role** (user: rigid body with fix/free + a solid option instead); auto-assign makes
+pusher/plunger/piston free rigid bodies, fluid-ish names Fluid (inlet/input/source/outlet/sink/ambient → constant).
+**Flow connections** (`detect_connections`): wherever two fluid bodies touch (probe just outside each fluid face,
+winding numbers) and where a dynamic fluid faces the outside (faces that probe outside are re-probed further out -
+faceting gaps between the curved tube wall and the curved fluid faked an "outside" strip). Stored in
+`project.connections[key]` = {"type": Opening | Orifice | Closed, "law"}; default opening between fluids, closed
+to the outside. Shown under "Flow connections" in the model tree (items with negative indices -1-k,
+`ModelTree.set_connections`) and in the **Flow** tab (`FlowPanel`); selecting one highlights the contact face.
+**Flow network** (`membrane_sim/flow.py`, SI units): nodes (fixed or unknown gauge pressure), edges with the user's
+law dp = f(mdot, rho, mu, A, P, h, w, L, Dh, p, p_up, p_down, rho_up) inverted per edge (brentq on |mdot|), openings
+merge nodes (union-find), steady mass balance solved with `scipy.optimize.root`. Ideal gas ρ = p_abs/(R T); R, T,
+p_atm, μ are Study settings. `rho` = mean pressure (friction), `rho_up` = upstream (orifice; default orifice law
+`(mdot/(0.61*A))**2/(2*rho_up)`, default segment law laminar `32*mu*L*mdot/(rho*A*Dh**2)`). A connection's A, P, h, w
+= its contact face (for the user's CAD that is the whole bore - a smaller orifice needs its area typed in the law).
+Segment geometry = the smallest section in the segment (`ChannelSections.geometry`: A, perimeter, height along the
+closing direction, width). Sections cut the **whole inside wall** (every tube face against any fluid, not end
+faces): cutting only the dynamic fluid's faces lost the triangles at the junction with the next fluid (a fake 0.37
+mm² dip). Axis = long direction of the tube fluid, oriented from the higher-pressure end (constant fluids and
+outside openings count as ends).
+`run_study`: per Δp, iterate structure ↔ flow: set wall pressures (segment k = mean of its end nodes; other fluids
+against the tube get theirs) → warm-started solve (1-2 load steps, `min_load_increment` 1/64) → measure → network →
+new wall pressures, under-relaxed when the change grows, until max change ≤ `coupling_tolerance` (kPa). Results:
+A (min section), mdot, node pressures along the tube, p_end, travel, profiles; `ActivationDesign.load(path)`
+.area/.mass_flow/.end_pressure(dp). Results tab: A & ṁ vs Δp, **tube-end pressures vs Δp** (user asked), and the
+area + pressure profile along the tube at the selected point. The live plot follows the newest point
+(`add_point`) - the slider kept an index of the previous longer run and raised IndexError on every point.
+A membrane is bonded to every free rigid body (`RigidTie`) or Solid (`SurfaceTie`) its face touches (within 0.6 t);
+Δp pushes it towards the tube; the closing direction comes from the membranes' area-weighted centroid (a vertex mean
+tilted it 1%). Contact: every deformable solid (tube, Solids) vs every free rigid body (`MovingContact`) and vs
+each other (`SolidContact`, both directions). `PartSettings.set_role` no longer carries `elements_per_side` across
+kinds (a rigid body's 10 gave a Solid pusher 15.8k nodes and minutes per iteration). Core pieces:
+- `membrane_sim/solid.py` `Solid`: TET4/TET10 compressible neo-Hookean, 4 Gauss points; shell-like interface
+  (`faces` = boundary sub-triangles, 4 per TET10 face; `surface_nodes`; `allow_initial_overlap` → rest contact
+  offset may be negative). **J via triple product**: `torch.linalg.det`'s Hessian is NaN at F = I (made the
+  first Newton step fail).
+- `membrane_sim/rigid.py`: `RigidBody` (6 dofs t, θ; Rodrigues with Taylor branch; `n_nodes = 0`, `coord_mask`),
+  `RigidTie` (penalty 10 k), `MovingContact` (solid nodes vs the body in its frame; 2nd-order surrogate of the sd
+  gives exact derivatives w.r.t. node and body).
+- `membrane_sim/solid_contact.py`: `SolidContact` (nodes of A vs closest triangle of solid B, signed by the
+  triangle normal, offset = min(0, rest sd) so touching at rest is neutral; C0 where the closest triangle changes)
+  and `SurfaceTie` (membrane node follows a barycentric point of a solid's surface + non-rotating rest offset).
+- `fluid.py` `SurfacePatch` / `FluidVolume.add_patch`: chamber wall on a solid, every boundary loop with a free
+  node closed by a fan to its centroid (apex-independent volume; cap force = axial force of the pressure drop).
+  `FluidVolume.volume_terms()` is what the solver now assembles (shell boundaries + patches). The tube's wall
+  pressures are constant-pressure FluidVolumes (one per segment / per fluid) whose P0 the flow iteration updates.
+- `shell_contact.py` `ShellContact(pairs=[(A, nodes, B, faces, h)])`: explicit node/face sets, used for the tube
+  closing on itself (membrane-side wall vs far wall, h = 0.02 H). `safe_step` skips a node's own triangles when
+  A is B — nodes on the seam have distance 0 and otherwise allowed no step at all.
+- `solver.py`: bodies = Shell | Solid | RigidBody; `couplings` (bind/terms → global dofs, e, g, H) and
+  `surface_contacts` lists (also on `Environment`).
+- `lumen.py` `ChannelSections`: rest-configuration planes normal to the axis (a vertex on a plane counts as
+  above), segments oriented by the wall normal, A = ½ Σ (p × q)·a (no ordering needed), clipped at 0.
+Contact stiffness for the device: k = 4 p_ref / (0.02 H), H = inside height of the tube along the closing direction.
+User's CAD (`cad_models/ActivationTest.step`, rebuilt 2026-09-29 22:01): lens-shaped Tube z -5..5 with TubeCavity
+(dynamic fluid), End1/End2 (fixed rigid tube stubs z -7..-5 / 5..7) with fluids Input and Body10 inside them
+(Body10 auto-assigns as a rigid body - the user sets it to a constant fluid). Pressure check with Input 10 kPa,
+Body10 0 kPa, orifice TubeCavity→Body10 with A = whole bore: solver mdot = 6.5558e-5 kg/s = hand orifice formula;
+the orifice takes ~9.1 kPa (jet ≈73 m/s; laminar segment law is really Re ≈ 3500). The user's own run used a
+0.0001·A orifice, 500x smaller than even the closed tube (floor ≈0.012-0.036 mm²: contact gap + lens corners), so
+the tube never controlled the flow - told them to size the orifice between open- and closed-tube resistance.
+Earlier numbers (old model, rigid pusher, p_in 10 kPa in the input half): A = 0.33 at 10 kPa, closed from ≈20 kPa,
+12-25 s per point; Solid pusher (E = 5 MPa): A = 0.367 at 10 kPa, 70-150 s per point. The user saved designs into
+the session scratchpad (temporary) because QSettings' last_dir came from a GUI test - told them to save elsewhere.
+
 `app/` — GUI (PyQt5 via qtpy + PyVista) on top of the core:
 - `cad.py` — gmsh/OpenCASCADE STEP import (names from product labels, fallback to STEP solid names for
   Fusion multi-body parts), per-body surface meshing, topological outward orientation (handles cavities),
@@ -157,14 +240,11 @@ math changes.** Build: `pdflatex` twice in `docs/paper` (MiKTeX installed; aux f
 - GUI test scripts open real windows on the user's desktop (they may click them); VTK does not work with
   `QT_QPA_PLATFORM=offscreen` on Windows. Capture the 3D view with `viewport.screenshot()`, not `grab()`.
 - Bash heredocs containing Python with quotes sometimes break the harness — write edit scripts to the
-  scratchpad and run them. `cmd | grep` buffers output of long runs; write to a log file instead.
+  scratchpad and run them. `Path.write_text` without `encoding="utf-8"` writes cp1252 on Windows (broke `mm²`). `cmd | grep` buffers output of long runs; write to a log file instead.
   TaskStop may leave the Python child running — check with `Get-CimInstance Win32_Process`.
   The user's Jupyter Lab processes are theirs; don't kill them.
 
-## Work in progress (UNCOMMITTED, as of end of 2026-09-28 session)
-
-Uncommitted edits in `membrane_sim/solver.py`, `membrane_sim/shell_contact.py` (new), `app/project.py`,
-`README.md`, `tests/`. Commit once the tests below pass. (`cad_models/*` changes are the user's.)
+## Earlier work (2026-09-28/29, committed in 2b5d242)
 
 1. **Membrane–membrane contact** (`membrane_sim/shell_contact.py`, wired into `NewtonSolver.evaluate`):
    node-to-triangle penalty between *different* shells (no self-contact), contact distance
@@ -198,6 +278,13 @@ Uncommitted edits in `membrane_sim/solver.py`, `membrane_sim/shell_contact.py` (
    W1 constant, W2 linear, W0 constant (0.64 kPa error) with the exhaustive search. Δp=0 points are left out (user's choice).
 
 ## Status and open issues
+
+- **Deformable (Solid) pusher does not converge on the generated round-tube valve** (`SolidContact`: residual
+  stalls at load ≈0.2 of 30 kPa, also with a finer pusher mesh; test marked xfail). Works on the user's lens tube.
+  Likely the closest-triangle-only pairing (C0); the fix to try: all triangles within range with a smoothed
+  penalty, as `ShellContact` does.
+- Flow model limits: steady, isothermal, lumped (uniform pressure per segment); no choking/compressible orifice law
+  unless the user writes one; the closed tube keeps ≈2% of A0 (contact gap h = 0.02 H - could be a setting).
 
 - The new robust `newton()` (commit 7540c3e) solves `cad_models/Example.mns` up to 19 kPa, but
   **regressed on the soft-neuron benchmark** (old: converged 110 its / 32 s; new: stalls at λ≈0.995 after
