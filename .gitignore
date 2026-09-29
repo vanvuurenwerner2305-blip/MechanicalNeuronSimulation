@@ -6,3 +6,7 @@ __pycache__/
 *.vtp
 *.msh
 examples/output/
+docs/paper/*.aux
+docs/paper/*.log
+docs/paper/*.out
+docs/paper/*.toc

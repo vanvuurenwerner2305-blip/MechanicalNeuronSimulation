@@ -598,6 +598,76 @@ def test_lowest_total_order_is_never_above_the_greedy_rule():
             assert order(lowest) <= order(greedy)
 
 
+def test_equation_fit_stops_at_its_budget_and_can_be_cancelled():
+    # an unreachable tolerance used to try every degree combination (hours on a real sweep)
+    samples = _synthetic_samples(w1=([2.0, 0.3, 0.01], [5.0, -0.2]))
+    noise = iter(1 + 0.01 * np.random.default_rng(0).standard_normal(3 * len(samples)))
+    for s in samples:  # like solver output: no piece is ever fitted exactly, so the degree caps stay high
+        s["terms"] = {k: (p, dp, W * next(noise)) for k, (p, dp, W) in s["terms"].items()}
+    result = ms.fit_neuron_equation(samples, tolerance=0.0, max_evaluations=25)
+    assert result["stopped"] and not result["met"] and result["evaluated"] == 25
+    assert result["error"] == pytest.approx(max(result["errors"]))  # the best combination found is returned
+    assert not ms.fit_neuron_equation(samples, tolerance=1.0)["stopped"]
+
+    class Cancelled(Exception):
+        pass
+    calls = []
+
+    def check():
+        calls.append(1)
+        if len(calls) > 3:
+            raise Cancelled()
+    with pytest.raises(Cancelled):
+        ms.fit_neuron_equation(samples, tolerance=0.0, check=check)
+
+
+def test_sensitivity_is_undefined_where_the_weighted_average_model_breaks():
+    # Eq. 4.10: dp_a/dW_k = (p_k - p_a) / sum W
+    S = ms.activation_sensitivities({"in": (4.0, 2.0), "W0": (1.0, 2.0)})
+    assert S["in"] == pytest.approx(1.0) and S["W0"] == pytest.approx(-0.25)
+    # NeuronTest2 at Input1 = 0: a pre-pressurised weight chamber forces secant weights that sum to ~0,
+    # one of them negative; that state must not dominate the fit
+    S = ms.activation_sensitivities({"Input1": (-0.035, -152.6), "Input2": (-0.035, 109.67),
+                                     "ambient": (-0.035, 42.63), "W0": (0.035, 0.3)})
+    assert all(np.isnan(v) for v in S.values())
+
+
+def test_measured_bias_enters_the_equation():
+    # path "in1" pushes b = 4 mm3 at zero pressure difference (e.g. a pre-pressurised weight chamber):
+    # dV1 = b + 2 dp1; W2 = 3; W0 = 1. At equal pressures (all 0) p_a = b / sum W = 4 / 6, not 0.
+    b = 4.0
+    samples = []
+    for p1 in np.linspace(-10, 10, 7):
+        for p2 in (0.0, 5.0):
+            pa = ms.solve_activation([(p1, [2.0], False), (p2, [3.0], False), (0.0, [1.0], True)], bias=b)
+            assert 2.0 * (p1 - pa) + 3.0 * (p2 - pa) + (0.0 - pa) + b == pytest.approx(0.0, abs=1e-9)
+            dp1 = p1 - pa
+            samples.append({"p_a": pa, "terms": {"in1": (p1, dp1, (b + 2.0 * dp1) / dp1),  # secant incl. bias
+                                                 "in2": (p2, p2 - pa, 3.0), "W0": (0.0, pa, 1.0)},
+                            "volumes": {"in1": b + 2.0 * dp1}})
+    fit = ms.fit_neuron_equation(samples, tolerance=1e-9, bias={"in1": b})
+    assert fit["met"] and fit["bias"] == pytest.approx(b) and fit["fits"]["in1"]["bias"] == pytest.approx(b)
+    assert all(d == 0 for w in _degrees(fit).values() for d in w.values())  # W1 = 2 exactly once b is out
+    assert fit["fits"]["in1"]["sides"]["+"]["coefficients"] == pytest.approx([2.0])
+    latex = ms.equation_align(ms.neuron_equation_latex([("in1", fit["fits"]["in1"]), ("in2", fit["fits"]["in2"])]))
+    assert "+ B}" in latex and "b_{1}" in latex
+
+
+def test_a_multivalued_equation_is_judged_by_its_worst_root():
+    # W1(x) = (x - 6)^2 against a constant W2 = 0.5: with x = 10 - p_a the residual W1(x) x - 0.5 (10 - x)
+    # changes sign three times on [0, 10], so the equation allows three activation pressures
+    terms = [(10.0, [36.0, -12.0, 1.0], False), (0.0, [0.5], False)]
+    roots = ms.solve_activation(terms, all_roots=True)
+    assert len(roots) == 3 and roots == sorted(roots)
+    assert ms.solve_activation(terms, p_hint=roots[-1]) == pytest.approx(roots[-1])
+    # the fit scores such an equation by its worst root, not by the root nearest the simulation
+    samples = [{"p_a": roots[0], "terms": {"in1": (10.0, 10.0 - roots[0], 36.0 - 12.0 * (10.0 - roots[0])
+                                                    + (10.0 - roots[0]) ** 2),
+                                           "in2": (0.0, -roots[0], 0.5)}}]
+    fit = ms.fit_neuron_equation(samples, tolerance=1e-6)
+    assert fit["ambiguous"] == 0 or fit["error"] >= roots[-1] - roots[0] - 1e-6
+
+
 def test_weight_without_usable_points_is_left_out():
     fit = ms.polyfit_weight([0.0, np.nan], [1.0, 2.0], 0)  # dp = 0 is left out
     assert fit["kind"] == "none"

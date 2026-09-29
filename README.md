@@ -116,6 +116,10 @@ tests/                  analytical benchmarks, consistency checks, application p
 
 ## Solver model
 
+The full formulation (elements, pressure loads, contact, Newton globalisation, CAD pipeline and the
+fitting of the neuron equation) is written up in [`docs/paper/membrane_neuron_simulator.pdf`](docs/paper/membrane_neuron_simulator.pdf)
+(LaTeX source next to it). The summary below is the short version.
+
 - **Membrane**: plane-stress triangle on the exact surface deformation gradient. Incompressible
   neo-Hookean (the default, for rubber) or St. Venant–Kirchhoff. Optional pre-tension.
 - **Bending**: Morley triangle with one mid-edge rotation unknown per edge. It is independent of

@@ -71,10 +71,24 @@ PyQt5, matplotlib, `gmsh` pip-installed). Windows.
   **Weights are piecewise** (user, 2026-09-29): one polynomial for Δp > 0 and one for Δp < 0, each side a
   separate "piece" with its own degree in the search; fits[k] = {"kind": "piecewise", "sides": {"+", "-"}}
   (None = side not sampled, then the other side's polynomial is used for both, `weight_coefficients`).
-  `polyfit_weight` weights the least squares by |Δp| (= error in ΔV): unweighted, the huge W = ΔV/Δp just
-  off Δp=0 (slack membrane) dominated and forced degree 4 with 1e6 coefficients. (A sensitivity weighting
-  |Δp|/ΣW from Eq. 4.10, a W>0 check and sensitivity-coloured dots were tried 2026-09-29 and **rolled back
-  at the user's request**. Open issue found then: with a near-rigid activation fluid (W0 ≪ W) p_a depends
+  `polyfit_weight` weights the least squares by the sensitivity |∂p_a/∂W| = |Δp|/ΣW (Eq. 4.10,
+  `activation_sensitivities`, ΣW over that sample's weights incl. W_0; user's request 2026-09-29, after an
+  earlier attempt was rolled back). Without sensitivities it falls back to |Δp| (= error in ΔV). Unweighted, the
+  huge W = ΔV/Δp just off Δp=0 (slack membrane) dominated and forced degree 4 with 1e6 coefficients. The
+  W-vs-Δp plot (`_plot_fit`) colours each dot by |∂p_a/∂W| (`weight_sensitivity` in `app/sweep.py`).
+  A sample whose ΣW cancels (≤ 1e-3 Σ|W|) gets NaN sensitivity and is left out of the fits: a gas weight chamber
+  pre-pressurised inside a path is a hidden bias (NeuronTest2.mns, Weight1 at 20 kPa: at Input1 = 0 all pressures
+  are 0 but p_a = 0.035, so W = -152.6 + 109.7 + 42.6 + 0.3 ≈ 0 and S → 2e10).
+  **Bias term B** (user, 2026-09-29): p_a = (ΣW_j p_j + W_0 p_0 + B)/(ΣW_j + W_0). A path through a closed chamber that
+  is not neutral at rest (`is_neutral`: pressure(0) ≠ 0) is biased: dV_j = b_j + W_j Δp_j. b_j is **measured, not
+  fitted** (fitted, B wandered 0.6..18 mm³ with the degrees): `measure_bias` in app/sweep.py does one extra solve with
+  every CONSTANT input (not vents) at the activation rest pressure, `bias_volumes` = dV - W_tan·Δp there (NeuronTest2
+  with Weight1 at 20 kPa: b = 5.884). Rows carry row["bias"]; `sample_weight` gives (dV - b)/Δp.
+  **Multivalued equations**: polynomial W can give several p_a roots; `solve_activation(all_roots=True)`; the fit
+  scores each sample by its *worst* root ("ambiguous" count in the result) - picking the nearest root had accepted an
+  equation 1.2 kPa off by another root. "Equation vs simulation" tab (`_plot_compare`): simulated p_a with the
+  equation over it (1D curve + other roots as x; 2D surface + 25×25 wireframe).
+  (Open issue found earlier: with a near-rigid activation fluid (W0 ≪ W) p_a depends
   only on weight *ratios*, so the p_a tolerance lets every W be off by the same factor — e.g. constant W
   fits 40-60% off the sampled W still met 1 kPa.) The 2D example
   sweep (Left, Right 0..20 kPa) is all constants per side at 1 kPa (W_Left 956 / 2652, W_Right 1752 / 4324
@@ -87,9 +101,12 @@ PyQt5, matplotlib, `gmsh` pip-installed). Windows.
   with only that weight fitted, others at sampled W); can end higher because errors cancel (example
   neuron at 1 kPa: exhaustive total 1 vs greedy 3). Degrees capped at the first exact fit / points−1.
   Dialog: tolerance or method change does not refit; "Regenerate equation" refits from the stored rows
-  (no re-simulation). Clicking a weight line in the rendered equation (matplotlib pick) plots its fit
-  over the sampled points below it (Δp≈0 points shown as dotted lines). p_a per point from `solve_activation` (implicit root of
-  Σ W_k(x_k)(p_k − p_a) = 0 between min/max p_k). `polyfit_weight`: least squares, Δp≈0 points left out.
+  (no re-simulation). Equation tab (redesigned 2026-09-29, user found it unreadable): verdict banner, then a
+  scroll area with each line rendered at natural size (`math_pixmap` via mathtext) and one clickable `WeightCard` per
+  weight (piecewise sides with a painted `Brace`), next to the selected weight's fit plot; LaTeX source in its own tab.
+  The card's fit plot shows its fit
+  over the sampled points (Δp≈0 points shown as dotted lines). p_a per point from `solve_activation` (implicit root of
+  Σ W_k(x_k)(p_k − p_a) = 0 between min/max p_k). `polyfit_weight`: sensitivity-weighted least squares, Δp≈0 points left out.
   `neuron_equation_latex` → LaTeX lines (matplotlib-mathtext compatible). `app/sweep.py`: activation
   chamber combo, "p_a from weights" check column, "Neuron equation" tab (rendered + Copy LaTeX),
   export `<name>.csv`, `_weights.csv`, `_equation.tex`.
@@ -115,7 +132,19 @@ ghost volume (blue, darker = more liquid), Closed incompressible = linear law wi
 Vent (0 kPa, transparent). Membrane default E = 0.5 MPa.
 Thickness is measured from CAD when a role is assigned.
 
+`docs/paper/membrane_neuron_simulator.tex` (+ compiled PDF) — technical reference of the whole formulation,
+linked from the thesis instead of describing the simulator there (user, 2026-09-29). **Keep it in sync when the
+math changes.** Build: `pdflatex` twice in `docs/paper` (MiKTeX installed; aux files are git-ignored).
+
 ## Gotchas (learned the hard way)
+
+- **Sweep dialog threads (fixed 2026-09-29):** the user's "crashes" were Windows app hangs (Event Viewer: AppHangB1,
+  pythonw) - closing the dialog blocked the UI in `wait(60000)` on an equation fit that could not be cancelled and,
+  at an unreachable tolerance, tried every degree combination (hours). Now: `fit_neuron_equation(check=, 
+  max_evaluations=2000)` ("stopped" in the result), closing cancels and closes on `finished` (never waits on the
+  UI thread; Esc goes through `reject`, which skips `closeEvent`), a new sweep cancels a running fit, and Export no
+  longer fits on the UI thread. Crash forensics: `Get-WinEvent` Application log IDs 1000/1001/1002 - fast-fail
+  aborts (0xc0000409) and hangs never reach faulthandler/crash.log.
 
 - Only **PyQt5** works in this Anaconda env (PySide6/PyQt6 DLL conflicts); `app/__init__.py` sets `QT_API=pyqt5`.
   Qt6-only imports (e.g. `QAction` from QtGui) need a fallback.

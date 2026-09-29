@@ -78,7 +78,7 @@
         "pressure": 0.0,
         "ghost_volume": 0.0,
         "incompressible": 0.0,
-        "stiffness": 10.0,
+        "stiffness": 100.0,
         "fluid_volume": 300.0
       },
       "visible": true
@@ -87,9 +87,9 @@
       "name": "Weight1",
       "role": "Fluid chamber",
       "props": {
-        "model": "Constant pressure (input)",
-        "pressure": 20.0,
-        "ghost_volume": 0.0,
+        "model": "Closed: ideal gas (isothermal)",
+        "pressure": 0.0,
+        "ghost_volume": 3000.0,
         "incompressible": 0.0,
         "stiffness": 1000.0,
         "fluid_volume": 60.0
@@ -100,10 +100,10 @@
       "name": "Weight2",
       "role": "Fluid chamber",
       "props": {
-        "model": "Constant pressure (input)",
+        "model": "Closed: ideal gas (isothermal)",
         "pressure": 0.0,
-        "ghost_volume": 0.0,
-        "incompressible": 0.0,
+        "ghost_volume": 3000.0,
+        "incompressible": 99.0,
         "stiffness": 1000.0,
         "fluid_volume": 60.0
       },
@@ -113,8 +113,8 @@
       "name": "Input1",
       "role": "Fluid chamber",
       "props": {
-        "model": "Closed: incompressible",
-        "pressure": 0.0,
+        "model": "Constant pressure (input)",
+        "pressure": 20.0,
         "ghost_volume": 0.0,
         "incompressible": 0.0,
         "stiffness": 10.0,
@@ -126,7 +126,7 @@
       "name": "Input2",
       "role": "Fluid chamber",
       "props": {
-        "model": "Closed: incompressible",
+        "model": "Constant pressure (input)",
         "pressure": 0.0,
         "ghost_volume": 0.0,
         "incompressible": 99.0,
