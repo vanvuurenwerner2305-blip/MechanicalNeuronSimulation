@@ -1,4 +1,4 @@
-"""Start the application: python -m app [model.step | project.mns | design.mad]"""
+"""Start the application: python -m app [model.step | project.mns | design.mad | neuron.mfn]"""
 import faulthandler
 import sys
 import traceback
@@ -7,11 +7,13 @@ from pathlib import Path
 
 from . import __name__ as _  # noqa: F401  (sets QT_API before Qt is imported)
 from qtpy.QtCore import QLocale
+from qtpy.QtGui import QIcon
 from qtpy.QtWidgets import QApplication, QMessageBox
 
 from .spaces import AppWindow
 
 LOG_DIR = Path.home() / ".membrane_neuron_simulator"
+ICON = Path(__file__).with_name("icon.ico")
 
 
 def _install_error_handling():
@@ -36,10 +38,14 @@ def _install_error_handling():
 def main(argv=None):
     argv = sys.argv if argv is None else argv
     _install_error_handling()
+    if sys.platform == "win32":  # own taskbar entry and icon instead of pythonw's
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("MembraneNeuronSimulator.App")
     QLocale.setDefault(QLocale.c())  # engineering input: '.' as decimal separator everywhere
     app = QApplication.instance() or QApplication(argv)
     app.setApplicationName("Membrane Neuron Simulator")
     app.setStyle("Fusion")
+    app.setWindowIcon(QIcon(str(ICON)))
     window = AppWindow()
     window.show()
     if len(argv) > 1:

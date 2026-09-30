@@ -1,7 +1,10 @@
 """
-Activation-function space: CAD + roles -> a squeezed-tube model with gas flowing through it, the Δp
-sweep that maps the membrane's pressure difference to the tube's area, mass flow and pressures, and
-the saved design file.
+Activation-function space ("pre-activation to activation"): CAD + roles -> a squeezed-tube model with gas
+flowing through it, the Δp sweep that maps the membrane's pressure difference (the pre-activation) to
+the tube's area, mass flow and pressures, and the saved design file. The outputs (activations) are
+named segments of the tube's dynamic fluid (its "outputs" property, [{"name", "segment"}]); each is the
+gas pressure of its segment, read from the stored node pressures, so adding or changing outputs needs no
+new simulation. Without any, the downstream segment is the one output "activation".
 
 The device: a membrane (loaded by the pressure difference Δp across it) pushes, through a part
 bonded to it (a free rigid body or a deformable solid, e.g. a pusher), on a soft tube (the channel)
@@ -30,7 +33,9 @@ gas density) for the pressures, put them back on the wall, until the pressures s
 The design file (*.mad, JSON) keeps the roles, connections, settings and the computed mapping, so
 the device can be used as a part without simulating it again.
 """
+import base64
 import json
+import zlib
 from types import SimpleNamespace
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -143,8 +148,168 @@ class ActivationProject(Project):
         project.results = data.get("results")
         if project.results and "mdot" not in project.results:
             project.results = None  # mapping of the first version (no flow): simulate again
+        segment = data.get("output_segment")  # the single output of the version before named outputs
+        lumen = next((q for q in project.parts if project.results and q.name == project.results.get("lumen")), None)
+        if segment and lumen is not None and not lumen.props.get("outputs"):
+            lumen.props["outputs"] = [{"name": "activation", "segment": int(segment)}]
         project.path = str(path)
         return project
+
+
+def segment_pressures(results) -> np.ndarray:
+    """(points, N) gas pressure of every tube segment (kPa): the mean of its two end nodes, as on the wall."""
+    P = np.asarray(results["pressures"], float)
+    return 0.5 * (P[:, :-1] + P[:, 1:])
+
+
+# -----------------------------
+# The stored FEM solution (the deformed device at every simulated point)
+# -----------------------------
+
+def encode_array(a) -> dict:
+    """A numpy array as compressed float32 (or int32) base64 text, for the JSON design file."""
+    a = np.ascontiguousarray(a, dtype=np.int32 if np.issubdtype(np.asarray(a).dtype, np.integer) else np.float32)
+    return {"dtype": str(a.dtype), "shape": list(a.shape),
+            "data": base64.b64encode(zlib.compress(a.tobytes(), 6)).decode("ascii")}
+
+
+def decode_array(d) -> np.ndarray:
+    return np.frombuffer(zlib.decompress(base64.b64decode(d["data"])), dtype=d["dtype"]).reshape(d["shape"])
+
+
+def body_kind(body):
+    return "rigid" if getattr(body, "is_rigid", False) else "solid" if hasattr(body, "tets") else "shell"
+
+
+def body_display_coords(body) -> np.ndarray:
+    """What is stored of a body per point: node coordinates of a shell, surface-node coordinates of a solid, the
+    posed surface mesh of a rigid body."""
+    x = body.x.detach().cpu().numpy()
+    if body_kind(body) == "solid":
+        return x[body.surface_nodes.cpu().numpy()]
+    return x
+
+
+def encode_fem(build, project, frames) -> dict:
+    """The deformed device at every point: per body its display triangles, rest coordinates and one frame per
+    point (float32, compressed), keyed to the part names."""
+    parts = project.parts
+    bodies = []
+    for k, (index, body) in enumerate(build.shells.items()):
+        kind = body_kind(body)
+        faces = body.faces_np if hasattr(body, "faces_np") else body.faces.cpu().numpy()
+        rest = body.X.detach().cpu().numpy()
+        if kind == "solid":  # only the surface: renumber its nodes
+            nodes = body.surface_nodes.cpu().numpy()
+            renumber = np.full(len(rest), -1, np.int64)
+            renumber[nodes] = np.arange(len(nodes))
+            faces, rest = renumber[np.asarray(faces)], rest[nodes]
+        entry = {"name": parts[index].name, "kind": kind, "faces": encode_array(np.asarray(faces)),
+                 "rest": encode_array(rest), "frames": encode_array(np.stack([f[k] for f in frames]) if frames
+                                                                  else np.zeros((0,) + rest.shape))}
+        if kind == "shell":
+            entry["thickness"] = float(body.thickness)
+            entry["material"] = body.material
+        bodies.append(entry)
+    return {"version": 1, "bodies": bodies}
+
+
+class DesignFrames:
+    """The stored FEM solution of a design, interpolated between the simulated points:
+    at(dp) -> [{"name", "kind", "faces", "rest", "x", "thickness"}] (x: coordinates at dp, mm)."""
+
+    def __init__(self, fem, dp_all, keep):
+        """fem: results["fem"]; dp_all: results["dp"]; keep: indices of the points used (converged), sorted by dp."""
+        self.dp = np.asarray(dp_all, float)[keep]
+        self.bodies = []
+        for b in fem["bodies"]:
+            frames = decode_array(b["frames"]).astype(float)
+            self.bodies.append({"name": b["name"], "kind": b["kind"], "faces": decode_array(b["faces"]).astype(np.int64),
+                                "rest": decode_array(b["rest"]).astype(float), "frames": frames[keep],
+                                "thickness": b.get("thickness"), "material": b.get("material")})
+
+    def at(self, dp):
+        """Every body at pre-activation dp: linear between the neighbouring points, the end point outside."""
+        if len(self.dp) == 1:
+            i, w = 0, 0.0
+        else:
+            dp = min(max(float(dp), self.dp[0]), self.dp[-1])
+            i = int(np.clip(np.searchsorted(self.dp, dp) - 1, 0, len(self.dp) - 2))
+            w = (dp - self.dp[i]) / (self.dp[i + 1] - self.dp[i]) if self.dp[i + 1] > self.dp[i] else 0.0
+        out = []
+        for b in self.bodies:
+            f = b["frames"]
+            x = f[i] if len(f) == 1 or w == 0.0 else (1.0 - w) * f[i] + w * f[i + 1]
+            out.append({**{k: b[k] for k in ("name", "kind", "faces", "rest", "thickness", "material")}, "x": x})
+        return out
+
+
+DEFAULT_OUTPUT = "activation"
+
+
+def clean_outputs(outputs, segments=None):
+    """[{"name", "segment"}] with names made unique and non-empty, segments clamped to 1..segments."""
+    out, names = [], set()
+    for k, o in enumerate(outputs or ()):
+        name = str(o.get("name", "") or "").strip() or f"output {k + 1}"
+        base, n = name, 2
+        while name in names:
+            name, n = f"{base} ({n})", n + 1
+        names.add(name)
+        segment = max(int(o.get("segment", 1)), 1)
+        out.append({"name": name, "segment": min(segment, segments) if segments else segment})
+    return out
+
+
+def output_definitions(parts, results=None):
+    """The named outputs of a design: those of the fluid filling the tube (results["lumen"]), else of the first
+    dynamic fluid that has any; without any, the downstream segment as the one output "activation"."""
+    segments = len(results["pressures"][0]) - 1 if results and results.get("pressures") else None
+    fluids = [q for q in parts if q.role == FLUID and q.props.get("model") == DYNAMIC_FLUID]
+    lumen = next((q for q in fluids if results and q.name == results.get("lumen")), None)
+    source = lumen if lumen is not None else next((q for q in fluids if q.props.get("outputs")), None)
+    outputs = clean_outputs(source.props.get("outputs") if source is not None else (), segments)
+    if not outputs:
+        n = segments or (int(source.props.get("segments", 10)) if source is not None else 1)
+        outputs = [{"name": DEFAULT_OUTPUT, "segment": n}]
+    return outputs
+
+
+def output_pressures(results, outputs) -> dict:
+    """{output name: (points,) gas pressure of its segment (kPa)}."""
+    P = segment_pressures(results)
+    return {o["name"]: P[:, min(o["segment"], P.shape[1]) - 1] for o in outputs}
+
+
+def channel_axis(surface, lumen, connections, parts):
+    """(unit axis, centre) of the fluid filling the tube: its long direction, pointing from the higher-pressure
+    end (constant fluids and outside openings it connects to). connections: [(Connection, settings)]."""
+    pts = surface.vertices
+    center = _centroid(surface)
+    _, _, axes = np.linalg.svd(pts - pts.mean(axis=0), full_matrices=False)
+    axis = axes[0]
+    ends = []  # (position along the axis, pressure) of constant fluids and outside openings at the tube
+    for conn, settings in connections:
+        if lumen not in (conn.a, conn.b) or settings["type"] == CLOSED:
+            continue
+        other = conn.b if conn.a == lumen else conn.a
+        if other is None:
+            ends.append((float((conn.center - center) @ axis), 0.0))
+        elif parts[other].props.get("model") == CONSTANT_FLUID:
+            ends.append((float((conn.center - center) @ axis), float(parts[other].props.get("pressure", 0.0))))
+    if len(ends) >= 2:
+        upstream = max(ends, key=lambda e: e[1])
+        if upstream[0] > 0:
+            axis = -axis
+    return axis, center
+
+
+def segment_faces(surface, axis, segments, k):
+    """Faces of a fluid's surface mesh in segment k (1..segments) along the axis (equal lengths, as the model)."""
+    s = surface.vertices[surface.faces].mean(axis=1) @ axis
+    ends = surface.vertices @ axis
+    bounds = np.linspace(ends.min(), ends.max(), segments + 1)
+    return np.nonzero((s >= bounds[k - 1]) & (s <= bounds[k]))[0]
 
 
 class ActivationDesign:
@@ -153,26 +318,43 @@ class ActivationDesign:
     pressures along the tube, read from its .mad file and interpolated between the simulated points.
 
         design = ActivationDesign.load("valve.mad")
-        design.area(12.5)            # smallest cross-section at Δp = 12.5 kPa (mm²)
+        design.output("activation", 12.5)  # a named output: pressure of its tube segment at Δp = 12.5 kPa (kPa)
+        design.area(12.5)            # smallest cross-section (mm²)
         design.mass_flow(12.5)       # kg/s
         design.end_pressure(12.5)    # pressure at the downstream end of the tube (kPa)
+        design.swept_volume(12.5)    # volume the membrane swept towards the tube (mm³)
+
+    The swept volume is what a neuron needs to use the device's membrane as a wall of its pre-activation
+    chamber (the "Activation membrane" role); designs simulated before it was recorded have none
+    (has_volume False) and must be simulated again for that.
     """
 
-    def __init__(self, results: dict, name: str = ""):
+    def __init__(self, results: dict, name: str = "", outputs=None):
         self.name = name
         self.results = results
+        self.output_list = clean_outputs(outputs, len(results["pressures"][0]) - 1) or \
+            [{"name": DEFAULT_OUTPUT, "segment": len(results["pressures"][0]) - 1}]
         ok = np.asarray(results["converged"], bool)
+        if not ok.any():
+            raise ValueError(f"{name or 'The design'} has no converged points.")
         order = np.argsort(np.asarray(results["dp"], float)[ok])
         pick = lambda key: np.asarray(results[key], float)[ok][order]  # noqa: E731
         self.dp, self.A, self.mdot, self.p_end = pick("dp"), pick("area"), pick("mdot"), pick("p_end")
+        self.p_out = {name: v[ok][order] for name, v in output_pressures(results, self.output_list).items()}
+        self.travel_ = pick("travel") if "travel" in results else None
         self.A0 = float(results["A0"])
+        self.has_volume = "volume" in results and "membrane_area" in results
+        keep = np.nonzero(ok)[0][order]
+        self.frames = DesignFrames(results["fem"], results["dp"], keep) if results.get("fem") else None
+        self.volume = pick("volume") if self.has_volume else None
+        self.membrane_area = float(results["membrane_area"]) if self.has_volume else None
 
     @classmethod
     def load(cls, path):
         project = ActivationProject.load(path)
         if not project.results:
             raise ValueError(f"{path} holds no simulated mapping yet.")
-        return cls(project.results, Path(path).stem)
+        return cls(project.results, Path(path).stem, output_definitions(project.parts, project.results))
 
     def area(self, dp):
         return np.interp(dp, self.dp, self.A)
@@ -182,6 +364,45 @@ class ActivationDesign:
 
     def end_pressure(self, dp):
         return np.interp(dp, self.dp, self.p_end)
+
+    @property
+    def output_names(self):
+        return [o["name"] for o in self.output_list]
+
+    def output(self, name, dp):
+        return np.interp(dp, self.dp, self.p_out[name])
+
+    def swept_volume(self, dp):
+        return np.interp(dp, self.dp, self.volume)
+
+    @property
+    def dp_range(self):
+        return float(self.dp[0]), float(self.dp[-1])
+
+    def extrapolating(self, dp) -> bool:
+        lo, hi = self.dp_range
+        return not (lo - 1e-9 <= dp <= hi + 1e-9)
+
+    def range_warning(self, dp, where="") -> str:
+        """The warning shown when the pre-activation leaves the simulated range ("" inside it)."""
+        if not self.extrapolating(dp):
+            return ""
+        lo, hi = self.dp_range
+        side = "above" if dp > hi else "below"
+        return (f"{where + ': ' if where else ''}pre-activation Δp = {dp:.4g} kPa is {side} the simulated range of "
+                f"{self.name or 'the design'} ({lo:.4g} … {hi:.4g} kPa): EXTRAPOLATING, not interpolating - the "
+                f"membrane's swept volume is extended linearly and the outputs are held at their end values.")
+
+    def outputs(self, dp) -> dict:
+        """The device's outputs at a pressure difference dp (kPa) across its membrane; `extrapolated`
+        when dp lies outside the simulated range (the outputs are then those at the nearest end)."""
+        lo, hi = self.dp_range
+        out = {"dp": float(dp), "outputs": {name: float(self.output(name, dp)) for name in self.output_names},
+               "area": float(self.area(dp)), "mdot": float(self.mass_flow(dp)), "p_end": float(self.end_pressure(dp)),
+               "extrapolated": self.extrapolating(dp)}
+        if self.travel_ is not None:
+            out["travel"] = float(np.interp(dp, self.dp, self.travel_))
+        return out
 
 
 # -----------------------------
@@ -385,6 +606,11 @@ class ActivationBuild:
     def A0(self):
         return float(self.sections.rest_areas.min())
 
+    @property
+    def membrane_area(self):
+        """Rest area of the membrane(s) Δp acts on (mm²)."""
+        return float(sum(m.rest_area.sum().item() for m in self.membranes.values()))
+
     def area_profile(self, x=None):
         return self.sections.profile(self.tube.x.cpu().numpy() if x is None else x)
 
@@ -529,24 +755,12 @@ def build_activation(cad, mesh: ActivationMesh, project) -> ActivationBuild:
     # --- channel axis: the long direction of the fluid filling the tube, from its higher-pressure end
     lm = mesh.surfaces[lumen]
     pts = lm.vertices
-    center = _centroid(lm)
-    _, _, axes = np.linalg.svd(pts - pts.mean(axis=0), full_matrices=False)
-    axis = axes[0]
     connections = [(conn, project.connection(conn.key, outside=conn.b is None))
                    for conn in detect_connections(mesh.surfaces, parts, bodies)]
-    ends = []  # (position along the axis, pressure) of constant fluids and outside openings at the tube
-    for conn, settings in connections:
-        if lumen not in (conn.a, conn.b) or settings["type"] == CLOSED:
-            continue
-        other = conn.b if conn.a == lumen else conn.a
-        if other is None:
-            ends.append((float((conn.center - center) @ axis), 0.0))
-        elif parts[other].props.get("model") == CONSTANT_FLUID:
-            ends.append((float((conn.center - center) @ axis), float(parts[other].props.get("pressure", 0.0))))
-    if len(ends) >= 2:
-        upstream = max(ends, key=lambda e: e[1])
-        if upstream[0] > 0:
-            axis = -axis
+    axis, center = channel_axis(lm, lumen, connections, parts)
+    for j, q in enumerate(parts):
+        if j != lumen and q.role == FLUID and q.props.get("outputs"):
+            warnings.append(f"{q.name} is not the fluid inside the tube: its outputs are not used.")
     s = pts @ axis
     lo, hi = float(s.min()), float(s.max())
     squeeze = squeeze_direction_from(mesh, membranes_idx, center, axis)
@@ -760,7 +974,7 @@ def run_study(build: ActivationBuild, project, callback=None, point_callback=Non
     flow = build.solve_flow(gas)
     wall = flow["wall"]
     warm = False
-    rows, history_states = [], []
+    rows, history_states, frames = [], [], []
     for k, dp in enumerate(dps):
         if check:
             check()
@@ -796,10 +1010,12 @@ def run_study(build: ActivationBuild, project, callback=None, point_callback=Non
             wall = wall + omega * (flow["wall"] - wall)
         profile = build.area_profile()
         row = {"dp": float(dp), "area": build.area(), "mdot": flow["mdot"], "p_end": float(flow["tube"][-1]),
+               "volume": float(build.load.delta_volume),
                "pressures": flow["tube"].tolist(), "fluids": flow["fluids"], "travel": build.travel(),
                "iterations": iterations, "converged": bool(converged), "profile": profile.tolist(),
                "message": result.message if result is not None else ""}
         rows.append(row)
+        frames.append([body_display_coords(b) for b in build.shells.values()])
         history_states.append({
             "dp": float(dp), "load_factor": 1.0, "converged": bool(converged),
             "shell_coords": [s.x.detach().cpu().clone() for s in build.shells.values()],
@@ -815,12 +1031,15 @@ def run_study(build: ActivationBuild, project, callback=None, point_callback=Non
     return {
         "dp": [r["dp"] for r in rows], "area": [r["area"] for r in rows], "mdot": [r["mdot"] for r in rows],
         "p_end": [r["p_end"] for r in rows], "pressures": [r["pressures"] for r in rows],
+        "volume": [r["volume"] for r in rows], "membrane_area": build.membrane_area,
+        "fem": encode_fem(build, project, frames),
         "fluids": [r["fluids"] for r in rows], "travel": [r["travel"] for r in rows],
         "converged": [r["converged"] for r in rows], "iterations": [r["iterations"] for r in rows],
         "profiles": [r["profile"] for r in rows], "stations": (build.sections.stations - f.bounds[0]).tolist(),
         "node_positions": f.node_positions().tolist(), "rest_profile": build.sections.rest_areas.tolist(),
         "A0": build.A0, "segments": f.segments, "segment_law": f.segment_law.text,
+        "lumen": f.names[f.lumen], "axis": build.axis.tolist(), "bounds": f.bounds.tolist(),
         "connections": {conn.key: dict(st) for conn, st in f.connections}, "gas": asdict(study),
         "units": {"dp": "kPa", "area": "mm^2", "mdot": "kg/s", "p_end": "kPa", "pressures": "kPa", "travel": "mm",
-                  "stations": "mm"},
+                  "stations": "mm", "volume": "mm^3", "membrane_area": "mm^2"},
     }, history_states

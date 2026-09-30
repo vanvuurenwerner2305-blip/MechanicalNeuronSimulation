@@ -1,10 +1,13 @@
 """
 Top-level window with the two spaces of the software, each a full window of its own in a tab:
 
-  Neuron               - the inputs to the activation chamber (MainWindow): membranes, chambers,
+  Inputs → pre-activation     - the inputs to the pre-activation chamber (MainWindow): membranes, chambers,
                          sweeps and the neuron equation.
-  Activation function  - the valve that maps the activation pressure difference to the area of a
-                         squeezed tube (ActivationWindow), saved as a design (*.mad).
+  Pre-activation → activation - the valve that maps the pre-activation (the pressure difference across its
+                                membrane) to the activation, the gas pressure of a chosen segment of a squeezed
+                                tube (ActivationWindow), saved as a design (*.mad).
+  Full neuron                 - both imported and linked (FullNeuronWindow): the design's membrane replaces a
+                                neuron membrane; fluid parameters, recording, sweeps; saved as *.mfn.
 
 Each space keeps its own CAD model and project. The inactive space is hidden, so its keyboard
 shortcuts (the same keys in both) do not clash.
@@ -14,9 +17,11 @@ from qtpy.QtWidgets import QMainWindow, QTabWidget
 
 from .activation import DESIGN_SUFFIX
 from .activation_window import ActivationWindow
+from .full_neuron import SUFFIX as FULL_SUFFIX
+from .full_neuron_window import FullNeuronWindow
 from .main_window import APP_NAME, MainWindow
 
-NEURON_TAB, ACTIVATION_TAB = "Neuron: inputs → activation", "Activation function"
+NEURON_TAB, ACTIVATION_TAB, FULL_TAB = "Inputs → pre-activation", "Pre-activation → activation", "Full neuron"
 
 
 class AppWindow(QMainWindow):
@@ -26,9 +31,10 @@ class AppWindow(QMainWindow):
         self.resize(1550, 950)
         self.neuron = MainWindow()
         self.activation = ActivationWindow()
+        self.full = FullNeuronWindow()
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
-        for window, title in ((self.neuron, NEURON_TAB), (self.activation, ACTIVATION_TAB)):
+        for window, title in ((self.neuron, NEURON_TAB), (self.activation, ACTIVATION_TAB), (self.full, FULL_TAB)):
             window.setWindowFlags(Qt.Widget)   # embedded: menus, docks and toolbars stay inside the tab
             window.windowTitleChanged.connect(self._update_title)
             self.tabs.addTab(window, title)
@@ -43,7 +49,7 @@ class AppWindow(QMainWindow):
 
     @property
     def spaces(self):
-        return (self.neuron, self.activation)
+        return (self.neuron, self.activation, self.full)
 
     def current(self):
         return self.tabs.currentWidget()
@@ -59,14 +65,20 @@ class AppWindow(QMainWindow):
         """Open a STEP file in the current space, a .mns project in the neuron space or a design in the
         activation-function space."""
         lower = str(path).lower()
-        if lower.endswith(DESIGN_SUFFIX):
+        if lower.endswith(FULL_SUFFIX):
+            self.show_space(self.full)
+            self.full.open_project(path)
+        elif lower.endswith(DESIGN_SUFFIX):
             self.show_space(self.activation)
             self.activation.open_project(path)
         elif lower.endswith(".mns"):
             self.show_space(self.neuron)
             self.neuron.open_project(path)
-        else:
+        elif self.current() is not self.full:
             self.current().open_step(path)
+        else:
+            self.show_space(self.neuron)
+            self.neuron.open_step(path)
 
     def closeEvent(self, event):
         for window in self.spaces:

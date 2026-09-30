@@ -12,8 +12,12 @@ SHELL = "Shell"
 RIGID = "Rigid body"
 CHAMBER = "Fluid chamber"
 IGNORE = "Ignore"
-ROLES = [UNASSIGNED, MEMBRANE, SHELL, RIGID, CHAMBER, IGNORE]
+# A membrane replaced by a pre-simulated activation-function design (its Δp -> swept volume curve)
+ACTIVATION_MEMBRANE = "Activation membrane"
+ROLES = [UNASSIGNED, MEMBRANE, SHELL, ACTIVATION_MEMBRANE, RIGID, CHAMBER, IGNORE]
 DEFORMABLE = (MEMBRANE, SHELL)
+SHEETS = DEFORMABLE + (ACTIVATION_MEMBRANE,)  # thin parts meshed on their mid-surface
+AUTOMATIC = "Automatic"
 
 # Activation-function space: a membrane squeezes a soft tube (the channel), through whatever is bonded
 # to it (a free rigid body or a deformable solid)
@@ -35,6 +39,7 @@ ROLE_COLORS = {
     UNASSIGNED: "#c8c8c8",
     MEMBRANE: "#e4572e",
     SHELL: "#f3a712",
+    ACTIVATION_MEMBRANE: "#d6336c",
     RIGID: "#6c7a89",
     CHAMBER: "#29a0d6",
     IGNORE: "#eeeeee",
@@ -43,7 +48,7 @@ ROLE_COLORS = {
     SOLID: "#b5838d",
 }
 FREE_RIGID_COLOR = "#8d6e63"
-ROLE_OPACITY = {UNASSIGNED: 1.0, MEMBRANE: 1.0, SHELL: 1.0, RIGID: 1.0, CHAMBER: 0.25, IGNORE: 0.1,
+ROLE_OPACITY = {UNASSIGNED: 1.0, MEMBRANE: 1.0, SHELL: 1.0, ACTIVATION_MEMBRANE: 1.0, RIGID: 1.0, CHAMBER: 0.25, IGNORE: 0.1,
                 CHANNEL: 1.0, FLUID: 0.35, SOLID: 1.0}
 
 ROLE_HELP = {
@@ -52,6 +57,12 @@ ROLE_HELP = {
               "A face that touches no chamber sees the surroundings (0 kPa).",
     SHELL: "Thin deformable sheet with bending stiffness. Simulated on its mid-surface. "
            "A face that touches no chamber sees the surroundings (0 kPa).",
+    ACTIVATION_MEMBRANE: "The membrane of an activation-function design (*.mad) simulated in the Pre-activation → "
+                         "activation space. It is not simulated again: the design's pre-simulated response (the "
+                         "volume the membrane sweeps at a pressure difference) replaces it. The driving chamber (the "
+                         "pre-activation chamber) pushes it towards the tube; the other side is the tube side. The "
+                         "design's outputs - the activation (the pressure of its chosen tube segment), tube area and "
+                         "mass flow - are read from it at the solved pre-activation pressure difference.",
     RIGID: "Undeformable part. Membranes and shells cannot pass through it. In the activation-function space it "
            "can also be free: it then moves and tilts as a rigid body, bonded to the membrane that touches it "
            "(e.g. a pusher), and presses on the tube and solids by contact.",
@@ -154,6 +165,17 @@ _DEFORMABLE_FIELDS = [
 ]
 
 ROLE_FIELDS = {
+    ACTIVATION_MEMBRANE: [
+        Field("design", "Activation design", "file", "", tooltip="The activation-function design (*.mad) whose "
+              "membrane this part is. Save it from the Pre-activation → activation space after running its study.",
+              choices=("Activation design (*.mad)",)),
+        Field("driving", "Driving chamber", "choice", AUTOMATIC, choices="__chambers__",
+              tooltip="The chamber whose pressure pushes the membrane towards the tube (positive Δp in the "
+                      "design). Δp = its pressure - the pressure on the other side (a chamber there, or 0 kPa).\n"
+                      "Automatic: the closed chamber it touches (the pre-activation chamber), else the first one."),
+        Field("thickness", "Thickness", "float", 0.0, "mm", 0.0, 1e6, 4, mesh=True,
+              tooltip="Only used to find the chambers on either side of the part."),
+    ],
     UNASSIGNED: [],
     IGNORE: [],
     MEMBRANE: _DEFORMABLE_FIELDS + [
@@ -239,6 +261,11 @@ ROLE_FIELDS.update({
                       "its own pressure on the tube wall. Elsewhere a dynamic fluid is one pressure."),
         Field("segment_law", "Segment resistance Δp", "text", SEGMENT_LAW, "Pa",
               visible_if=("model", (DYNAMIC_FLUID,)), tooltip=FLOW_LAW_HELP),
+        Field("outputs", "Outputs", "outputs", (), visible_if=("model", (DYNAMIC_FLUID,)),
+              tooltip="Named outputs (activations) of the device: the gas pressure of a segment of the fluid inside "
+                      "the tube. Choose a segment (it is highlighted in the 3D view), name it and add it; several "
+                      "outputs are allowed. Changing them needs no new simulation. Without any, the downstream "
+                      "segment is the one output 'activation'."),
     ],
     SOLID: [
         Field("youngs_modulus", "Young's modulus", "float", 0.5, "MPa", 1e-9, 1e6, 5),
@@ -303,6 +330,14 @@ SOLVER_FIELDS = [
 ]
 
 
+def _relative(target, project_file) -> str:
+    """target relative to the project file's folder when it is below it, else absolute."""
+    try:
+        return str(Path(target).resolve().relative_to(Path(project_file).resolve().parent))
+    except ValueError:
+        return str(Path(target).resolve())
+
+
 class Project:
     def __init__(self, step_path: str = None, part_names=()):
         self.step_path = step_path
@@ -365,28 +400,41 @@ class Project:
         path = Path(path)
         data = self.to_dict()
         if self.step_path:
-            try:
-                data["step_path"] = str(Path(self.step_path).resolve().relative_to(path.resolve().parent))
-            except ValueError:
-                data["step_path"] = str(Path(self.step_path).resolve())
+            data["step_path"] = _relative(self.step_path, path)
+        for part in data["parts"]:
+            if part["role"] == ACTIVATION_MEMBRANE and part["props"].get("design"):
+                design = Path(part["props"]["design"])
+                if not design.is_absolute() and self.path:  # was relative to the old project location
+                    design = Path(self.path).parent / design
+                part["props"]["design"] = _relative(design, path)
         path.write_text(json.dumps(data, indent=2))
         self.path = str(path)
 
     @classmethod
     def load(cls, path):
         path = Path(path)
-        data = json.loads(path.read_text())
+        project = cls.from_dict(json.loads(path.read_text()), path.parent)
+        project.path = str(path)
+        return project
+
+    @classmethod
+    def from_dict(cls, data, folder):
+        """A project from its saved dict; relative paths are relative to `folder`."""
+        folder = Path(folder)
         project = cls()
         step = Path(data["step_path"])
-        project.step_path = str(step if step.is_absolute() else (path.parent / step).resolve())
+        project.step_path = str(step if step.is_absolute() else (folder / step).resolve())
         project.parts = [PartSettings(**p) for p in data["parts"]]
+        for part in project.parts:
+            design = part.props.get("design") if part.role == ACTIVATION_MEMBRANE else None
+            if design and not Path(design).is_absolute():
+                part.props["design"] = str((folder / design).resolve())
         for part in project.parts:  # projects saved with older chamber models
             model = part.props.get("model")
             if part.role == CHAMBER and model in LEGACY_MODELS:
                 part.props["model"] = LEGACY_MODELS[model]
                 part.props["stiffness"] = INCOMPRESSIBLE_STIFFNESS
         project.solver = SolverSettings(**data.get("solver", {}))
-        project.path = str(path)
         return project
 
     def match_bodies(self, bodies):

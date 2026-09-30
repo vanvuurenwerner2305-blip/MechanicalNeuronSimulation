@@ -51,9 +51,9 @@ def build(path: Path):
 
     tag_to_name = {tag: name for name, tag in parts}
     text = path.read_text()
-    text = re.sub(r"Open CASCADE STEP translator [\d.]+ 1\.(\d+)",
+    text = re.sub(r"Open CASCADE STEP translator [\d.]+ \d+\.(\d+)",
                   lambda m: tag_to_name[written[int(m.group(1)) - 1]], text)
-    text = re.sub(r"'Open CASCADE STEP translator [\d.]+ 1'", "'SqueezeValve'", text)
+    text = re.sub(r"'Open CASCADE STEP translator [\d.]+ \d+'", "'SqueezeValve'", text)
     path.write_text(text)
     return [name for name, _ in parts]
 

@@ -19,11 +19,12 @@ commit/modify them unless asked.
 
 ```
 python run_app.py [file.step | project.mns | design.mad]   # GUI (or double-click "Membrane Neuron Simulator.bat" / desktop shortcut)
-python -m pytest tests                          # ~70 tests, ~10 min (solver benchmarks + app pipeline + activation)
+python -m pytest tests                          # ~85 tests, ~10 min (solver benchmarks + app pipeline + activation)
 python -m pytest tests/test_app.py -k ghost     # single test
 python examples/make_neuron_step.py             # writes examples/soft_neuron.step (named test assembly)
 python examples/make_activation_step.py         # writes examples/squeeze_valve.step (round-tube valve: TubeFluid, InletFluid, OutletFluid)
 python examples/soft_neuron_3d.py               # solver core used from a script
+python examples/make_icon.py app                # redraws app/icon.png + app/icon.ico (neuron; window/taskbar icon via app/__main__.py, desktop .lnk points at icon.ico)
 ```
 
 Environment: Anaconda Python 3.11 at `C:\Users\werne\anaconda3` (torch 2.5, scipy, pyvista, pyvistaqt,
@@ -112,6 +113,70 @@ PyQt5, matplotlib, `gmsh` pip-installed). Windows.
   chamber combo, "p_a from weights" check column, "Neuron equation" tab (rendered + Copy LaTeX),
   export `<name>.csv`, `_weights.csv`, `_equation.tex`.
 
+**Naming (user, 2026-09-30):** the neuron's "activation" chamber/pressure is now called **pre-activation** in all
+user-facing text (UI, docstrings, paper; code identifiers such as `activation_index`, `solve_activation` and the symbol
+p_a are unchanged). Tabs: **Inputs → pre-activation** (neuron) and **Pre-activation → activation** (the valve).
+**Named outputs** (user, 2026-09-30, replacing a single output-segment dropdown in the Results tab): a dynamic fluid's
+property `outputs` = [{"name", "segment"}] (Field kind "outputs" → `panels.OutputsEditor`: segment spin box, name, Add /
+Remove, rename in place; choosing a segment emits `PropertyPanel.segment_highlight` → yellow segment in 3D). Every output
+is drawn in its colour with its name (`ActivationWindow._show_outputs`, faces via `channel_axis` + `segment_faces` on the
+display mesh, lifted by `_raised` to avoid z-fighting). Editing outputs does not invalidate results (post-processing:
+`output_pressures` = mean of the segment's end nodes from the stored `pressures`). `output_definitions(parts, results)`:
+the lumen fluid's outputs (results["lumen"]), default one "activation" = downstream segment; old files' `output_segment`
+migrates to one output. `ActivationDesign.outputs(dp)["outputs"]` = {name: kPa}; neuron sweep columns "out:<name>".
+Results also store `lumen`, `axis`, `bounds`.
+
+**Full neuron workbench** (user, 2026-09-30; third tab "Full neuron", `app/full_neuron.py` model + `app/full_neuron_window.py`
+`FullNeuronWindow(QMainWindow)`, not a MainWindow subclass): imports a .mns (embedded copy in the `.mfn`, original untouched)
+and a .mad (path only; must have `volume`), `link` = {part, driving} → `linked_project()` deep-copies the neuron and sets
+that part's role to Activation membrane with the design path. Only chamber fields except `model` are editable
+(`LOCKED_FIELDS`); design parts read-only. Record catalogue keys: `P:<chamber>`, `dV:<chamber>`, `dp`, `out:<name>`,
+`area`, `mdot`; default = closed chambers' P + dp + outputs. Solve once at the set values, or characterise (below); each
+row keeps shell coords for the 3D results view. Model tree: two collapsible groups
+("Inputs to pre-activation", "Pre-activation to activation"); clicking a group edits its display transform (position mm,
+xyz Euler degrees about the model's bbox centre, `transform_points`). Design pick ids = 100000 + index. The design is
+placed at +x of the neuron on import. The neuron mesh is generated on the main thread before the worker (cached per
+import). `Project.from_dict(data, folder)` was split out of `Project.load` for the embedded project. Shared fixture
+`design` (simulated valve, session scope) is in `tests/conftest.py`.
+
+**Characterisation** (user, 2026-09-30: "sweep as many properties as i want and track as many as i want ... save this
+fully characterised dataset with the model ... later a workbench connects several neurons, we can't run the simulation
+each time"; no plots): Full neuron "Record & run" tab = table of sweep axes {part, field, from, to, points}
+(`project.sweep["axes"]`; `parameters()` = every float chamber field its model uses, `SWEEPABLE`, except `model`) and the
+record list (All/None). `run_grid(worker, cad, project, mesh, axes)` solves every combination in `serpentine` order
+(N-D boustrophedon, one step of one axis between points), each point solved **in one load step** (no ramp) from a
+**predicted state**: `predicted_state` = straight line through the solutions at the neighbour and the point before it
+on the same axis (`get_state`/`set_state` = every body's unknowns); if that fails, from the neighbour's solution, then
+from rest. Measured on NeuronTest+ActivationTest (2026-09-30): 12-pt 3x2x2 grid 58 s (2 ramp steps) -> 43-45 s;
+9x5 pressure grid 111 s (one step) -> 88 s with prediction; smooth region 3 -> 2 Newton its/point. Choosing between the
+prediction and the neighbour by lowest residual was tried and was worse (98 s: residual misjudges the guesses).
+Cost is dominated by the first ~4 kPa (slack membrane + contact onset: 10-25 its/point at any step size; ~0.3 s/it);
+past that 2-3 its/point, so dense axes are cheap (16x the points for 3x the time). `apply_parameter` changes P0 / gas volume / bulk
+stiffness / liquid volume on the built FluidVolume (no rebuild). `run_points` (1-2 pressures, rows with a/b) wraps it.
+`make_dataset` → `project.characterisation` (saved in the .mfn; values per key as JSON lists in grid C-order, null =
+not solved; converged, extrapolated, complete, `fingerprint` = sha1 of the neuron dict minus swept fields/visible/design
+path + solver + link + design file sha1; optional `shapes` = neuron sheets' rest/faces/frames, `encode_array`).
+`Characterisation(data)`: names "Part.field", `grid(key)`, `evaluate({name: value})` (multilinear RGI, linear
+extrapolation, `out_of_range`), `shapes()`, `rows()`. **This is the API the future multi-neuron workbench should use.**
+A finished run is stored and the .mfn saved automatically (Save dialog if it has no file yet); a cancelled/failed run
+is stored as incomplete (no shapes). Opening a .mfn shows the stored dataset; `dataset_current()` flags changes.
+Results tab: table only (plot removed), status, "Show the stored characterisation", CSV. 3D: neuron sheets and the
+design's stored FEM frames both coloured by |u| with one shared scale (`_frame_mesh`, `_thinned`). User model check
+(copies): Weight1 0..20 (3) × Weight2 0..10 (2) × ActivationChamber stiffness 10..40 (2) = 12 points in 55 s, 0.12 MB.
+
+**Stored FEM solution + extrapolation warning** (user, 2026-09-30): `run_study` stores results["fem"] (`encode_fem`):
+per body (build.shells: membranes, tube, movers) name, kind (shell/solid/rigid), display faces, rest coords and one frame
+per point (shells: nodes; solids: surface nodes only, renumbered; rigid: posed surface), float32 zlib base64
+(`encode_array`/`decode_array`) inside the .mad (valve test ≈ fine; check size on big tubes). `ActivationDesign.frames`
+= `DesignFrames.at(dp)` (linear between points, clamped outside). Shown by `viewport.frame_polydata`: in the activation
+window's Results view for a loaded design without a build (`_show_frames`, slider = point) and in the Full neuron results
+view (design deformed at the row's Δp, placed, part colours). Designs without "fem" still work (shown undeformed, note).
+`ActivationDesign.range_warning(dp, name)` / `BuildResult.range_warnings(parts, step)`: pre-activation Δp outside the
+simulated range → "EXTRAPOLATING, not interpolating" (swept volume extended linearly, outputs held at end values):
+neuron solve (log + message box), neuron sweep (orange rows, worker log, message at the end), Full neuron (log per point,
+orange rows, red 3D overlay, message at the end). The user's test models are `cad_models/ActivationTest.*` and
+`cad_models/NeuronTest.*` (+ `full_neuron.mfn`; Body14 is the Activation membrane, inputs Weight1/Weight2).
+
 **Two spaces** (user, 2026-09-29): the window (`app/spaces.py` `AppWindow`) has two tabs, each a full embedded
 QMainWindow with its own CAD model/project: **Neuron** (`MainWindow`, everything above) and **Activation function**
 (`app/activation_window.py` `ActivationWindow(MainWindow)`, overriding role list / project class / results panel /
@@ -156,6 +221,21 @@ A (min section), mdot, node pressures along the tube, p_end, travel, profiles; `
 .area/.mass_flow/.end_pressure(dp). Results tab: A & ṁ vs Δp, **tube-end pressures vs Δp** (user asked), and the
 area + pressure profile along the tube at the selected point. The live plot follows the newest point
 (`add_point`) - the slider kept an index of the previous longer run and raised IndexError on every point.
+**Design used in a neuron** (user, 2026-09-30: "import an activation function project into the neuron and connect the
+activation membrane to one of the neuron membranes ... it replaces it with the empirical model"): neuron role
+`ACTIVATION_MEMBRANE` ("Activation membrane", props `design` = .mad path (kind "file", Browse button; saved relative to
+the .mns, resolved absolute on load) and `driving` = chamber name or Automatic (kind "choice" with `choices="__chambers__"`
+filled from the form context)). `SHEETS = DEFORMABLE + (ACTIVATION_MEMBRANE,)` get mid-surfaces (only to find the chambers
+either side). `membrane_sim/empirical.py` `EmpiricalMembrane`: 1 dof q = mean deflection (mm), v = A q, energy
+∫Δp(v)dv from PCHIP of the inverted V(Δp), linear extension; mirrored about its Δp=0 point when no Δp<0 was simulated.
+It is a normal FluidVolume boundary (driving chamber side +1, tube side -1) via `fluid.wall_volume`/`wall_volume_terms`
+(duck-typed `swept_volume`/`volume_terms`), so characterise treats it as a path from its tube side. `run_study` now records
+`volume` (the Δp chamber's dV, mm³) and `membrane_area`; older .mad files have none (`has_volume` False) → error asking to
+re-run the study. At Δp=0 the tube gas pushes the membrane back (valve test: V = -0.94 mm³), that is physical.
+`BuildResult.activation` {part: `ActivationLink`} → `activation_outputs(step)` = design outputs at Δp = Σ side·P (log,
+results table, sweep columns/plots "act", CSV). Only the swept volume couples back; the design is valid for the supply/sink
+pressures it was simulated with. Tests: `tests/test_activation_link.py` (FE disk vs its own empirical curve in a sealed gas
+chamber agree within 0.05 kPa).
 A membrane is bonded to every free rigid body (`RigidTie`) or Solid (`SurfaceTie`) its face touches (within 0.6 t);
 Δp pushes it towards the tube; the closing direction comes from the membranes' area-weighted centroid (a vertex mean
 tilted it 1%). Contact: every deformable solid (tube, Solids) vs every free rigid body (`MovingContact`) and vs
@@ -229,6 +309,9 @@ math changes.** Build: `pdflatex` twice in `docs/paper` (MiKTeX installed; aux f
   longer fits on the UI thread. Crash forensics: `Get-WinEvent` Application log IDs 1000/1001/1002 - fast-fail
   aborts (0xc0000409) and hangs never reach faulthandler/crash.log.
 
+- gmsh numbers STEP products per write in a process ("Open CASCADE STEP translator 7.8 3.N" on the 3rd write): the
+  example generators' renaming regex must accept any write number, or a second generated file in one pytest run loses
+  its part names (fixed 2026-09-30).
 - Only **PyQt5** works in this Anaconda env (PySide6/PyQt6 DLL conflicts); `app/__init__.py` sets `QT_API=pyqt5`.
   Qt6-only imports (e.g. `QAction` from QtGui) need a fallback.
 - PyQt5 aborts on unhandled exceptions in slots; `app/__main__.py` installs an excepthook + faulthandler.

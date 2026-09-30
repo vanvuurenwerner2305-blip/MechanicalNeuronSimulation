@@ -5,7 +5,7 @@ from pyvistaqt import QtInteractor
 from qtpy.QtCore import QTimer, Signal
 from qtpy.QtWidgets import QVBoxLayout, QWidget
 
-from .project import DEFORMABLE, FREE_RIGID_COLOR, RIGID, ROLE_COLORS, part_color, part_opacity
+from .project import ACTIVATION_MEMBRANE, FREE_RIGID_COLOR, RIGID, ROLE_COLORS, SHEETS, part_color, part_opacity
 
 SELECTED = "#ffcc00"
 AXES = {"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1)}
@@ -49,6 +49,21 @@ def solid_shell(x, faces, thickness, values=None, on_cells=False):
             pd.cell_data["values"] = np.concatenate([values, values, side_values])
         else:
             pd.point_data["values"] = np.concatenate([values, values])
+    return pd
+
+
+def frame_polydata(frame, scale=1.0, place=None):
+    """A stored design body (DesignFrames.at) as a mesh at its deformed coordinates, with the displacement
+    magnitude as point values "values". scale exaggerates the displacement; place(points) positions it."""
+    rest, x = frame["rest"], frame["x"]
+    u = np.linalg.norm(x - rest, axis=1)
+    shown = rest + scale * (x - rest)
+    if place is not None:
+        shown = place(shown)
+    if frame["kind"] == "shell":
+        return solid_shell(shown, frame["faces"], float(frame.get("thickness") or 0.0), u)
+    pd = polydata(shown, frame["faces"])
+    pd.point_data["values"] = u
     return pd
 
 
@@ -238,7 +253,7 @@ class Viewport(QWidget):
                 continue
             selected = index in selection
             color = SELECTED if selected else part_color(part)
-            if part.role in DEFORMABLE and index in mesh_data.midsurfaces:
+            if part.role in SHEETS and index in mesh_data.midsurfaces:
                 mid = mesh_data.midsurfaces[index]
                 self._add(f"body{index}", polydata(mid.vertices, mid.faces), body=index, color=color,
                           opacity=1.0 if selected else max(self.opacity, 0.6), show_edges=True,
@@ -276,6 +291,9 @@ class Viewport(QWidget):
             if parts[index].role == RIGID and parts[index].visible:
                 self._add(f"body{index}", polydata(mesh.vertices, mesh.faces), body=index,
                           color=ROLE_COLORS[RIGID], opacity=min(0.3, self.opacity), pickable=True)
+            elif parts[index].role == ACTIVATION_MEMBRANE and parts[index].visible:  # not simulated: as in CAD
+                self._add(f"body{index}", polydata(mesh.vertices, mesh.faces), body=index,
+                          color=ROLE_COLORS[ACTIVATION_MEMBRANE], opacity=min(0.6, self.opacity), pickable=True)
 
         values = self.result_values(build, step, field)
         if clim is None:

@@ -16,7 +16,7 @@ from qtpy.QtWidgets import (QApplication, QComboBox, QDockWidget, QFileDialog, Q
 from .builder import KPA, build_environment, generate_mesh, measure_thickness, mesh_sizes
 from .cad import CadModel
 from .panels import ModelTree, PropertyPanel, ResultsPanel, SolverPanel
-from .project import CHAMBER, DEFORMABLE, ROLE_FIELDS, ROLES, Project
+from .project import CHAMBER, ROLE_FIELDS, ROLES, SHEETS, Project
 from .sweep import SweepDialog
 from .viewport import Viewport, polydata
 from .workers import Worker
@@ -63,9 +63,31 @@ rigid bodies). Their largest CAD face defines the mid-surface.</li>
 """
 
 
+def describe_outputs(out) -> str:
+    """One line of an activation membrane's outputs (ActivationDesign.outputs)."""
+    outputs = ", ".join(f"{name} {v:.4g} kPa" for name, v in out["outputs"].items())
+    text = (f"pre-activation Δp = {out['dp']:.4g} kPa → {outputs}; tube area {out['area']:.4g} mm², "
+            f"mass flow {out['mdot']:.4g} kg/s")
+    return text + ("  ⚠ EXTRAPOLATING: Δp outside the design's simulated range (outputs held at its end values)"
+                   if out["extrapolated"] else "")
+
+
+def activation_summary(build, parts):
+    """Log lines for the activation membranes of a build: design, driving and tube side."""
+    lines = []
+    for i, link in build.activation.items():
+        drive = [parts[c].name for c, s in link.sides.items() if s > 0] or ["-"]
+        tube = [parts[c].name for c, s in link.sides.items() if s < 0] or ["surroundings (0 kPa)"]
+        lo, hi = link.design.dp_range
+        lines.append(f"{parts[i].name}: activation design {Path(link.path).name} (Δp {lo:.4g}..{hi:.4g} kPa, "
+                     f"outputs {', '.join(link.design.output_names)}), "
+                     f"driven by {', '.join(drive)}, tube side {', '.join(tube)}")
+    return lines
+
+
 class MainWindow(QMainWindow):
-    """The neuron space (inputs -> activation). ActivationWindow subclasses it for the
-    activation-function space; these class attributes are what differs."""
+    """The neuron space (inputs -> pre-activation). ActivationWindow subclasses it for the
+    activation-function space (pre-activation -> activation); these class attributes are what differs."""
     SPACE_ROLES = ROLES
     PROJECT_CLASS = Project
     PROJECT_FILTER = "Project (*.mns)"
@@ -432,7 +454,7 @@ class MainWindow(QMainWindow):
             part = self.project.parts[i]
             if part.role == CHAMBER and not float(part.props.get("fluid_volume", 0.0) or 0.0):
                 part.props["fluid_volume"] = round(self.cad.bodies[i].volume, 6)
-            if part.role in DEFORMABLE and not float(part.props.get("thickness", 0.0) or 0.0):
+            if part.role in SHEETS and not float(part.props.get("thickness", 0.0) or 0.0):
                 try:
                     part.props["thickness"] = round(measure_thickness(self.cad, self.surfaces, i), 6)
                     self.log_message(f"{part.name}: measured thickness {part.props['thickness']:.4g} mm")
@@ -636,6 +658,8 @@ class MainWindow(QMainWindow):
         for i, t in check.thickness.items():
             fixed = int(check.shells[i].fixed.sum())
             self.log_message(f"  {parts[i].name}: thickness {t:.4g} mm, {fixed} fixed nodes")
+        for line in activation_summary(check, parts):
+            self.log_message("  " + line)
         self.log_message(f"  Contact stiffness {check.contact_stiffness:.4g} MPa/mm")
         for w in check.warnings:
             self.log_message("  Warning: " + w)
@@ -673,9 +697,16 @@ class MainWindow(QMainWindow):
         self.log_message(status)
         for c, v in build.volumes.items():
             self.log_message(f"  {parts[c].name}: P = {v.P / KPA:.5g} kPa, ΔV = {v.delta_volume:.5g} mm³")
+        for i, out in build.activation_outputs().items():
+            self.log_message(f"  {parts[i].name}: " + describe_outputs(out))
+        warnings = build.range_warnings(parts)
+        for w in warnings:
+            self.log_message("  Warning: " + w)
         if not solve_result.converged:
             QMessageBox.warning(self, APP_NAME, "The solver did not reach full load. Results show the last "
                                                 "converged load step.\n\n" + solve_result.message)
+        if warnings:
+            QMessageBox.warning(self, APP_NAME, "\n\n".join(warnings))
         self.results_panel.set_results(build.env.history, status)
         self.tabs.setCurrentWidget(self.results_panel)
         self.set_mode(RESULTS)
@@ -689,6 +720,8 @@ class MainWindow(QMainWindow):
         for (i, shell), coords in zip(self.build.shells.items(), step["shell_coords"]):
             u = np.linalg.norm(coords.numpy() - shell.X.cpu().numpy(), axis=1).max()
             disp.append(f"{parts[i].name}: max displacement {u:.4g} mm")
+        for i, out in self.build.activation_outputs(step).items():
+            disp.append(f"{parts[i].name}: " + describe_outputs(out))
         self.results_panel.set_table(rows, "\n".join(disp))
 
     def open_sweep(self):

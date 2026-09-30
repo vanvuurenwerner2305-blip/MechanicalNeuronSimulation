@@ -1,9 +1,9 @@
 """Parameter sweep over one or two input chamber pressures (the neuron's response surface).
 
 Besides the chamber pressures, every point records the mechanical weight of every input path into
-the chosen activation chamber: W_j = dV_j / (p_j - p_a), with dV_j the volume the path pushes into
-the activation chamber (see membrane_sim.characterise; a path lumps its membranes and intermediate
-chambers), plus the activation chamber's own compliance W_0. After the sweep each W is fitted as
+the chosen pre-activation chamber: W_j = dV_j / (p_j - p_a), with dV_j the volume the path pushes into
+the pre-activation chamber (see membrane_sim.characterise; a path lumps its membranes and intermediate
+chambers), plus the pre-activation chamber's own compliance W_0. After the sweep each W is fitted as
 the lowest-degree polynomial W(dp) that passes within the tolerance of every point (degree 0: W is
 constant; points with dp = 0 are left out), and the neuron equation is written out in LaTeX.
 """
@@ -32,10 +32,10 @@ from membrane_sim.characterise import (BIGGEST_ERROR, LOWEST_TOTAL, activation_s
                                        rebuild_activation_pressure, weight_degree)
 
 from .builder import KPA, build_environment, generate_mesh
-from .project import CHAMBER, CONSTANT, VENT
+from .project import ACTIVATION_MEMBRANE, CHAMBER, CONSTANT, VENT
 from .workers import Worker
 
-FLUID = "W0"  # key of the activation chamber's own compliance among the weights
+FLUID = "W0"  # key of the pre-activation chamber's own compliance among the weights
 # per-path quantities: key -> (label, unit, factor from model units: mm, MPa)
 WEIGHT_FIELDS = {
     "p": ("p", "kPa", 1.0 / KPA),
@@ -46,15 +46,41 @@ WEIGHT_FIELDS = {
 }
 
 
+# quantities of an activation membrane (a linked activation-function design) per sweep point, besides its named
+# outputs (keys "out:<name>", kPa)
+ACTIVATION_QUANTITIES = {
+    "dp": ("pre-activation Δp", "kPa"),
+    "area": ("tube area", "mm2"),
+    "mdot": ("mass flow", "kg/s"),
+}
+
+
+def activation_row(out) -> dict:
+    """A design's outputs at one point (ActivationDesign.outputs) as flat sweep values: named outputs first."""
+    row = {f"out:{name}": v for name, v in out["outputs"].items()}
+    row.update({k: out[k] for k in ACTIVATION_QUANTITIES})
+    return row
+
+
+def activation_label(key):
+    """(name, unit) of a flat activation value."""
+    return (key[4:], "kPa") if key.startswith("out:") else ACTIVATION_QUANTITIES[key]
+
+
 def point_weights(build, activation_index, load_factor):
     """Weights of every input path (label -> {key: value in WEIGHT_FIELDS units, "shells": names}),
-    the activation chamber's own term under FLUID, and the activation pressure rebuilt from them."""
+    the pre-activation chamber's own term under FLUID, and the pre-activation pressure rebuilt from them."""
     raw = input_weights(build.env, build.volumes[activation_index], load_factor)
     scale = lambda w: {k: w[k] * f for k, (_, _, f) in WEIGHT_FIELDS.items()}
     weights = {w["input"]: {**scale(w), "shells": w["shells"], "biased": w.get("biased", False),
                             "bias_chambers": w.get("bias_chambers", [])} for w in raw["inputs"]}
     weights[FLUID] = {**scale(raw["chamber"]), "shells": []}
     return weights, rebuild_activation_pressure(raw) / KPA
+
+
+def activation_value(row, index, field):
+    """An activation membrane's output at a sweep point (nan when it was not built)."""
+    return row.get("act", {}).get(index, {}).get(field, math.nan)
 
 
 def sample_weight(row, key):
@@ -69,7 +95,7 @@ def sample_weight(row, key):
 
 def weight_sensitivity(row, key):
     """dp_a/dW of weight `key` at a sweep point (Article 2, Eq. 4.10): (p_k - p_a) / sum of all W, in
-    kPa per mm3/kPa. For the activation fluid's own W_0 the pressure difference is p_0 - p_a = -dp."""
+    kPa per mm3/kPa. For the pre-activation fluid's own W_0 the pressure difference is p_0 - p_a = -dp."""
     return activation_sensitivities({k: (w["dp"], sample_weight(row, k)) for k, w in row["W"].items()})[key]
 
 
@@ -85,8 +111,8 @@ def equation_fit(rows, activation_index, tolerance, method=LOWEST_TOTAL, check=N
 
 
 def measure_bias(build, project, activation_index, callback, log):
-    """{path label: b_j (mm3)} of the biased paths into the activation chamber, from one solve at the
-    neutral state: every constant-pressure input at the activation chamber's rest pressure p_0. There an
+    """{path label: b_j (mm3)} of the biased paths into the pre-activation chamber, from one solve at the
+    neutral state: every constant-pressure input at the pre-activation chamber's rest pressure p_0. There an
     unbiased path pushes nothing; a path through a chamber that is not neutral at rest (e.g. a gas weight
     chamber filled above ambient) pushes its bias. {} when no path is biased (no extra solve)."""
     activation = build.volumes[activation_index]
@@ -98,7 +124,7 @@ def measure_bias(build, project, activation_index, callback, log):
     inputs = [v for i, v in build.volumes.items() if project.parts[i].props.get("model") == CONSTANT]  # not vents
     saved = {id(v): v.P0 for v in inputs}
     p0 = activation.pressure(0.0)
-    log(f"Measuring the bias of {', '.join(biased)} (all inputs at the activation chamber's rest pressure)…")
+    log(f"Measuring the bias of {', '.join(biased)} (all inputs at the pre-activation chamber's rest pressure)…")
     try:
         for v in inputs:
             v.P0 = p0
@@ -238,7 +264,7 @@ def run_sweep(worker, cad, project, mesh_data, a_index, a_values, b_index, b_val
     chambers = list(build.volumes.items())
     if activation_index is not None and not build.volumes[activation_index].is_closed:
         raise ValueError(f"{project.parts[activation_index].name} is not a closed chamber: "
-                         "it can not be the activation chamber.")
+                         "it can not be the pre-activation chamber.")
     # one contact stiffness for the whole sweep, sized for its highest pressure
     p_max = max([abs(v.P0) for v in build.volumes.values()] + [abs(x) * KPA for x in a_values]
                 + ([abs(x) * KPA for x in b_values] if b_index is not None else []))
@@ -262,7 +288,11 @@ def run_sweep(worker, cad, project, mesh_data, a_index, a_values, b_index, b_val
         first = False
         row = {"i": i, "j": j, "a": a, "b": b, "converged": result.converged, "time": time.time() - start,
                "P": {c: v.P / KPA for c, v in chambers}, "dV": {c: v.delta_volume for c, v in chambers},
-               "W": {}, "p_a_rebuilt": math.nan}
+               "W": {}, "p_a_rebuilt": math.nan,
+               "act": {i: activation_row(out) for i, out in build.activation_outputs().items()},
+               "extrapolated": build.range_warnings(project.parts)}
+        for w in row["extrapolated"]:
+            worker.log("Warning: " + w)
         if activation_index is not None:
             row["W"], row["p_a_rebuilt"] = point_weights(build, activation_index, result.load_factor)
             row["bias"] = bias
@@ -294,6 +324,7 @@ class SweepDialog(QDialog):
         self.chambers = [i for i, p in enumerate(parts) if p.role == CHAMBER]
         self.inputs = [i for i in self.chambers if parts[i].props.get("model") == CONSTANT]
         self.closed = [i for i in self.chambers if parts[i].props.get("model") not in (CONSTANT, VENT)]
+        self.linked = [i for i, p in enumerate(parts) if p.role == ACTIVATION_MEMBRANE]
 
         layout = QVBoxLayout(self)
         setup = QGroupBox("Inputs (constant-pressure chambers)")
@@ -323,14 +354,14 @@ class SweepDialog(QDialog):
                 grid.addWidget(w, r + 1, c)
             self.rows_ui.append((enabled, combo, lo, hi, n))
 
-        grid.addWidget(QLabel("Activation chamber"), 3, 0)
+        grid.addWidget(QLabel("Pre-activation chamber"), 3, 0)
         self.activation = QComboBox()
         self.activation.addItem("(none: no weights)", None)
         for i in self.closed:
             self.activation.addItem(parts[i].name, i)
         named = [k for k, i in enumerate(self.closed) if "activ" in parts[i].name.lower()]
         self.activation.setCurrentIndex(1 + (named[0] if named else 0) if self.closed else 0)
-        self.activation.setToolTip("The chamber whose pressure p_a is the neuron's activation. Every input path "
+        self.activation.setToolTip("The chamber whose pressure p_a is the neuron's pre-activation. Every input path "
                                    "into it gets one weight W_j = dV_j / (p_j - p_a).")
         grid.addWidget(self.activation, 3, 1)
         grid.addWidget(QLabel("Equation tolerance [kPa]"), 3, 2)
@@ -379,7 +410,7 @@ class SweepDialog(QDialog):
         # weight) next to the selected weight's fit plot
         equation = QWidget()
         el = QVBoxLayout(equation)
-        self.eq_summary = QLabel("The neuron equation appears here after a sweep with an activation chamber.")
+        self.eq_summary = QLabel("The neuron equation appears here after a sweep with an pre-activation chamber.")
         self.eq_summary.setWordWrap(True)
         self.eq_summary.setTextFormat(Qt.RichText)
         self.eq_summary.setContentsMargins(8, 6, 8, 6)
@@ -419,7 +450,7 @@ class SweepDialog(QDialog):
         self.latex = QPlainTextEdit()
         self.latex.setReadOnly(True)
         self.latex.setLineWrapMode(QPlainTextEdit.NoWrap)
-        self.latex.setPlaceholderText("The neuron equation (LaTeX) appears here after a sweep with an activation chamber.")
+        self.latex.setPlaceholderText("The neuron equation (LaTeX) appears here after a sweep with an pre-activation chamber.")
         sl.addWidget(self.latex, 1)
         copy = QPushButton("Copy LaTeX")
         copy.clicked.connect(lambda: QApplication.clipboard().setText(self.latex.toPlainText()))
@@ -468,6 +499,10 @@ class SweepDialog(QDialog):
         self.output.clear()
         for i in self.chambers:
             self.output.addItem(f"P {parts[i].name}", ("P", i))
+        for i in self.linked:
+            for field in self._activation_keys(i):
+                name, unit = activation_label(field)
+                self.output.addItem(f"{parts[i].name}: {name} [{unit}]", ("act", (i, field)))
         if self.weight_keys:
             self.output.addItem("p_a from the fitted equation - simulated", ("equation", None))
             self.output.addItem("p_a from the point's own weights - simulated (check)", ("rebuilt", None))
@@ -535,10 +570,24 @@ class SweepDialog(QDialog):
         if self.b_index is not None:
             headers.append(f"{parts[self.b_index].name} [kPa]")
         headers += [f"P {parts[c].name} [kPa]" for c in self.chambers]
+        headers += self._activation_headers()
         if self.weight_keys:
             headers.append("p_a from weights [kPa]")
         headers += [f"W {self._weight_label(k)} [mm3/kPa]" for k in self.weight_keys]
         return headers + ["Converged", "Time [s]"]
+
+    def _activation_keys(self, i):
+        """The values of linked part i, from the first sweep point (its design's outputs are known then)."""
+        first = self.rows[0].get("act", {}).get(i) if self.rows else None
+        return list(first) if first else list(ACTIVATION_QUANTITIES)
+
+    def _activation_headers(self):
+        parts = self.main.project.parts
+        return [f"{parts[i].name} {'{} [{}]'.format(*activation_label(k))}" for i in self.linked
+                for k in self._activation_keys(i)]
+
+    def _activation_values(self, row):
+        return [activation_value(row, i, k) for i in self.linked for k in self._activation_keys(i)]
 
     def _add_row(self, row):
         self.rows.append(row)
@@ -552,14 +601,19 @@ class SweepDialog(QDialog):
             self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         values = [row["a"]] + ([row["b"]] if self.b_index is not None else [])
         values += [row["P"][c] for c in self.chambers]
+        values += self._activation_values(row)
         if self.weight_keys:
             values.append(row["p_a_rebuilt"])
         values += [row["W"].get(k, {}).get("W", math.nan) for k in self.weight_keys]
         r = self.table.rowCount()
         self.table.insertRow(r)
+        warning = "\n".join(row.get("extrapolated") or [])
         for c, v in enumerate(values):
             item = QTableWidgetItem(f"{v:.5g}")
             item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if warning:  # outside an activation design's simulated range: extrapolated
+                item.setBackground(QColor("#ffe0b2"))
+                item.setToolTip(warning)
             self.table.setItem(r, c, item)
         self.table.setItem(r, len(values), QTableWidgetItem("yes" if row["converged"] else "NO"))
         self.table.setItem(r, len(values) + 1, QTableWidgetItem(f"{row['time']:.1f}"))
@@ -581,6 +635,9 @@ class SweepDialog(QDialog):
             return
         if field == "P":
             value, label = (lambda r: r["P"][key]), f"{parts[key].name} pressure [kPa]"
+        elif field == "act":
+            name, unit = activation_label(key[1])
+            value, label = (lambda r: activation_value(r, *key)), f"{parts[key[0]].name}: {name} [{unit}]"
         elif field == "equation":
             fit, rows = self.equation(), [r for r in self.rows if r["converged"] and r["W"]]
             error = {id(r): e for r, e in zip(rows, fit["predicted"])} if fit and len(fit["predicted"]) == len(rows) else {}
@@ -747,7 +804,7 @@ class SweepDialog(QDialog):
         self.weight_cards = {}
         self.eq_body = QWidget()
         self.eq_scroll.setWidget(self.eq_body)
-        self.eq_summary.setText("The neuron equation appears here after a sweep with an activation chamber.")
+        self.eq_summary.setText("The neuron equation appears here after a sweep with an pre-activation chamber.")
         self.eq_summary.setStyleSheet("")
         self.weight_figure.clear()
         self.weight_canvas.draw_idle()
@@ -784,7 +841,7 @@ class SweepDialog(QDialog):
             notes.append(f"% W_0 ({self._weight_label(FLUID)}): {describe_fit(fits[FLUID])}{own(FLUID)}")
         if fit.get("bias"):
             notes.append(f"% B = {fit['bias']:.6g} mm3: measured bias of the biased paths (every input at the "
-                         "activation chamber's rest pressure); their W = (dV - b) / dp.")
+                         "pre-activation chamber's rest pressure); their W = (dV - b) / dp.")
         self.latex.setPlainText("\n".join(notes) + "\n" + equation_align(equation) + f"% {equation['note']}\n")
 
     def _equation_keys(self):
@@ -814,7 +871,7 @@ class SweepDialog(QDialog):
         layout = QVBoxLayout(body)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(10)
-        heading = QLabel("<b>Activation pressure</b>")
+        heading = QLabel("<b>Pre-activation pressure p<sub>a</sub></b>")
         layout.addWidget(heading)
         layout.addWidget(math_label(equation["main"], 16, colors["text"], ratio))
         layout.addWidget(QLabel(f"<b>Weights</b> <span style='color:{colors['muted']}'>"
@@ -832,7 +889,7 @@ class SweepDialog(QDialog):
         self.eq_scroll.setWidget(body)
 
     def _bias_card(self, bias, ratio, colors):
-        """The bias B: what the biased paths push into the activation chamber at zero pressure difference."""
+        """The bias B: what the biased paths push into the pre-activation chamber at zero pressure difference."""
         card = QFrame()
         card.setObjectName("bias")
         card.setStyleSheet(f"QFrame#bias {{ border: 1px solid {colors['border']}; border-radius: 6px; "
@@ -842,10 +899,10 @@ class SweepDialog(QDialog):
         layout.addWidget(QLabel("<b>B</b> &nbsp; bias"))
         layout.addWidget(math_label(bias["definition"], 13, colors["text"], ratio))
         chambers = {name for r in self.rows for w in r["W"].values() for name in w.get("bias_chambers", [])}
-        text = ("Volume the biased paths push into the activation chamber when every pressure is equal, "
+        text = ("Volume the biased paths push into the pre-activation chamber when every pressure is equal, "
                 "because " + ", ".join(sorted(chambers)) + (" is" if len(chambers) == 1 else " are")
                 + " not neutral at rest (filled above or below ambient). Measured by one extra solve with every "
-                "input at the activation chamber's rest pressure; not fitted.")
+                "input at the pre-activation chamber's rest pressure; not fitted.")
         details = QLabel(text)
         details.setWordWrap(True)
         details.setStyleSheet(f"color: {colors['muted']};")
@@ -855,7 +912,7 @@ class SweepDialog(QDialog):
     def _card_title(self, key, n):
         symbol = "W<sub>0</sub>" if key == FLUID else f"W<sub>{n + 1}</sub>"
         if key == FLUID:
-            return f"<b>{symbol}</b> &nbsp; compliance of the activation fluid ({self._weight_label(key)})"
+            return f"<b>{symbol}</b> &nbsp; compliance of the pre-activation fluid ({self._weight_label(key)})"
         shells = ", ".join(self._shells(key))
         return f"<b>{symbol}</b> &nbsp; input <b>{key}</b>" + (f" &nbsp;·&nbsp; path through {shells}" if shells else "")
 
@@ -892,7 +949,7 @@ class SweepDialog(QDialog):
         return solve_activation(terms, bias=fit.get("bias", 0.0), all_roots=True) if terms else [math.nan]
 
     def _plot_compare(self):
-        """The simulated activation pressure with the fitted equation's prediction over it: points and a
+        """The simulated pre-activation pressure with the fitted equation's prediction over it: points and a
         curve for a one-input sweep, surfaces for a two-input sweep (the equation on a finer grid, so it
         also shows what it does between the sweep points)."""
         self.compare_figure.clear()
@@ -980,6 +1037,13 @@ class SweepDialog(QDialog):
     def _done(self, mesh_data):
         self.main.adopt_mesh(mesh_data)
         text = f"Sweep finished: {len(self.rows)} points, {sum(r['time'] for r in self.rows):.0f} s."
+        outside = sum(bool(r.get("extrapolated")) for r in self.rows)
+        if outside:
+            text += (f" ⚠ {outside} point(s) outside an activation design's simulated Δp range: EXTRAPOLATING "
+                     "(orange rows).")
+            QMessageBox.warning(self, "Sweep", f"{outside} of {len(self.rows)} point(s) put the pre-activation Δp "
+                                               "outside the activation design's simulated range: there the design "
+                                               "is extrapolated, not interpolated (orange rows; hover for details).")
         self._finish(text)
         self._refit(then=lambda fitted: self.status.setText(f"{text} {fitted}"))
 
@@ -1013,6 +1077,7 @@ class SweepDialog(QDialog):
                 header.append(f"{parts[self.b_index].name} [kPa]")
             header += [f"P {parts[c].name} [kPa]" for c in self.chambers]
             header += [f"dV {parts[c].name} [mm3]" for c in self.chambers]
+            header += self._activation_headers()
             if self.weight_keys:
                 header.append("p_a from weights [kPa]")
             header += [f"{name} {self._weight_label(k)} [{unit}]"
@@ -1021,6 +1086,7 @@ class SweepDialog(QDialog):
             for r in sorted(self.rows, key=lambda r: (r["a"], r["b"] if r["b"] is not None else 0)):
                 writer.writerow([r["a"]] + ([r["b"]] if self.b_index is not None else [])
                                 + [r["P"][c] for c in self.chambers] + [r["dV"][c] for c in self.chambers]
+                                + self._activation_values(r)
                                 + ([r["p_a_rebuilt"]] if self.weight_keys else [])
                                 + [r["W"].get(k, {}).get(field, math.nan)
                                    for k in self.weight_keys for field in WEIGHT_FIELDS]

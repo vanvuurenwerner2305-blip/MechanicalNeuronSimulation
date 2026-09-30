@@ -122,7 +122,8 @@ class NewtonSolver:
             self._contact_nodes[id(s)], self._contact_offsets[id(s)] = nodes, offset
 
         X = torch.cat([s.X for s in self.shells])
-        self.length_scale = (X.max(0).values - X.min(0).values).norm().item()
+        self.length_scale = ((X.max(0).values - X.min(0).values).norm().item() if len(X) else
+                             max(getattr(s, "length_scale", 1.0) for s in self.shells))
         self.max_step = max_step if max_step is not None else 0.1 * self.length_scale
 
         # Candidate lists for the rigid contact queries, rebuilt when a node has moved more than

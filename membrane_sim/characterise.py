@@ -1,31 +1,31 @@
 """
 Mechanical weights of a solved state, for back-inferring the neuron equation up to the
-activation pressure p_a:
+pre-activation pressure p_a:
 
     p_a = (sum_j W_j p_j + W_0 p_0) / (sum_j W_j + W_0).
 
 A weight belongs to an *input path*, not to a membrane: everything between input chamber j and
-the activation chamber (one membrane, or e.g. membrane - weight chamber - membrane for bulk
+the pre-activation chamber (one membrane, or e.g. membrane - weight chamber - membrane for bulk
 modulus tuning) is lumped into
 
-    W_j = dV_j / (p_j - p_a),   dV_j = volume the path's membranes push into the activation chamber.
+    W_j = dV_j / (p_j - p_a),   dV_j = volume the path's membranes push into the pre-activation chamber.
 
-Paths are found from the geometry: every shell bounding the activation chamber is followed back
+Paths are found from the geometry: every shell bounding the pre-activation chamber is followed back
 through closed intermediate chambers to the constant-pressure chamber(s) driving it. A shell side
 with no chamber is the ambient (0 gauge). Several shells reaching the same input form one path.
 
-The activation chamber's own fluid adds W_0 = -dV_a / (p_a - p_0), with p_0 the pressure of its law
+The pre-activation chamber's own fluid adds W_0 = -dV_a / (p_a - p_0), with p_0 the pressure of its law
 at the rest volume (a compliant chamber; W_0 = 0 for a rigid, incompressible one).
 
 A path through a closed chamber that is not neutral at rest (a gas weight chamber filled above ambient,
-a liquid one filled with more or less liquid than its volume) pushes volume into the activation
+a liquid one filled with more or less liquid than its volume) pushes volume into the pre-activation
 chamber even when all pressures are equal: a bias. Such a path is *biased*; its volume is modelled as
 dV_j = b_j + W_j(dp_j) dp_j, and the equation gets the bias B = sum b_j:
 
     p_a = (sum_j W_j p_j + W_0 p_0 + B) / (sum_j W_j + W_0).
 
 b_j is measured, not fitted (fitted, it trades off against the W polynomials and is not identifiable
-from a sweep): at the neutral state, every input at the activation chamber's rest pressure p_0, an
+from a sweep): at the neutral state, every input at the pre-activation chamber's rest pressure p_0, an
 unbiased path pushes nothing, so what a biased path pushes there is its bias (bias_volumes()).
 
 Only W is identified: pressure/volume data can not separate an effective area from a stiffness.
@@ -37,7 +37,7 @@ import math
 import numpy as np
 import torch
 
-from .fluid import cone_volume_grad, shell_cone_volume
+from .fluid import wall_volume, wall_volume_terms
 from .solver import _Tangent
 
 AMBIENT = "ambient"
@@ -66,8 +66,8 @@ def is_neutral(volume) -> bool:
 
 def input_paths(activation, volumes):
     """
-    [(input label, input volume or None for the ambient, [(shell, side of the activation chamber)],
-      [closed intermediate chambers on the path])], one entry per input driving the activation chamber.
+    [(input label, input volume or None for the ambient, [(shell, side of the pre-activation chamber)],
+      [closed intermediate chambers on the path])], one entry per input driving the pre-activation chamber.
     A shell whose far side reaches several inputs through closed chambers gets the label of all of them
     joined with ' + ' (and volume None).
     """
@@ -101,8 +101,8 @@ def input_paths(activation, volumes):
 def _side_gradient(solver, shell, side):
     """Free-dof gradient of the volume on `side` of one shell (the load of a unit pressure there)."""
     g = torch.zeros(solver.n_dof, dtype=torch.float64, device=solver.device)
-    dofs = shell.face_dofs + solver.dof_offset[id(shell)]
-    g.index_add_(0, dofs.reshape(-1), side * cone_volume_grad(shell.x[shell.faces] - shell.volume_origin).reshape(-1))
+    dofs, grad, _ = wall_volume_terms(shell, side, tangent=False)
+    g.index_add_(0, (dofs + solver.dof_offset[id(shell)]).reshape(-1), grad.reshape(-1))
     return g[solver._free_t].cpu().numpy()
 
 
@@ -121,7 +121,7 @@ def input_weights(env, activation, load_factor: float = 1.0) -> dict:
     volumes = solver.fluid_volumes
     p_a = activation.P
 
-    # tangent with the activation pressure held fixed; other closed chambers keep their law
+    # tangent with the pre-activation pressure held fixed; other closed chambers keep their law
     state = solver.evaluate(load_factor, tangent=True)
     keep = [k for k, (v, _) in enumerate(state["closed"]) if v is not activation]
     try:
@@ -132,9 +132,8 @@ def input_weights(env, activation, load_factor: float = 1.0) -> dict:
 
     inputs = []
     for label, volume, shells, between in input_paths(activation, volumes):
-        # volume pushed into the activation chamber = minus its contribution to the chamber's dV
-        dV = -sum(side * (shell_cone_volume(s, s.x).item() - shell_cone_volume(s, s.X).item())
-                  for s, side in shells)
+        # volume pushed into the pre-activation chamber = minus its contribution to the chamber's dV
+        dV = -sum(side * (wall_volume(s) - wall_volume(s, rest=True)) for s, side in shells)
         p = 0.0 if label == AMBIENT else (volume.P if volume is not None else math.nan)
         dp = p - p_a
         w_tan = math.nan
@@ -163,7 +162,7 @@ def input_weights(env, activation, load_factor: float = 1.0) -> dict:
 
 
 def bias_volumes(weights) -> dict:
-    """{path label: b_j} from input_weights() at the neutral state (every input at the activation
+    """{path label: b_j} from input_weights() at the neutral state (every input at the pre-activation
     chamber's rest pressure): the volume a biased path pushes in at zero pressure difference. The small
     pressure difference left there is corrected to first order with the tangent weight."""
     out = {}
@@ -194,11 +193,11 @@ def activation_sensitivities(terms) -> dict:
     """dp_a/dW_k of every weight at one solved state (Article 2, Eq. 4.10):
         dp_a/dW_k = (p_k - p_a) / sum_j W_j,
     terms: {key: (dp_k, W_k)} with dp_k = p_k - p_a for an input and p_a - p_k for the key "W0" (the
-    activation chamber's own compliance), whose sign is therefore flipped. Non-finite W are left out
+    pre-activation chamber's own compliance), whose sign is therefore flipped. Non-finite W are left out
     of the sum.
 
     The sum must be clearly positive. A chamber pre-pressurised inside a path (e.g. a gas weight
-    chamber) acts as a hidden bias: where all pressures around the activation chamber are (nearly)
+    chamber) acts as a hidden bias: where all pressures around the pre-activation chamber are (nearly)
     equal, p_a still differs from them, so the secant weights must cancel (NeuronTest2 at Input1 = 0:
     -152.6 + 109.7 + 42.6 + 0.3 = 0) and dp_a/dW -> infinity. A state whose sum is not positive, or below
     SENSITIVITY_CANCELLATION of the weights' total size, gets NaN for every weight (the fit leaves it out)."""
@@ -253,7 +252,7 @@ MAX_DEGREE = 10
 
 def solve_activation(terms, p_hint=None, bias=0.0, all_roots=False):
     """
-    The activation pressure the equation gives for one input set: the root of
+    The pre-activation pressure the equation gives for one input set: the root of
         sum_k W_k(x_k) (p_k - p_a) + B = 0,   x_k = p_k - p_a (inputs) or p_a - p_k (the chamber term),
     i.e. p_a = (sum W_k p_k + B) / sum W_k with the weights evaluated at p_a itself.
     terms: [(p_k, coefficients, is_chamber)], coefficients either one polynomial (a list) or a pair
@@ -333,7 +332,7 @@ def fit_neuron_equation(samples, tolerance: float, method: str = LOWEST_TOTAL, c
                         max_evaluations: int = MAX_EVALUATIONS, bias=None) -> dict:
     """
     Fit every weight W_k(dp_k) with least-squares polynomials, one for dp_k > 0 and one for dp_k < 0,
-    so that the neuron equation, solved for p_a, reproduces the simulated activation pressure of
+    so that the neuron equation, solved for p_a, reproduces the simulated pre-activation pressure of
     every sample within `tolerance` (absolute, in the samples' pressure unit), with degrees as low as
     possible. Each side of each weight is a piece with its own degree; all start constant (degree 0).
     A weight sampled on one side only uses that side's polynomial for both signs. Two ways to raise
@@ -353,9 +352,9 @@ def fit_neuron_equation(samples, tolerance: float, method: str = LOWEST_TOTAL, c
     ("stopped" True), with the best combination so far. `check()`, if given, is called before every
     combination; it can raise to cancel the fit.
 
-    samples: [{"p_a": simulated activation pressure,
+    samples: [{"p_a": simulated pre-activation pressure,
                "terms": {key: (p_k, dp_k, W_k)},     with dp_k = p_k - p_a for an input and
-                                                     p_a - p_k for the key "W0" (the activation
+                                                     p_a - p_k for the key "W0" (the pre-activation
                                                      chamber's own compliance about p_0 = p_k),
                "volumes": {key: dV_k}}]   (needed for the keys in `bias`)
              with bias = {key: b_k}: measured bias volumes of the biased paths (bias_volumes()). Their
@@ -563,10 +562,10 @@ def latex_polynomial(coefficients, variable, precision=4):
 
 def neuron_equation_latex(inputs, chamber=None, activation="a", precision=6, p_unit="kPa", w_unit="mm^3/kPa"):
     """
-    The neuron equation up to the activation pressure, as LaTeX pieces.
+    The neuron equation up to the pre-activation pressure, as LaTeX pieces.
       inputs  : [(label, fit)] with fit a piecewise weight from fit_neuron_equation() for W_j against
                 dp_j = p_j - p_a
-      chamber : optional (fit, p0) for the activation chamber's own compliance W_0(p_a - p_0)
+      chamber : optional (fit, p0) for the pre-activation chamber's own compliance W_0(p_a - p_0)
     Returns {"main", "weights": [{"symbol", "variable", "pieces": [(polynomial, condition)],
     "definition"}], "bias": None or {"symbol", "value", "parts": [(symbol, label, value)], "definition"},
     "note"}; see equation_align() and equation_lines() to put it together. The weights depend on p_a

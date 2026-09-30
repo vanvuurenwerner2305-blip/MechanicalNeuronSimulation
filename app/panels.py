@@ -1,12 +1,13 @@
 """Dock panels: model tree, part properties, solver settings, results."""
-from qtpy.QtCore import QLocale, Qt, Signal
+from qtpy.QtCore import QLocale, QSettings, Qt, Signal
 from qtpy.QtGui import QColor, QDoubleValidator, QIcon, QPixmap
-from qtpy.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QFrame,
-                            QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QPushButton, QSlider,
-                            QSpinBox, QTableWidget, QTableWidgetItem, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
-                            QWidget)
+from qtpy.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+                            QFrame, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
+                            QListWidgetItem, QMenu, QPushButton, QSlider, QSpinBox, QTableWidget, QTableWidgetItem,
+                            QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
-from .project import CHAMBER, DEFORMABLE, ROLE_COLORS, ROLE_FIELDS, ROLE_HELP, ROLES, SOLVER_FIELDS, part_color
+from .project import (AUTOMATIC, CHAMBER, DEFORMABLE, ROLE_COLORS, ROLE_FIELDS, ROLE_HELP, ROLES, SOLVER_FIELDS,
+                      part_color)
 from .viewport import RESULT_FIELDS
 
 
@@ -138,9 +139,112 @@ class ModelTree(QTreeWidget):
 # Generic property form
 # -----------------------------
 
+SEGMENT_TAG = "   (segment "
+
+
+class OutputsEditor(QWidget):
+    """Named outputs of a fluid: [{"name", "segment"}]. Choosing a segment (or an output in the list) asks for it
+    to be highlighted; names are edited in place (double-click)."""
+    changed = Signal(list)
+    highlight = Signal(object)  # segment (1..N) or None
+
+    def __init__(self, outputs, segments, parent=None):
+        super().__init__(parent)
+        self.outputs = [dict(o) for o in (outputs or ())]
+        self.segments = max(int(segments or 1), 1)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Segment"))
+        self.segment = QSpinBox()
+        self.segment.setRange(1, self.segments)
+        self.segment.setSuffix(f" of {self.segments}")
+        self.segment.setToolTip("1 = the upstream end of the tube. The chosen segment is highlighted in the 3D view.")
+        self.segment.valueChanged.connect(lambda k: self.highlight.emit(k))
+        row.addWidget(self.segment)
+        self.name = QLineEdit()
+        self.name.setPlaceholderText("output name")
+        self.name.returnPressed.connect(self._add)
+        row.addWidget(self.name, 1)
+        add = QPushButton("Add output")
+        add.clicked.connect(self._add)
+        row.addWidget(add)
+        layout.addLayout(row)
+        self.list = QListWidget()
+        self.list.setMaximumHeight(110)
+        self.list.setToolTip("Double-click a name to rename it.")
+        self.list.currentRowChanged.connect(self._selected)
+        self.list.itemChanged.connect(self._renamed)
+        layout.addWidget(self.list)
+        remove = QPushButton("Remove output")
+        remove.clicked.connect(self._remove)
+        layout.addWidget(remove, 0, Qt.AlignLeft)
+        self._fill()
+
+    def _fill(self):
+        self.list.blockSignals(True)
+        self.list.clear()
+        for _ in self.outputs:
+            item = QListWidgetItem()
+            item.setFlags(item.flags() | Qt.ItemIsEditable)
+            self.list.addItem(item)
+        self.list.blockSignals(False)
+        self._labels()
+
+    def _labels(self):
+        self.list.blockSignals(True)
+        for k, o in enumerate(self.outputs):
+            item = self.list.item(k)
+            item.setText(f"{o['name']}{SEGMENT_TAG}{o['segment']})")
+            item.setToolTip(f"{o['name']}: gas pressure of segment {o['segment']} of {self.segments}")
+        self.list.blockSignals(False)
+
+    def _add(self):
+        k = self.segment.value()
+        name = self.name.text().strip() or f"segment {k}"
+        taken = {o["name"] for o in self.outputs}
+        base, n = name, 2
+        while name in taken:
+            name, n = f"{base} ({n})", n + 1
+        self.outputs.append({"name": name, "segment": k})
+        self.name.clear()
+        self._fill()
+        self.list.setCurrentRow(len(self.outputs) - 1)
+        self.changed.emit([dict(o) for o in self.outputs])
+
+    def _remove(self):
+        k = self.list.currentRow()
+        if 0 <= k < len(self.outputs):
+            del self.outputs[k]
+            self._fill()
+            self.changed.emit([dict(o) for o in self.outputs])
+            self.highlight.emit(None)
+
+    def _selected(self, k):
+        if 0 <= k < len(self.outputs):
+            self.segment.blockSignals(True)
+            self.segment.setValue(min(self.outputs[k]["segment"], self.segments))
+            self.segment.blockSignals(False)
+            self.highlight.emit(self.outputs[k]["segment"])
+
+    def _renamed(self, item):
+        k = self.list.row(item)
+        name = item.text().split(SEGMENT_TAG)[0].strip()
+        if not (0 <= k < len(self.outputs)) or not name or name == self.outputs[k]["name"]:
+            self._labels()
+            return
+        if name in {o["name"] for i, o in enumerate(self.outputs) if i != k}:
+            self._labels()  # names must be unique
+            return
+        self.outputs[k]["name"] = name
+        self._labels()
+        self.changed.emit([dict(o) for o in self.outputs])
+
+
 class FieldForm(QWidget):
     """Form generated from project.Field descriptors, editing a dict (or several dicts at once)."""
     edited = Signal(str, object)  # key, value
+    highlight = Signal(object)    # a segment to highlight (outputs editor)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -165,9 +269,30 @@ class FieldForm(QWidget):
             value = values.get(f.key, f.default)
             if f.kind == "choice":
                 widget = QComboBox()
-                widget.addItems(list(f.choices))
+                # choices named by a context key are filled at build time (e.g. the project's chambers)
+                choices = [AUTOMATIC] + list(context.get(f.choices, ())) if isinstance(f.choices, str) else f.choices
+                widget.addItems(list(choices))
+                if widget.findText(str(value)) < 0:  # e.g. a chamber that was renamed or reassigned
+                    widget.addItem(str(value))
                 widget.setCurrentText(str(value))
                 widget.currentTextChanged.connect(lambda v, key=f.key: self.edited.emit(key, v))
+            elif f.kind == "outputs":
+                widget = OutputsEditor(value, values.get("segments", 1))
+                widget.changed.connect(lambda v, key=f.key: self.edited.emit(key, v))
+                widget.highlight.connect(self.highlight.emit)
+            elif f.kind == "file":
+                widget = QWidget()
+                h = QHBoxLayout(widget)
+                h.setContentsMargins(0, 0, 0, 0)
+                line = QLineEdit(str(value))
+                line.setToolTip(str(value))
+                line.editingFinished.connect(lambda w=line, key=f.key: self.edited.emit(key, w.text().strip()))
+                browse = QPushButton("…")
+                browse.setFixedWidth(28)
+                browse.clicked.connect(lambda _, w=line, key=f.key, flt=";;".join(f.choices):
+                                       self._browse(key, w, flt))
+                h.addWidget(line, 1)
+                h.addWidget(browse)
             elif f.kind == "text":
                 widget = QLineEdit(str(value))
                 widget.editingFinished.connect(lambda w=widget, key=f.key: self.edited.emit(key, w.text()))
@@ -199,6 +324,14 @@ class FieldForm(QWidget):
                 label.setToolTip(f.tooltip)
             self.layout_.addRow(label, row)
 
+    def _browse(self, key, line, file_filter):
+        start = line.text() or QSettings("MembraneNeuronSimulator", "App").value("last_dir", "")
+        path, _ = QFileDialog.getOpenFileName(self, "Choose file", start, file_filter + ";;All files (*)")
+        if path:
+            line.setText(path)
+            line.setToolTip(path)
+            self.edited.emit(key, path)
+
     def _float_edited(self, key, widget):
         text = widget.text().replace(",", ".")
         try:
@@ -214,6 +347,7 @@ class FieldForm(QWidget):
 class PropertyPanel(QWidget):
     role_changed = Signal(list, str)
     props_changed = Signal(list, str, object)  # indices, key, value
+    segment_highlight = Signal(list, object)   # indices, segment (1..N) or None
 
     def __init__(self, parent=None, roles=ROLES, role_fields=ROLE_FIELDS):
         super().__init__(parent)
@@ -246,6 +380,7 @@ class PropertyPanel(QWidget):
         pl = QVBoxLayout(self.props_box)
         self.form = FieldForm()
         self.form.edited.connect(self._edited)
+        self.form.highlight.connect(lambda k: self.segment_highlight.emit(self.indices, k))
         pl.addWidget(self.form)
         layout.addWidget(self.props_box)
 
@@ -295,7 +430,8 @@ class PropertyPanel(QWidget):
 
         if role is not None and self.role_fields[role]:
             self.props_box.setVisible(True)
-            self.form.build(self.role_fields[role], selected[0].props, {"__role__": role})
+            self.form.build(self.role_fields[role], selected[0].props,
+                            {"__role__": role, "__chambers__": [p.name for p in parts if p.role == CHAMBER]})
         if role == CHAMBER and couplings_text is not None:
             self.coupling_box.setVisible(True)
             self.coupling_label.setText(couplings_text)

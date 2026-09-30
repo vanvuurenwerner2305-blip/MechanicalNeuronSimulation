@@ -1,4 +1,4 @@
-"""Launch the Membrane Neuron Simulator:  python run_app.py [model.step | project.mns | design.mad]"""
+"""Launch the Membrane Neuron Simulator:  python run_app.py [model.step | project.mns | design.mad | neuron.mfn]"""
 import sys
 
 from app.__main__ import main

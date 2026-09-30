@@ -37,6 +37,23 @@ def shell_cone_volume(shell, x) -> torch.Tensor:
     return cone_volume(x[shell.faces] - shell.volume_origin).sum()
 
 
+def wall_volume(body, rest: bool = False) -> float:
+    """Volume measure of a chamber wall (its changes are what count): the cone volume of a shell, or the
+    swept volume of a wall with its own volume model (e.g. an EmpiricalMembrane, 0 at rest)."""
+    if hasattr(body, "swept_volume"):
+        return 0.0 if rest else body.swept_volume()
+    return shell_cone_volume(body, body.X if rest else body.x).item()
+
+
+def wall_volume_terms(body, side: int, tangent: bool):
+    """(local dofs (E, d), d(side V)/du (E, d), d2(side V)/du2 (E, d, d) or None) of one wall."""
+    if hasattr(body, "volume_terms"):
+        return body.volume_terms(side, tangent)
+    xe = body.x[body.faces] - body.volume_origin
+    return (body.face_dofs, side * cone_volume_grad(xe).reshape(-1, 9),
+            side * cone_volume_hess(xe).reshape(-1, 9, 9) if tangent else None)
+
+
 def _cap_volume(ring):
     """Cone volume (apex at the origin) of the fan closing a boundary loop: triangles
     (ring[k+1], ring[k], centroid), i.e. the loop's half-edges reversed."""
@@ -178,7 +195,7 @@ class FluidVolume:
     def add_boundary(self, shell, side: int):
         if side not in (1, -1):
             raise ValueError("side must be +1 (normal points out of the volume) or -1.")
-        rest = shell_cone_volume(shell, shell.X).item()
+        rest = wall_volume(shell, rest=True)
         self.boundaries.append((shell, side, rest))
         shell.fluid_volumes.append(self)
 
@@ -197,16 +214,14 @@ class FluidVolume:
     # -----------------------------
 
     def compute_delta_volume(self) -> float:
-        return (sum(side * (shell_cone_volume(shell, shell.x).item() - rest) for shell, side, rest in self.boundaries)
+        return (sum(side * (wall_volume(shell) - rest) for shell, side, rest in self.boundaries)
                 + sum(p.side * (p.volume(p.body.x) - p.rest) for p in self.patches))
 
     def volume_terms(self, tangent: bool):
         """[(body, local dofs (E, d), d(dV)/du (E, d), d2(dV)/du2 (E, d, d) or None)] over all walls."""
         out = []
         for shell, side, _ in self.boundaries:
-            xe = shell.x[shell.faces] - shell.volume_origin
-            out.append((shell, shell.face_dofs, side * cone_volume_grad(xe).reshape(-1, 9),
-                        side * cone_volume_hess(xe).reshape(-1, 9, 9) if tangent else None))
+            out.append((shell, *wall_volume_terms(shell, side, tangent)))
         for patch in self.patches:
             out.extend(patch.terms(tangent))
         return out

@@ -4,6 +4,7 @@ from .characterise import (BIGGEST_ERROR, LOWEST_TOTAL, activation_sensitivities
                            neuron_equation_latex, polyfit_weight, polynomial_text, rebuild_activation_pressure,
                            solve_activation, weight_coefficients, weight_degree)
 from .contact import Obstacle, ObstacleField
+from .empirical import EmpiricalMembrane
 from .environment import Environment
 from .fluid import FluidVolume
 from .mesh import (box_mesh, boundary_nodes, closed_mesh_volume, disk_mesh, extrude_polygon,

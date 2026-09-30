@@ -1,7 +1,8 @@
 """
-Activation-function space: import the valve CAD, assign roles, set the flow connections, simulate the
-Δp sweep (structure and gas flow together) and save the result as an activation-function design
-(*.mad) that can be used as a part without simulating it again.
+Activation-function space ("pre-activation to activation"): import the valve CAD, assign roles, set the
+flow connections, simulate the Δp sweep (structure and gas flow together), choose the tube segment whose
+pressures are the named outputs (activations), and save the result as an activation-function design (*.mad)
+that can be used as a part without simulating it again.
 """
 import csv
 
@@ -17,23 +18,27 @@ from qtpy.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpin
 
 from membrane_sim.flow import ORIFICE_LAW, SEGMENT_LAW, compile_flow_law
 
-from .activation import (STUDY_FIELDS, ActivationProject, build_activation, detect_connections,
-                         generate_activation_mesh, run_study)
+from .activation import (STUDY_FIELDS, ActivationProject, build_activation, channel_axis, detect_connections,
+                         generate_activation_mesh, output_definitions, output_pressures, run_study, segment_faces)
 from .main_window import MESH, MODEL, RESULTS, MainWindow
 from .panels import SolverPanel, fmt
 from .project import (ACTIVATION_ROLES, CLOSED, CONNECTION_TYPES, DYNAMIC_FLUID, FLOW_LAW_HELP, FLUID, OPENING,
-                      ORIFICE)
-from .viewport import RESULT_FIELDS, polydata
+                      ORIFICE, RIGID, part_color)
+from .viewport import RESULT_FIELDS, frame_polydata, polydata
 
 TITLE = "Activation Function Simulator"
 CONNECTION_COLORS = {OPENING: "#2ca02c", ORIFICE: "#d35400", CLOSED: "#999999"}
+OUTPUT_COLORS = ["#d35400", "#1f77b4", "#2ca02c", "#9467bd", "#8c564b", "#e377c2", "#17becf", "#bcbd22"]
+SEGMENT_HIGHLIGHT = "#ffd400"
 
 GUIDE = """
-<h3>Activation function workflow</h3>
-<p>The device maps the pressure difference <b>Δp</b> across a membrane to how far a soft tube is
-squeezed shut, and so to the gas flow through it and the pressures along it. The membrane pushes,
-through a part bonded to it (e.g. a pusher), on the tube and squeezes it against a rigid body.
-Simulate it once, save it as a design (<b>*.mad</b>) and use the mapping as a part.</p>
+<h3>Pre-activation to activation</h3>
+<p>The device maps the <b>pre-activation</b> - the pressure difference <b>Δp</b> across a membrane - to
+how far a soft tube is squeezed shut, and so to the gas flow through it and the pressures along it. The
+membrane pushes, through a part bonded to it (e.g. a pusher), on the tube and squeezes it against a rigid
+body. The <b>outputs</b> (activations) are the gas pressures of segments of the tube, which you choose and
+name in the tube fluid's properties. Simulate it once, save it as a design (<b>*.mad</b>) and use the mapping as a part
+(role <i>Activation membrane</i> in the Inputs to pre-activation space).</p>
 <ol>
 <li><b>Model in CAD</b> with every region as a solid body: the membrane (thin solid), the part
 between membrane and tube (e.g. a pusher touching the membrane's face), the tube, the rigid body
@@ -55,11 +60,34 @@ faces the outside). Click one to make it an <b>Opening</b> (no resistance), an <
 equation) or <b>Closed</b>.</li>
 <li>Set the Δp range and the gas in the <b>Study</b> tab and press <b>Simulate</b> (F5). At every Δp the
 structure and the flow are iterated until the wall pressures stop changing.</li>
+<li>Select the fluid inside the tube and, under <b>Outputs</b> in its properties, choose a segment (it is
+highlighted in the 3D view), type a name and press <b>Add output</b>. Add as many outputs as you like; each is
+the gas pressure of its segment. Changing them needs no new simulation.</li>
 <li><b>File → Save design</b> keeps everything and the computed mapping in one .mad file.</li>
 </ol>
 <p>Resistance equations give the pressure drop in Pa for a mass flow mdot (kg/s), in SI units, with
 the gas density rho from the ideal gas law. Units elsewhere: mm, N, MPa; pressures in kPa.</p>
 """
+
+
+def _frames_of(results):
+    """The stored FEM solution of design results (None when it has none)."""
+    if not results or not results.get("fem"):
+        return None
+    try:
+        from .activation import ActivationDesign
+        return ActivationDesign(results).frames
+    except Exception:
+        return None
+
+
+def _raised(surface, faces, lift=1.0):
+    """Faces of a surface mesh moved slightly outwards, so a highlight drawn over the body does not flicker."""
+    pd = polydata(surface.vertices, surface.faces[faces]).compute_normals(
+        cell_normals=False, point_normals=True, split_vertices=False, auto_orient_normals=False)
+    size = float(np.linalg.norm(np.ptp(surface.vertices, axis=0)))
+    pd.points = pd.points + (0.004 * lift * size) * pd.point_data["Normals"]
+    return pd
 
 
 def _travel(results):
@@ -177,8 +205,9 @@ class FlowPanel(QWidget):
 # -----------------------------
 
 class ActivationResultsPanel(QWidget):
-    """A(Δp) and mass flow(Δp), the area and pressure along the tube at the selected point, and display
-    settings for the 3D view (same signals and current_step() as ResultsPanel)."""
+    """A(Δp) and mass flow(Δp), the named outputs (pressures of their tube segments) against the pre-activation
+    Δp, the area and pressure along the tube at the selected point, and display settings for the 3D view (same
+    signals and current_step() as ResultsPanel)."""
     display_changed = Signal()
     export_vtk = Signal()
     export_csv = Signal()
@@ -192,6 +221,8 @@ class ActivationResultsPanel(QWidget):
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
 
+        self.outputs = []   # [{"name", "segment"}], set by the window from the tube fluid's properties
+
         self.figure = Figure(figsize=(4, 5), tight_layout=True)
         self.canvas = FigureCanvasQTAgg(self.figure)
         self.canvas.setMinimumHeight(540)
@@ -202,10 +233,7 @@ class ActivationResultsPanel(QWidget):
         self.ax_pressure = self.ax_profile.twinx()
         self.canvas.mpl_connect("button_press_event", self._on_click)
 
-        self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["Δp [kPa]", "A [mm²]", "ṁ [g/s]", "p end [kPa]", "Travel [mm]", ""])
-        self.table.horizontalHeaderItem(3).setToolTip("Pressure at the downstream end of the tube")
-        self.table.horizontalHeaderItem(4).setToolTip("How far the part bonded to the membrane moved towards the tube")
+        self.table = QTableWidget(0, 0)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.verticalHeader().setVisible(False)
@@ -273,21 +301,53 @@ class ActivationResultsPanel(QWidget):
         self._updating = True
         self.step.setRange(0, max(0, n - 1))
         self.step.setValue(n - 1 if n else 0)
-        self.table.setRowCount(n)
-        for r in range(n):
-            values = [results["dp"][r], results["area"][r], 1000.0 * results["mdot"][r], results["p_end"][r],
-                      _travel(results)[r]]
-            for c, v in enumerate(values):
-                item = QTableWidgetItem(fmt(v))
-                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                self.table.setItem(r, c, item)
-            self.table.setItem(r, 5, QTableWidgetItem("" if results["converged"][r] else "not converged"))
+        self._fill_table()
         self._updating = False
         self._update_label()
         self.plot()
 
+    def set_outputs(self, outputs):
+        """The named outputs to show (changing them needs no new simulation)."""
+        self.outputs = [dict(o) for o in outputs]
+        updating, self._updating = self._updating, True
+        self._fill_table()
+        self._updating = updating
+        self.plot()
+
     def set_table(self, rows, text=""):
         pass  # the table lists the sweep points (set_results)
+
+    def output_values(self):
+        """{output name: value (kPa) at every point of the current results}."""
+        r = self.results
+        if not r or not r.get("pressures") or len(r["pressures"]) != len(r["dp"]) or not self.outputs:
+            return {}
+        return output_pressures(r, self.outputs)
+
+    def _fill_table(self):
+        r = self.results
+        outputs = self.output_values()
+        headers = ["Pre-activation Δp [kPa]"] + [f"{name} [kPa]" for name in outputs] + \
+                  ["A [mm²]", "ṁ [g/s]", "Travel [mm]", ""]
+        self.table.setColumnCount(len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
+        for c, o in enumerate(self.outputs[:len(outputs)], start=1):
+            self.table.horizontalHeaderItem(c).setToolTip(f"Output: gas pressure of tube segment {o['segment']}")
+        self.table.horizontalHeaderItem(len(headers) - 2).setToolTip(
+            "How far the part bonded to the membrane moved towards the tube")
+        n = len(r["dp"]) if r else 0
+        self.table.setRowCount(n)
+        for k in range(n):
+            values = [r["dp"][k]] + [v[k] for v in outputs.values()] + \
+                     [r["area"][k], 1000.0 * r["mdot"][k], _travel(r)[k]]
+            for c, v in enumerate(values):
+                item = QTableWidgetItem(fmt(v))
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.table.setItem(k, c, item)
+            self.table.setItem(k, len(values), QTableWidgetItem("" if r["converged"][k] else "not converged"))
+        k = self.current_index()
+        if k is not None:
+            self.table.selectRow(k)
 
     def add_point(self, results_so_far):
         """Live update while the sweep runs: follow the newest point (the slider may still hold a point of the
@@ -353,7 +413,7 @@ class ActivationResultsPanel(QWidget):
             self.ax_map.plot(dp[~ok], A[~ok], "x", color="#d62728", ms=8)
         if "A0" in r:
             self.ax_map.axhline(r["A0"], color=purple, lw=0.8, ls=":")
-        self.ax_map.set_xlabel("Δp across the membrane [kPa]", fontsize=8)
+        self.ax_map.set_xlabel("Pre-activation: Δp across the membrane [kPa]", fontsize=8)
         self.ax_map.set_ylabel("A smallest section [mm²]", color=purple, fontsize=8)
         self.ax_map.set_ylim(bottom=0)
         self.ax_flow.plot(dp, mdot, "-s", color=blue, ms=3, lw=1)
@@ -367,18 +427,20 @@ class ActivationResultsPanel(QWidget):
         for ax in (self.ax_map, self.ax_flow):
             ax.tick_params(labelsize=7)
 
-        # pressures at the two ends of the dynamic fluid in the tube, against the membrane pressure
-        pressures = r.get("pressures", [])
-        if pressures and len(pressures) == len(dp):
-            P = np.asarray([row for row in pressures], float)
-            self.ax_ends.plot(dp, P[:, 0], "-o", color="#2ca02c", ms=4, label="upstream end")
-            self.ax_ends.plot(dp, P[:, -1], "-s", color="#d62728", ms=4, label="downstream end")
+        # the activation functions: every named output (pressure of its segment) against the pre-activation
+        outputs = self.output_values()
+        for n, (name, act) in enumerate(outputs.items()):
+            color = OUTPUT_COLORS[n % len(OUTPUT_COLORS)]
+            self.ax_ends.plot(dp, act, "-o", color=color, ms=4, label=name)
             if (~ok).any():
-                self.ax_ends.plot(dp[~ok], P[~ok, -1], "x", color="#d62728", ms=8)
+                self.ax_ends.plot(dp[~ok], act[~ok], "x", color="#d62728", ms=8)
+            if k is not None:
+                self.ax_ends.plot([dp[k]], [act[k]], "o", ms=9, mfc="none", mec=color, mew=2)
+        if outputs:
             if k is not None:
                 self.ax_ends.axvline(dp[k], color="#999", lw=0.8)
-            self.ax_ends.set_ylabel("Gas pressure at the\ntube ends [kPa]", fontsize=8)
-            self.ax_ends.set_xlabel("Δp across the membrane [kPa]", fontsize=8)
+            self.ax_ends.set_ylabel("Outputs (activations):\ngas pressure [kPa]", fontsize=8)
+            self.ax_ends.set_xlabel("Pre-activation: Δp across the membrane [kPa]", fontsize=8)
             self.ax_ends.legend(fontsize=7, loc="best")
             self.ax_ends.grid(True, lw=0.3, alpha=0.5)
             self.ax_ends.tick_params(labelsize=7)
@@ -391,11 +453,16 @@ class ActivationResultsPanel(QWidget):
             self.ax_profile.set_ylabel("Section area [mm²]", color=purple, fontsize=8)
             self.ax_profile.set_ylim(bottom=0)
             if k < len(r.get("pressures", [])) and "node_positions" in r:
-                self.ax_pressure.plot(r["node_positions"], r["pressures"][k], "-o", color=green, ms=3, lw=1.2)
+                x = r["node_positions"]
+                for n, o in enumerate(self.outputs):  # the output segments
+                    if o["segment"] < len(x):
+                        self.ax_profile.axvspan(x[o["segment"] - 1], x[o["segment"]], alpha=0.15, lw=0,
+                                                color=OUTPUT_COLORS[n % len(OUTPUT_COLORS)])
+                self.ax_pressure.plot(x, r["pressures"][k], "-o", color=green, ms=3, lw=1.2)
                 self.ax_pressure.set_ylabel("Gas pressure [kPa]", color=green, fontsize=8)
                 self.ax_pressure.yaxis.set_label_position("right")
                 self.ax_pressure.yaxis.tick_right()
-            self.ax_profile.set_xlabel(f"Along the tube, upstream → downstream [mm]   (Δp = {dp[k]:.4g} kPa)",
+            self.ax_profile.set_xlabel(f"Along the tube [mm] at Δp = {dp[k]:.4g} kPa (shaded: output segments)",
                                        fontsize=8)
             for ax in (self.ax_profile, self.ax_pressure):
                 ax.tick_params(labelsize=7)
@@ -416,9 +483,12 @@ class ActivationWindow(MainWindow):
         self.states = []
         self.connections = []      # detected flow connections (activation.Connection)
         self.highlight = None      # (body index, faces) of the selected connection
+        self.segment_highlight = None  # (fluid index, segment) being chosen as an output
+        self.frames = None             # stored FEM solution of the loaded design (DesignFrames)
         super().__init__()
+        self.properties.segment_highlight.connect(self._segment_highlight)
         self.log.clear()
-        self.log_message("Activation function space: open the valve's STEP file (File → Open STEP…). "
+        self.log_message("Pre-activation to activation: open the valve's STEP file (File → Open STEP…). "
                          "Help → Quick guide explains the roles and the workflow.")
 
     # -----------------------------
@@ -432,7 +502,8 @@ class ActivationWindow(MainWindow):
 
     def _extra_tabs(self):
         self.study_panel = SolverPanel(title="Δp sweep and gas", fields=STUDY_FIELDS, note=(
-            "Δp is the pressure difference across the membrane; positive Δp pushes it towards the tube. "
+            "Δp, the pre-activation, is the pressure difference across the membrane; positive Δp pushes it towards "
+            "the tube. The activation (output) is the pressure of the segment chosen in the Results tab. "
             "The gas density follows the ideal gas law, ρ = p_abs / (R T), at the local pressure."))
         self.study_panel.changed.connect(self._on_study_changed)
         self.flow_panel = FlowPanel()
@@ -443,8 +514,8 @@ class ActivationWindow(MainWindow):
     def _build_actions(self):
         super()._build_actions()
         self.a_solve.setText("Simulate")
-        self.a_solve.setStatusTip("Run the Δp sweep and compute the activation function")
-        self.a_solve.setToolTip("Run the Δp sweep and compute the activation function")
+        self.a_solve.setStatusTip("Run the pre-activation (Δp) sweep and compute the activation function")
+        self.a_solve.setToolTip("Run the pre-activation (Δp) sweep and compute the activation function")
         self.a_save.setText("Save design")
         self.a_save_as.setText("Save design as…")
         self.a_open_project.setText("Open design…")
@@ -454,18 +525,75 @@ class ActivationWindow(MainWindow):
         setattr(self.project.study, key, value)
         self._invalidate(mesh=False)
 
+    def _lumen_outputs(self):
+        """The named outputs of the design as they are now (from the tube fluid's properties)."""
+        return output_definitions(self.project.parts, self.project.results)
+
+    def _refresh_outputs(self):
+        self.results_panel.set_outputs(self._lumen_outputs())
+
+    def _segment_highlight(self, indices, segment):
+        self.segment_highlight = (indices[0], segment) if indices and segment else None
+        self.refresh_view()
+
+    def _segment_faces(self, index, segment):
+        """Faces of fluid `index`'s display mesh in its segment `segment` (1..N), or None."""
+        if index not in self.surfaces:
+            return None
+        part = self.project.parts[index]
+        segments = max(int(part.props.get("segments", 10)), 1)
+        connections = [(c, self.project.connection(c.key, outside=c.b is None)) for c in self.connections]
+        try:
+            axis, _ = channel_axis(self.surfaces[index], index, connections, self.project.parts)
+        except Exception:
+            return None
+        return segment_faces(self.surfaces[index], axis, segments, min(segment, segments))
+
+    def _show_outputs(self):
+        """Every fluid's named outputs (coloured, with their names) and the segment being chosen (yellow)."""
+        parts = self.project.parts
+        labels = []
+        for i, part in enumerate(parts):
+            if part.role != FLUID or part.props.get("model") != DYNAMIC_FLUID or not part.visible:
+                continue
+            for n, o in enumerate(part.props.get("outputs") or ()):
+                faces = self._segment_faces(i, int(o["segment"]))
+                if faces is None or not len(faces):
+                    continue
+                mesh = _raised(self.surfaces[i], faces)
+                self.viewport._add(f"output{i}_{n}", mesh, color=OUTPUT_COLORS[n % len(OUTPUT_COLORS)],
+                                   opacity=0.85 if self.mode != RESULTS else 0.5, show_edges=False, pickable=False)
+                m = self.surfaces[i]
+                labels.append((m.vertices[m.faces[faces]].mean(axis=(0, 1)), o["name"]))
+        if labels:
+            self.viewport.plotter.add_point_labels(np.array([x for x, _ in labels]), [t for _, t in labels],
+                                                   name="output_names", font_size=12, point_size=1, shape_opacity=0.6,
+                                                   always_visible=True, show_points=False, render=False)
+            self.viewport._names.append("output_names")
+        if self.segment_highlight is not None:
+            i, k = self.segment_highlight
+            faces = self._segment_faces(i, k)
+            if faces is not None and len(faces) and parts[i].role == FLUID:
+                self.viewport._add("segment_highlight", _raised(self.surfaces[i], faces, 2.0), color=SEGMENT_HIGHLIGHT,
+                                   opacity=1.0, show_edges=True, edge_color="#806a00", pickable=False)
+
     def _after_load(self):
         self.study_panel.load(self.project.study)
+        self.segment_highlight = None
+        self.results_panel.outputs = self._lumen_outputs()
         self.states = []
         self._refresh_connections()
         results = self.project.results
+        self.frames = _frames_of(results)
         if results:
             n, ok = len(results["dp"]), sum(results["converged"])
-            self.results_panel.set_results(results, [], f"Saved activation function: {ok}/{n} points "
-                                                        f"(Simulate again to see the deformed device).")
+            self.results_panel.set_results(results, [], f"Saved activation function: {ok}/{n} points " + (
+                "(the stored FEM solution is shown in the Results view, key 3)." if self.frames is not None else
+                "(simulated before the FEM solution was stored: simulate again to see the deformed device)."))
             self.tabs.setCurrentWidget(self.results_panel)
-            self.log_message(f"Loaded design with {n} simulated points (Δp {results['dp'][0]:.4g} … "
-                             f"{results['dp'][-1]:.4g} kPa); no simulation needed to use it.")
+            self.log_message(f"Loaded design with {n} simulated points (pre-activation Δp {results['dp'][0]:.4g} … "
+                             f"{results['dp'][-1]:.4g} kPa; outputs "
+                             f"{', '.join(o['name'] for o in self._lumen_outputs())}); no simulation needed to use it.")
         else:
             self.results_panel.set_results(None, [], "No results yet. Press Simulate (F5).")
 
@@ -504,9 +632,27 @@ class ActivationWindow(MainWindow):
         QTimer.singleShot(0, self._refresh_connections)
 
     def _on_props_changed(self, indices, key, value):
+        if key == "outputs":  # post-processing: the results stay valid
+            for i in indices:
+                if self.project.parts[i].role == FLUID:
+                    self.project.parts[i].props["outputs"] = [dict(o) for o in value]
+            names = ", ".join(f"{o['name']} (segment {o['segment']})" for o in value) or "none"
+            self.log_message(f"Outputs of {', '.join(self.project.parts[i].name for i in indices)}: {names}")
+            self._refresh_outputs()
+            self.refresh_view()
+            return
         super()._on_props_changed(indices, key, value)
         if key == "model":  # constant/dynamic changes which outside connections exist
             QTimer.singleShot(0, self._refresh_connections)
+        if key == "segments":  # the outputs editor's range follows; outputs past the end move to the last segment
+            n = max(int(value), 1)
+            for i in indices:
+                part = self.project.parts[i]
+                for o in part.props.get("outputs") or ():
+                    o["segment"] = min(int(o["segment"]), n)
+            self.segment_highlight = None
+            QTimer.singleShot(0, lambda: self.properties.set_selection(
+                self.selection, self.project.parts, self.cad.bodies, self._couplings_text(self.selection)))
 
     def auto_assign(self):
         super().auto_assign()
@@ -534,6 +680,8 @@ class ActivationWindow(MainWindow):
                 self.tabs.setCurrentWidget(self.flow_panel)
                 self.flow_panel.select(self.connections[k].key)
             indices = [i for i in indices if i >= 0]
+        if self.segment_highlight is not None and self.segment_highlight[0] not in indices:
+            self.segment_highlight = None
         super().set_selection(indices, from_tree)
         if conns:
             self.tabs.setCurrentWidget(self.flow_panel)
@@ -621,11 +769,15 @@ class ActivationWindow(MainWindow):
 
             def point(row):
                 rows.append(row)
-                worker.log(f"  Δp = {row['dp']:.4g} kPa: A = {row['area']:.5g} mm², ṁ = {1000 * row['mdot']:.4g} g/s, "
-                           f"p end = {row['p_end']:.4g} kPa, travel {row['travel']:.4g} mm, "
+                values = output_pressures({"pressures": [row["pressures"]]}, outputs)
+                worker.log(f"  Δp = {row['dp']:.4g} kPa: "
+                           + ", ".join(f"{name} {v[0]:.4g} kPa" for name, v in values.items()) + ", "
+                           f"A = {row['area']:.5g} mm², ṁ = {1000 * row['mdot']:.4g} g/s, travel {row['travel']:.4g} mm, "
                            f"{row['iterations']} flow iterations" + ("" if row["converged"] else "  (NOT converged)"))
                 worker.item.emit((build, list(rows)))
 
+            outputs = output_definitions(project.parts, {"lumen": project.parts[build.flow.lumen].name,
+                                                         "pressures": [[0.0] * (build.flow.segments + 1)]})
             results, states = run_study(build, project, callback=callback, point_callback=point, check=worker.check)
             return mesh, build, results, states
 
@@ -652,12 +804,16 @@ class ActivationWindow(MainWindow):
         self.results_outdated = False
         self._clim = None
         n, ok = len(results["dp"]), sum(results["converged"])
+        last = ", ".join(f"{name} = {v[-1]:.4g} kPa" for name, v in
+                         output_pressures(results, output_definitions(self.project.parts, results)).items())
         status = f"Activation function: {ok}/{n} points converged · A0 = {results['A0']:.4g} mm² · " \
-                 f"at Δp = {results['dp'][-1]:.4g} kPa: A = {results['area'][-1]:.4g} mm², " \
+                 f"at Δp = {results['dp'][-1]:.4g} kPa: {last}, A = {results['area'][-1]:.4g} mm², " \
                  f"ṁ = {1000 * results['mdot'][-1]:.4g} g/s"
         self.log_message(status)
         if ok < n:
             QMessageBox.warning(self, TITLE, f"{n - ok} of {n} points did not converge; they are marked in the plot.")
+        self.frames = _frames_of(results)
+        self.results_panel.outputs = output_definitions(self.project.parts, results)
         self.results_panel.set_results(results, states, status + "\nSave the design (Ctrl+S) to keep it.")
         self.tabs.setCurrentWidget(self.results_panel)
         self.set_mode(RESULTS)
@@ -668,9 +824,16 @@ class ActivationWindow(MainWindow):
 
     def refresh_view(self):
         if self.mode == RESULTS and (self.build is None or self.results_panel.current_step() is None):
+            if self.frames is not None and self.results_panel.current_index() is not None and self.surfaces:
+                self._show_frames()
+                self._show_outputs()
+                self.viewport.plotter.render()
+                return
             self.mode = MODEL
             self.view_actions[MODEL].setChecked(True)
         super().refresh_view()
+        self._show_outputs()
+        self.viewport.plotter.render()
         if self.highlight is not None and self.mode != RESULTS and self.highlight[0] in self.surfaces:
             index, faces = self.highlight
             m = self.surfaces[index]
@@ -678,6 +841,37 @@ class ActivationWindow(MainWindow):
                 self.viewport._add("connection", polydata(m.vertices, m.faces[faces]), color="#ffcc00", opacity=1.0,
                                    show_edges=False, pickable=False)
                 self.viewport.plotter.render()
+
+    def _show_frames(self):
+        """The saved design's stored FEM solution at the selected point, coloured by displacement."""
+        vp = self.viewport
+        vp._clear()
+        r = self.project.results
+        k = self.results_panel.current_index()
+        frames = self.frames.at(r["dp"][k])
+        names = {f["name"] for f in frames}
+        for index, mesh in self.surfaces.items():  # everything not simulated, as context
+            part = self.project.parts[index]
+            if part.name in names or not part.visible or part.role not in (RIGID, FLUID):
+                continue
+            vp._add(f"body{index}", polydata(mesh.vertices, mesh.faces), body=index, color=part_color(part),
+                    opacity=min(0.3, vp.opacity), pickable=True)
+        top = max([float(np.linalg.norm(f["x"] - f["rest"], axis=1).max()) for f in frames] + [1e-12])
+        by_name = {p.name: i for i, p in enumerate(self.project.parts)}
+        for n, f in enumerate(frames):
+            index = by_name.get(f["name"])
+            if index is not None and not self.project.parts[index].visible:
+                continue
+            pd = frame_polydata(f, self.results_panel.scale.value())
+            pd.rename_array("values", "|u| [mm]")
+            vp._add(f"frame{n}", pd, body=index, scalars="|u| [mm]", cmap="turbo", clim=(0.0, top),
+                    show_edges=vp.show_edges, edge_color="#303030", line_width=0.4, show_scalar_bar=n == 0,
+                    scalar_bar_args=dict(title="|u| [mm]", vertical=True, position_x=0.86, position_y=0.1,
+                                         height=0.75, width=0.06, fmt="%.3g", color="black"), pickable=True)
+        vp.plotter.add_text(f"Stored FEM solution at Δp = {r['dp'][k]:.4g} kPa", position="upper_left",
+                            font_size=9, color="black", name="frame_title")
+        vp._names.append("frame_title")
+        vp._finish()
 
     def _global_clim(self, field):
         key = (id(self.build), field)
@@ -693,12 +887,19 @@ class ActivationWindow(MainWindow):
 
     def set_mode(self, mode):
         if mode == RESULTS and (self.build is None or not self.states):
-            mode = MODEL
+            if self.frames is None:
+                mode = MODEL
+            else:  # a loaded design: its stored FEM solution (the base class wants a live build)
+                self.mode = RESULTS
+                self.view_actions[RESULTS].setChecked(True)
+                self.refresh_view()
+                return
         super().set_mode(mode)
 
     def _update_actions(self):
         super()._update_actions()
-        self.view_actions[RESULTS].setEnabled(self.build is not None and bool(self.states))
+        self.view_actions[RESULTS].setEnabled((self.build is not None and bool(self.states))
+                                              or self.frames is not None)
 
     # -----------------------------
     # Files
@@ -727,11 +928,15 @@ class ActivationWindow(MainWindow):
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             positions = r.get("node_positions", [])
-            writer.writerow(["dp [kPa]", "A [mm2]", "mdot [kg/s]", "p end [kPa]", "travel [mm]", "converged"]
+            outputs = output_definitions(self.project.parts, r)
+            values = output_pressures(r, outputs)
+            writer.writerow(["pre-activation dp [kPa]"] + [f"{o['name']} (segment {o['segment']}) [kPa]" for o in outputs]
+                            + ["A [mm2]", "mdot [kg/s]", "travel [mm]", "converged"]
                             + [f"p at {x:.3g} mm [kPa]" for x in positions])
             for k in range(len(r["dp"])):
-                writer.writerow([r["dp"][k], r["area"][k], r["mdot"][k], r["p_end"][k], _travel(r)[k],
-                                 r["converged"][k]] + list(r["pressures"][k]))
+                writer.writerow([r["dp"][k]] + [v[k] for v in values.values()]
+                                + [r["area"][k], r["mdot"][k], _travel(r)[k], r["converged"][k]]
+                                + list(r["pressures"][k]))
         self.log_message(f"Exported {path}")
 
     def export_vtk(self):

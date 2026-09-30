@@ -2,6 +2,9 @@
 Turns a CAD model plus a Project into a membrane_sim.Environment.
 
   Membrane / Shell  -> Shell on the mid-surface of the thin solid (bending off / on)
+  Activation membrane -> EmpiricalMembrane: the membrane of a pre-simulated activation-function design
+                       (*.mad), replaced by its Δp -> swept volume curve (one dof); the chambers either side
+                       of the part's mid-surface are its driving side and its tube side
   Rigid body        -> Obstacle (closed surface mesh)
   Fluid chamber     -> FluidVolume, coupled to every membrane/shell it touches
 
@@ -11,6 +14,7 @@ acts on the side whose probes fall inside it (generalised winding number of its 
 Units in the solver: mm, N, MPa.
 """
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -18,9 +22,9 @@ import torch
 import membrane_sim as ms
 from membrane_sim.contact import ObstacleField, _winding_number
 
-from .project import (CHAMBER, CLAMPED, DEFORMABLE, IDEAL_GAS, IGNORE, INCOMPRESSIBLE, MEMBRANE, NEO_HOOKEAN,
-                      RIGID, ROLE_COLORS, SHELL, TOUCHING_RIGID, UNASSIGNED, VENT, INCOMPRESSIBLE_STIFFNESS,
-                      part_color)
+from .project import (ACTIVATION_MEMBRANE, AUTOMATIC, CHAMBER, CLAMPED, DEFORMABLE, IDEAL_GAS, IGNORE,
+                      INCOMPRESSIBLE, MEMBRANE, NEO_HOOKEAN, RIGID, ROLE_COLORS, SHEETS, SHELL, TOUCHING_RIGID,
+                      UNASSIGNED, VENT, INCOMPRESSIBLE_STIFFNESS, part_color)
 
 P_ATM = 0.101325  # MPa
 KPA = 1e-3        # kPa -> MPa
@@ -53,7 +57,7 @@ def element_size(body, role, elements_per_side=DEFAULT_ELEMENTS_PER_SIDE):
     not explode into huge meshes."""
     n = max(int(elements_per_side), 1)
     sides = np.sort(body.size)[::-1]
-    if role in DEFORMABLE:
+    if role in SHEETS:
         return float(sides[1] / n)
     return float(max(sides[2] / n, body.diagonal / (3 * n)))
 
@@ -73,7 +77,7 @@ def generate_mesh(cad, project) -> MeshData:
     sizes = mesh_sizes(cad, project)
     data = MeshData(sizes, cad.mesh(sizes))
     for body, part in zip(cad.bodies, project.parts):
-        if part.role in DEFORMABLE:
+        if part.role in SHEETS:
             data.midsurfaces[body.index] = cad.midsurface(body, data.surfaces[body.index])
     return data
 
@@ -90,6 +94,26 @@ class Coupling:
 
 
 @dataclass
+class ActivationLink:
+    """A neuron part replaced by an activation-function design's membrane."""
+    body: object              # EmpiricalMembrane
+    design: object            # app.activation.ActivationDesign
+    path: str
+    sides: dict               # chamber index -> +1 (driving side) / -1 (tube side)
+
+    def pressure_difference(self, pressures) -> float:
+        """Δp across the design's membrane (kPa) from the chamber pressures {chamber index: P (MPa)}."""
+        return sum(side * pressures[c] for c, side in self.sides.items()) / KPA
+
+    def outputs(self, pressures) -> dict:
+        return self.design.outputs(self.pressure_difference(pressures))
+
+    def range_warning(self, pressures, name="") -> str:
+        """The extrapolation warning at these chamber pressures ("" inside the design's simulated range)."""
+        return self.design.range_warning(self.pressure_difference(pressures), name)
+
+
+@dataclass
 class BuildResult:
     env: ms.Environment
     shells: dict                       # body index -> Shell
@@ -101,6 +125,24 @@ class BuildResult:
     warnings: list = field(default_factory=list)
 
     auto_contact: bool = True
+    activation: dict = field(default_factory=dict)  # part index -> ActivationLink
+
+    def activation_outputs(self, step=None) -> dict:
+        """{part index: design outputs} at a history step (default: the current state)."""
+        if step is None:
+            pressures = {c: v.P for c, v in self.volumes.items()}
+        else:
+            pressures = dict(zip(self.volumes.keys(), step["pressures"]))
+        return {i: link.outputs(pressures) for i, link in self.activation.items()}
+
+    def range_warnings(self, parts, step=None) -> list:
+        """The extrapolation warning of every activation membrane whose pre-activation Δp is outside its design's
+        simulated range (at a history step, default the current state)."""
+        if step is None:
+            pressures = {c: v.P for c, v in self.volumes.items()}
+        else:
+            pressures = dict(zip(self.volumes.keys(), step["pressures"]))
+        return [w for i, link in self.activation.items() if (w := link.range_warning(pressures, parts[i].name))]
 
     def set_contact_stiffness(self, pressure_ref=None):
         """Automatic penalty stiffness: penetration ~5% of the thinnest part at pressure_ref
@@ -109,7 +151,7 @@ class BuildResult:
             return
         if pressure_ref is None:
             pressure_ref = max(abs(v.P0) for v in self.volumes.values()) if self.volumes else 0.0
-        self.contact_stiffness = max(pressure_ref, 1.0 * KPA) / (0.05 * min(self.thickness.values()))
+        self.contact_stiffness = max(pressure_ref, 1.0 * KPA) / (0.05 * min(self.thickness.values(), default=1.0))
         self.env.contact_stiffness = self.contact_stiffness
 
     def solve(self, settings, callback=None, warm_start=False, load_steps=None, fixed_contact=False):
@@ -152,11 +194,12 @@ def build_environment(cad, mesh: MeshData, project) -> BuildResult:
 
     rigid = [i for i, p in enumerate(parts) if p.role == RIGID]
     deformable = [i for i, p in enumerate(parts) if p.role in DEFORMABLE]
+    linked = [i for i, p in enumerate(parts) if p.role == ACTIVATION_MEMBRANE]
     chambers = [i for i, p in enumerate(parts) if p.role == CHAMBER]
     unassigned = [parts[i].name for i, p in enumerate(parts) if p.role == UNASSIGNED]
-    if not deformable:
-        raise ValueError("Assign at least one part as Membrane or Shell.")
-    missing = [parts[i].name for i in deformable if i not in mesh.midsurfaces]
+    if not deformable and not linked:
+        raise ValueError("Assign at least one part as Membrane, Shell or Activation membrane.")
+    missing = [parts[i].name for i in deformable + linked if i not in mesh.midsurfaces]
     if missing:
         raise ValueError(f"Mesh is out of date for: {', '.join(missing)}. Generate the mesh again.")
     if unassigned:
@@ -197,6 +240,12 @@ def build_environment(cad, mesh: MeshData, project) -> BuildResult:
             contact_offset=0.5 * t,
             color=ROLE_COLORS[part.role], name=part.name)
 
+    empirical = {i: _empirical_membrane(parts[i], mesh.midsurfaces[i], getattr(project, "path", None), warnings)
+                 for i in linked}
+    for i in linked:
+        env.membrane_list.append(empirical[i][0])
+    linked_sides = {i: {} for i in linked}  # part -> {chamber: side of its mid-surface}
+
     volumes, couplings = {}, {}
     for c in chambers:
         part, body = parts[c], bodies[c]
@@ -217,6 +266,15 @@ def build_environment(cad, mesh: MeshData, project) -> BuildResult:
             if coverage < 0.9:
                 warnings.append(f"{part.name} touches only {coverage:.0%} of {parts[i].name}; "
                                 f"its pressure is applied to the whole face.")
+        for i in linked:
+            mid = mesh.midsurfaces[i]
+            t = float(parts[i].props.get("thickness", 0.0) or 0.0) or mid.thickness
+            side, coverage = _detect_side(mid, t, tri)
+            if side in (1, -1):
+                linked_sides[i][c] = side
+                couplings[c].append(Coupling(i, side, coverage))
+            elif side == 2:
+                warnings.append(f"{part.name} lies on both sides of {parts[i].name}; no net pressure, ignored.")
         if not couplings[c]:
             warnings.append(f"{part.name} does not touch any membrane or shell.")
 
@@ -224,9 +282,18 @@ def build_environment(cad, mesh: MeshData, project) -> BuildResult:
         if not shells[i].fluid_volumes:
             warnings.append(f"{parts[i].name} is not loaded by any fluid chamber.")
 
+    activation = {}
+    for i in linked:
+        body, design, path = empirical[i]
+        sides = _orient_activation_membrane(parts, i, linked_sides[i], warnings)
+        for c, side in sides.items():
+            volumes[c].add_boundary(body, side)
+        activation[i] = ActivationLink(body, design, path, sides)
+
     k = project.solver.contact_stiffness
     env.contact_stiffness = k
-    build = BuildResult(env, shells, obstacles, volumes, couplings, thickness, k, warnings, auto_contact=not k)
+    build = BuildResult(env, shells, obstacles, volumes, couplings, thickness, k, warnings, auto_contact=not k,
+                        activation=activation)
     build.set_contact_stiffness()
     return build
 
@@ -252,3 +319,65 @@ def _detect_side(mid, t, chamber_triangles, threshold=0.3):
     if front >= threshold:
         return -1, front
     return 0, 0.0
+
+
+def design_path(part, project_path=None) -> Path:
+    """The activation design file of an Activation membrane part (relative paths: next to the project)."""
+    text = str(part.props.get("design", "") or "").strip()
+    if not text:
+        raise ValueError(f"{part.name}: choose its activation design (*.mad) in the part's properties.")
+    path = Path(text)
+    if not path.is_absolute() and project_path:
+        path = Path(project_path).parent / path
+    return path
+
+
+def _empirical_membrane(part, mid, project_path, warnings):
+    """(EmpiricalMembrane, ActivationDesign, path) of an Activation membrane part."""
+    from .activation import ActivationDesign  # activation imports this module
+    path = design_path(part, project_path)
+    if not path.exists():
+        raise ValueError(f"{part.name}: activation design not found: {path}")
+    design = ActivationDesign.load(path)
+    if not design.has_volume:
+        raise ValueError(f"{part.name}: {path.name} was simulated before the membrane's swept volume was "
+                         "recorded. Open it in the Pre-activation → activation space, run its study again and save it.")
+    V, F = mid.vertices, mid.faces
+    area = 0.5 * float(np.linalg.norm(np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]]), axis=1).sum())
+    if abs(area - design.membrane_area) > 0.1 * design.membrane_area:
+        warnings.append(f"{part.name} has {area:.4g} mm² of membrane, the design {path.name} "
+                        f"{design.membrane_area:.4g} mm²; the design's response is used as simulated.")
+    body = ms.EmpiricalMembrane(design.dp * KPA, design.volume, area, name=part.name,
+                                color=ROLE_COLORS[ACTIVATION_MEMBRANE])
+    return body, design, str(path)
+
+
+def _orient_activation_membrane(parts, i, touching, warnings):
+    """{chamber index: +1 driving side / -1 tube side} from the chambers touching the part's two faces
+    ({chamber: side of the mid-surface}). The driving chamber is the chosen one, or automatically the
+    closed chamber it touches (the pre-activation chamber), else the first one."""
+    name = parts[i].name
+    if not touching:
+        warnings.append(f"{name} touches no fluid chamber: nothing drives the activation design.")
+        return {}
+    chosen = parts[i].props.get("driving", AUTOMATIC) or AUTOMATIC
+    by_name = {parts[c].name: c for c in touching}
+    if chosen != AUTOMATIC and chosen not in by_name:
+        warnings.append(f"{name}: the driving chamber {chosen} does not touch it; chosen automatically.")
+        chosen = AUTOMATIC
+    if chosen == AUTOMATIC:
+        closed = [c for c in touching if parts[c].props.get("model") in (IDEAL_GAS, INCOMPRESSIBLE)]
+        drive = closed[0] if closed else next(iter(touching))
+        if len({touching[c] for c in closed}) > 1:
+            warnings.append(f"{name} has closed chambers on both sides; {parts[drive].name} was taken as the "
+                            "driving chamber - choose it in the part's properties.")
+    else:
+        drive = by_name[chosen]
+    front = touching[drive]
+    sides = {c: (1 if s == front else -1) for c, s in touching.items()}
+    for sign, what in ((1, "driving"), (-1, "tube")):
+        several = [parts[c].name for c, s in sides.items() if s == sign]
+        if len(several) > 1:
+            warnings.append(f"{name}: several chambers on its {what} side ({', '.join(several)}); each one's "
+                            "full pressure acts on it.")
+    return sides
