@@ -66,6 +66,32 @@ def test_contact_is_active_in_consistency_check():
     assert (shell.x[:, 2] > 0.1).any()
 
 
+@pytest.mark.parametrize("material, tension", [("neo_hookean", 0.0), ("neo_hookean", 0.03), ("svk", 0.02)])
+def test_hand_written_membrane_derivatives_match_torch_func(material, tension):
+    from torch.func import grad, hessian, vmap
+    from membrane_sim.shell import _neo_hookean_energy, _svk_energy
+    shell = ms.Shell(*ms.disk_mesh((0, 0, 0), (0, 0, 1), 1.0, rings=3), thickness=0.05, youngs_modulus=1.0,
+                     poisson_ratio=0.3, material=material, pretension=tension, bending=False)
+    g = torch.Generator().manual_seed(2)
+    shell.x = shell.X + 0.15 * torch.randn(shell.X.shape, generator=g, dtype=torch.float64)
+    fn = lambda xe, Dm, A0: (_neo_hookean_energy if material == "neo_hookean" else _svk_energy)(  # noqa: E731
+        xe, Dm, A0, shell._mem["mu_t"], shell._mem["lam_t"], tension)
+    args = (shell.x[shell.faces], shell._Dm_inv, shell.rest_area)
+    _, e, gr, H = next(shell.element_terms(True))
+    assert torch.allclose(e, vmap(fn)(*args), rtol=1e-12, atol=1e-14)
+    assert torch.allclose(gr, vmap(grad(fn))(*args).reshape(-1, 9), rtol=1e-10, atol=1e-12)
+    assert torch.allclose(H, vmap(hessian(fn))(*args).reshape(-1, 9, 9), rtol=1e-10, atol=1e-11)
+
+
+def test_hand_written_cone_volume_derivatives_match_torch_func():
+    from torch.func import grad, hessian, vmap
+    from membrane_sim import fluid
+    xe = torch.randn(50, 3, 3, generator=torch.Generator().manual_seed(3), dtype=torch.float64)
+    assert torch.allclose(fluid.cone_volume(xe), vmap(fluid._cone_volume)(xe))
+    assert torch.allclose(fluid.cone_volume_grad(xe), vmap(grad(fluid._cone_volume))(xe))
+    assert torch.allclose(fluid.cone_volume_hess(xe), vmap(hessian(fluid._cone_volume))(xe))
+
+
 # -----------------------------
 # Analytical benchmarks
 # -----------------------------

@@ -17,7 +17,7 @@ import math
 
 import numpy as np
 import torch
-from torch.func import vmap, grad, hessian
+from torch.func import grad, hessian
 
 DTYPE = torch.float64
 
@@ -26,9 +26,37 @@ def _cone_volume(xe):
     return torch.dot(xe[0], torch.linalg.cross(xe[1], xe[2])) / 6.0
 
 
-cone_volume = vmap(_cone_volume)
-cone_volume_grad = vmap(grad(_cone_volume))
-cone_volume_hess = vmap(hessian(_cone_volume))
+# Cone volumes and their derivatives are written out by hand (torch.func's vmap/grad/hessian of _cone_volume give
+# the same numbers, but its overhead was ~20% of a Newton evaluation). V = x0 . (x1 x x2) / 6 per face (E, 3, 3).
+
+def cone_volume(xe):
+    return (xe[:, 0] * torch.linalg.cross(xe[:, 1], xe[:, 2])).sum(-1) / 6.0
+
+
+def cone_volume_grad(xe):
+    """dV/dx (E, 3 nodes, 3): dV/dx0 = x1 x x2 / 6 and cyclic."""
+    x0, x1, x2 = xe[:, 0], xe[:, 1], xe[:, 2]
+    return torch.stack((torch.linalg.cross(x1, x2), torch.linalg.cross(x2, x0), torch.linalg.cross(x0, x1)), 1) / 6.0
+
+
+def _levi_civita(v):
+    """eps_ijk v_k (E, 3, 3)."""
+    z = torch.zeros_like(v[:, 0])
+    return torch.stack((torch.stack((z, v[:, 2], -v[:, 1]), -1),
+                        torch.stack((-v[:, 2], z, v[:, 0]), -1),
+                        torch.stack((v[:, 1], -v[:, 0], z), -1)), 1)
+
+
+def cone_volume_hess(xe):
+    """d2V/dx2 (E, 3, 3, 3, 3) indexed [node p, i, node q, j]: the (p, p+1) block is eps_ijk x_{p+2,k} / 6, the
+    (p+1, p) block its transpose (= minus it), diagonal blocks zero."""
+    H = xe.new_zeros(xe.shape[0], 3, 3, 3, 3)
+    for p in range(3):
+        q, r = (p + 1) % 3, (p + 2) % 3
+        B = _levi_civita(xe[:, r]) / 6.0
+        H[:, p, :, q, :] = B
+        H[:, q, :, p, :] = -B
+    return H
 
 _GAUSS_X, _GAUSS_W = np.polynomial.legendre.leggauss(16)
 

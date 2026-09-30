@@ -19,8 +19,8 @@ The shell energy is the sum of
     energy A * D/2 * (nu tr(dk)^2 + (1-nu) dk:dk). The psi dofs make this the Morley
     plate element, which converges independently of mesh orientation.
 
-Element gradients and Hessians come from torch.func (exact derivatives of the energy),
-which is what gives the Newton solver its consistent tangent.
+Element gradients and Hessians are exact derivatives of the energy (the Newton solver's consistent
+tangent): written out by hand for the membrane (`membrane_terms`), from torch.func for bending.
 """
 from functools import partial
 
@@ -59,6 +59,76 @@ def _svk_energy(xe, Dm_inv, A0, mu_t, lam_t, tension):
     E = 0.5 * (C - torch.eye(2, dtype=C.dtype, device=C.device))
     trE = E[0, 0] + E[1, 1]
     return A0 * (0.5 * lam_t * trE ** 2 + mu_t * (E * E).sum()) + tension * area
+
+
+def membrane_terms(xe, G, A0, material, mu_t, lam_t, tension, tangent=True):
+    """
+    Energy (E,), gradient (E, 9) and Hessian (E, 9, 9) or None of the membrane triangles, written out by hand
+    (the same values as torch.func on _neo_hookean_energy / _svk_energy, several times faster).
+
+    The deformation gradient's columns are f_alpha = sum_a G[a, alpha] x_a (G = rows of Dm_inv, g_0 = -g_1 - g_2),
+    and both energies are functions of s = (a, b, c) = (f0.f0, f1.f1, f0.f1), i.e. of C = [[a, c], [c, b]], with
+    J^2 = det C = ab - c^2 and area = A0 J:
+        neo-Hookean  A0 mu t/2 (a + b + 1/J^2 - 3)
+        SVK          A0 (lam t/8 (a + b - 2)^2 + mu t/4 ((a - 1)^2 + (b - 1)^2 + 2 c^2))
+    plus tension * A0 J. Chain rule: d psi/df = psi_s ds/df, d2psi/df2 = psi_s d2s/df2 + ds/df^T psi_ss ds/df.
+    """
+    f = torch.einsum("eaq,eai->eqi", G, xe)                     # (E, 2, 3)
+    f0, f1 = f[:, 0], f[:, 1]
+    a, b, c = (f0 * f0).sum(-1), (f1 * f1).sum(-1), (f0 * f1).sum(-1)
+    J2 = a * b - c * c
+    one = torch.ones_like(a)
+    zero = torch.zeros_like(a)
+
+    # psi(J2) part: k / J2 + tension A0 sqrt(J2)
+    kJ = 0.5 * A0 * mu_t if material == "neo_hookean" else zero
+    J = torch.sqrt(J2)
+    energy = kJ / J2 + tension * A0 * J
+    phi1 = -kJ / J2 ** 2 + 0.5 * tension * A0 / J
+    phi2 = 2.0 * kJ / J2 ** 3 - 0.25 * tension * A0 / (J2 * J)
+
+    # polynomial part in (a, b, c)
+    if material == "neo_hookean":
+        k = 0.5 * A0 * mu_t
+        energy = energy + k * (a + b - 3.0)
+        Ps = torch.stack((k, k, zero), -1)
+        Pss = None
+    else:
+        tr = a + b - 2.0
+        energy = energy + A0 * (lam_t / 8.0 * tr ** 2 + mu_t / 4.0 * ((a - 1) ** 2 + (b - 1) ** 2 + 2 * c * c))
+        Ps = torch.stack((A0 * (lam_t / 4.0 * tr + mu_t / 2.0 * (a - 1)),
+                          A0 * (lam_t / 4.0 * tr + mu_t / 2.0 * (b - 1)),
+                          A0 * mu_t * c), -1)
+        d, o = A0 * (lam_t / 4.0 + mu_t / 2.0), A0 * lam_t / 4.0
+        Pss = torch.stack((torch.stack((d, o, zero), -1),
+                           torch.stack((o, d, zero), -1),
+                           torch.stack((zero, zero, A0 * mu_t * one), -1)), 1)
+
+    Js = torch.stack((b, a, -2.0 * c), -1)                       # dJ2/ds
+    psi_s = Ps + phi1[:, None] * Js                              # (E, 3)
+    zf = torch.zeros_like(f0)
+    ds = torch.stack((torch.stack((2 * f0, zf), 1),              # ds/df (E, 3, 2, 3)
+                      torch.stack((zf, 2 * f1), 1),
+                      torch.stack((f1, f0), 1)), 1)
+    grad_f = torch.einsum("es,esqi->eqi", psi_s, ds)
+    grad = torch.einsum("eaq,eqi->eai", G, grad_f).reshape(-1, 9)
+    if not tangent:
+        return energy, grad, None
+
+    Jss = torch.tensor([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -2.0]], dtype=xe.dtype, device=xe.device)
+    psi_ss = phi1[:, None, None] * Jss + phi2[:, None, None] * Js[:, :, None] * Js[:, None, :]
+    if Pss is not None:
+        psi_ss = psi_ss + Pss
+    # psi_s d2s/df2 = S[q, r] delta_ij with S = [[2 psi_a, psi_c], [psi_c, 2 psi_b]]
+    S = torch.stack((torch.stack((2 * psi_s[:, 0], psi_s[:, 2]), -1),
+                     torch.stack((psi_s[:, 2], 2 * psi_s[:, 1]), -1)), 1)
+    GSG = torch.einsum("eaq,eqr,ebr->eab", G, S, G)               # (E, 3, 3) nodes x nodes
+    eye = torch.eye(3, dtype=xe.dtype, device=xe.device)
+    dsx = torch.einsum("eaq,esqi->esai", G, ds)                  # ds/dx (E, 3, 3 nodes, 3)
+    H = (GSG[:, :, None, :, None] * eye[None, None, :, None, :]).reshape(-1, 9, 9)
+    dsx = dsx.reshape(-1, 3, 9)
+    H = H + torch.einsum("esm,est,etn->emn", dsx, psi_ss, dsx)
+    return energy, grad, H
 
 
 def _edge_rotations(q, N0, etype, esign):
@@ -192,6 +262,7 @@ class Shell:
         self.nodal_area = tt(nodal_area)
         self.volume_origin = self.X.mean(dim=0)  # reference point for cone volumes (see fluid.py)
         self._Dm_inv = tt(np.linalg.inv(Dm))
+        self._G = torch.stack((-self._Dm_inv.sum(1), self._Dm_inv[:, 0], self._Dm_inv[:, 1]), 1)  # f = sum_a G[a] x_a
         self._N0 = tt(N0)
         self._bend_nodes = torch.as_tensor(bend_nodes, device=self.device)
         self._edge_id = torch.as_tensor(edge_id, device=self.device)
@@ -206,8 +277,8 @@ class Shell:
                                     3 * n_nodes + self._edge_id], dim=1)
 
         # Vectorised element kernels
-        mem = partial(energy_fn, mu_t=mu * t, lam_t=lam * t, tension=self.pretension)
-        self._mem_e, self._mem_g, self._mem_h = vmap(mem), vmap(grad(mem)), vmap(hessian(mem))
+        self._mem = dict(material=material, mu_t=mu * t, lam_t=lam * t, tension=self.pretension)
+        self._mem_e = vmap(partial(energy_fn, mu_t=mu * t, lam_t=lam * t, tension=self.pretension))  # reference
         self._bend_e = vmap(_bending_energy)
         self._bend_g = vmap(grad(_bending_energy))
         self._bend_h = vmap(hessian(_bending_energy))
@@ -309,11 +380,8 @@ class Shell:
         Yield (local_dofs (E, d), energy (E,), gradient (E, d), hessian (E, d, d) or None)
         for the membrane and bending element groups at the current state.
         """
-        args = (self.x[self.faces], self._Dm_inv, self.rest_area)
-        yield (self.face_dofs,
-               self._mem_e(*args),
-               self._mem_g(*args).reshape(-1, 9),
-               self._mem_h(*args).reshape(-1, 9, 9) if tangent else None)
+        yield (self.face_dofs, *membrane_terms(self.x[self.faces], self._G, self.rest_area, tangent=tangent,
+                                               **self._mem))
 
         if self.bending:
             args = (self._bend_q(self.x, self.psi), self._N0, self._edge_type, self._edge_sign, self._phi0, self._M)
@@ -326,7 +394,7 @@ class Shell:
         """Move all tensors to another device."""
         self.device = torch.device(device)
         for name in ("X", "x", "psi", "faces", "fixed", "fixed_dofs", "rest_area", "nodal_area", "volume_origin",
-                     "_Dm_inv", "_N0", "_bend_nodes", "_edge_id", "_edge_type", "_edge_sign", "_M",
+                     "_Dm_inv", "_G", "_N0", "_bend_nodes", "_edge_id", "_edge_type", "_edge_sign", "_M",
                      "face_dofs", "bend_dofs") + (("_phi0",) if self.bending else ()):
             setattr(self, name, getattr(self, name).to(self.device))
         return self

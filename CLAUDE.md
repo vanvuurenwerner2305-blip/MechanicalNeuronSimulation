@@ -11,7 +11,7 @@ equilibrium with Newton–Raphson**. It replaced the explicit-dynamics 2D code i
 (`simulation.py` + notebooks — legacy context only, not maintained).
 
 GitHub remote `origin` = https://github.com/vanvuurenwerner2305-blip/MechanicalNeuronSimulation.git
-(pushed on the user's request, last 2026-09-29 — ask before pushing again). The global git user.name is the placeholder
+(pushed on the user's request, last 2026-09-30, commit 962fd4f — ask before pushing again). The global git user.name is the placeholder
 "Your Name"; commits use the configured identity. Files in `cad_models/` are the user's — do not
 commit/modify them unless asked.
 
@@ -35,7 +35,8 @@ PyQt5, matplotlib, `gmsh` pip-installed). Windows.
 `membrane_sim/` — solver core, usable without the GUI (units are whatever the caller uses; the app uses mm, N, MPa):
 - `shell.py` — triangles: large-strain membrane (incompressible neo-Hookean or SVK) + Morley bending
   (one mid-edge rotation dof per edge; the naive "average face normal" hinge model was mesh-orientation
-  dependent and was replaced). Energies per element; gradients/Hessians via `torch.func` (exact tangent).
+  dependent and was replaced). Energies per element, exact gradients/Hessians: membrane triangles by hand
+  (`membrane_terms`, chain rule through s = (f0.f0, f1.f1, f0.f1)), bending via `torch.func`.
 - `fluid.py` — `FluidVolume`: pressure as a function of ΔV only. ΔV comes from the moving shells alone
   (cone volumes; valid because shell boundary nodes are pinned), so chamber walls are never meshed.
   Laws: linear `P0 - K dV`, native ideal gas (`gas_volume`, isothermal, infinite energy if gas → 0),
@@ -49,9 +50,14 @@ PyQt5, matplotlib, `gmsh` pip-installed). Windows.
   Contact queries use exact candidate (Verlet) lists: `CachedSignedDistance` (rigid, per shell in the
   solver, skin = max(reach, 1% model size)) and `ShellContact._pairs_within` (sheet pairs, skin = h);
   `safe_step` skips pairs whose bbox lower bound cannot limit the step. NeuronTest 29.8 s -> 19.5 s,
-  identical iterations; profile now led by `shell.element_terms` (torch.func, ~40%).
-  Speed notes: ~3.4k dofs, so CUDA (launch overhead) and a C++ rewrite are not worth it; next wins
-  are hand-coded CST neo-Hookean gradient/Hessian and letting load increments grow past 1/load_steps.
+  identical iterations.
+  **Hand-coded derivatives (2026-10-01)**: membrane CST (`shell.membrane_terms`, neo-Hookean + SVK + tension) and
+  cone volumes (`fluid.cone_volume_grad/_hess`) replaced torch.func vmap/grad/hessian (tests compare them with
+  torch.func to 1e-10). Profiled solve on linked NeuronTest 22.1 -> 10.6 s (element terms 8.5 -> 1.1 s, volume terms
+  4.2 -> 0.6 s); grids: 12-pt 43 -> 38 s, 17-pt axis 33 -> 27 s, 9x5 88 -> 65 s (cProfile overstated the old cost).
+  The profile is now led by contact (rigid signed distance, sheet `safe_step`/terms/_pairs_within).
+  Speed notes: ~3.4k dofs, so CUDA (launch overhead) and a C++ rewrite are not worth it; next wins:
+  multiprocessing grid points, contact off + penetration check, bending by hand (Shell role only).
 - `solver.py` — `NewtonSolver.evaluate()` assembles energy, residual, sparse tangent; closed chambers add
   dense rank-1 terms `c g gᵀ` handled by Sherman–Morrison–Woodbury (`_Tangent`). `newton()`: Newton step
   with **second-order volume correction** (SOC) → LM-damped steps → Jacobi-preconditioned gradient step;
@@ -150,8 +156,11 @@ on the same axis (`get_state`/`set_state` = every body's unknowns); if that fail
 from rest. Measured on NeuronTest+ActivationTest (2026-09-30): 12-pt 3x2x2 grid 58 s (2 ramp steps) -> 43-45 s;
 9x5 pressure grid 111 s (one step) -> 88 s with prediction; smooth region 3 -> 2 Newton its/point. Choosing between the
 prediction and the neighbour by lowest residual was tried and was worse (98 s: residual misjudges the guesses).
-Cost is dominated by the first ~4 kPa (slack membrane + contact onset: 10-25 its/point at any step size; ~0.3 s/it);
-past that 2-3 its/point, so dense axes are cheap (16x the points for 3x the time). `apply_parameter` changes P0 / gas volume / bulk
+Cost is dominated by the first ~4 kPa (slack membrane, NOT contact: identical iteration counts with contact off; 10-25 its/point at any step size; ~0.3 s/it);
+past that 2-3 its/point, so dense axes are cheap (16x the points for 3x the time).
+Contact cost (2026-09-30, NeuronTest linked, 0-20 kPa): nothing touches anything (results identical to 1e-4 mm with
+contact off), yet contact costs ~30% (8-point sweep 15.3 s all contact / 13.4 s no sheet contact / 10.7 s none; one
+evaluation 0.152 / 0.144 / 0.126 s). Element terms (torch.func vmap) dominate an evaluation. `apply_parameter` changes P0 / gas volume / bulk
 stiffness / liquid volume on the built FluidVolume (no rebuild). `run_points` (1-2 pressures, rows with a/b) wraps it.
 `make_dataset` → `project.characterisation` (saved in the .mfn; values per key as JSON lists in grid C-order, null =
 not solved; converged, extrapolated, complete, `fingerprint` = sha1 of the neuron dict minus swept fields/visible/design

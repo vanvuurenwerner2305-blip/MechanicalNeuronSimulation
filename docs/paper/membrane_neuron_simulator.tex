@@ -481,13 +481,40 @@ distance already satisfies the bound are skipped without computing the exact dis
 
 Every energy above is written as a function of one element's coordinates: a membrane triangle
 (9 values), a bending stencil (the triangle, its three opposite nodes and three edge rotations:
-21 values), a pressure face (9), or a sheet-contact pair (12). The gradient and Hessian of each
-element energy are obtained by automatic differentiation with \code{torch.func} (\code{grad},
-\code{hessian}, vectorised over the elements with \code{vmap}) \cite{paszke2019}. The residual and
-tangent are therefore the \emph{exact} derivatives of the discrete energy, which gives quadratic
-Newton convergence without hand-derived tangent matrices. A test compares them with finite
-differences of $\Pi$ (\code{test\_residual\_is\_energy\_gradient\_and\_tangent\_is\_its\_jacobian}).
-Everything is computed in double precision.
+21 values), a pressure face (9), or a sheet-contact pair (12). The residual and tangent are the
+\emph{exact} gradient and Hessian of the discrete energy, which gives quadratic Newton
+convergence. For the bending stencils, contact pairs and cap fans they are obtained by automatic
+differentiation with \code{torch.func} (\code{grad}, \code{hessian}, vectorised over the elements
+with \code{vmap}) \cite{paszke2019}.
+
+The two most frequent elements, the membrane triangle and the pressure face, are differentiated
+by hand, because the overhead of automatic differentiation made them most of the cost of an
+evaluation. With $\mathbf{G}=[\vect{g}_0;\vect{g}_1;\vect{g}_2]\in\mathbb{R}^{3\times2}$ the rows
+$\vect{g}_1,\vect{g}_2$ of $\mathbf{D}_m^{-1}$ and $\vect{g}_0=-\vect{g}_1-\vect{g}_2$, the columns of
+$\mathbf{F}$ are $\vect{f}_\alpha = \sum_a G_{a\alpha}\,\x_a$, and both membrane energies are
+functions of $\vect{s}=(a,b,c)=(\vect{f}_0\cdot\vect{f}_0,\ \vect{f}_1\cdot\vect{f}_1,\
+\vect{f}_0\cdot\vect{f}_1)$, i.e.\ of $\mathbf{C}=\bigl[\begin{smallmatrix}a&c\\c&b\end{smallmatrix}\bigr]$,
+with $\det\mathbf{C}=ab-c^2$ and $A=A_0\sqrt{\det\mathbf{C}}$. The chain rule gives
+\begin{equation}
+\frac{\partial U}{\partial\vect{f}} = \sum_s U_{,s}\,\frac{\partial s}{\partial\vect{f}},\qquad
+\frac{\partial^2 U}{\partial\vect{f}^2} = \sum_s U_{,s}\,\frac{\partial^2 s}{\partial\vect{f}^2}
++ \sum_{s,r} U_{,sr}\,\frac{\partial s}{\partial\vect{f}}\otimes\frac{\partial r}{\partial\vect{f}},
+\end{equation}
+with $\partial a/\partial\vect{f}=(2\vect{f}_0,\vect{0})$, $\partial b/\partial\vect{f}=(\vect{0},2\vect{f}_1)$,
+$\partial c/\partial\vect{f}=(\vect{f}_1,\vect{f}_0)$ and constant second derivatives, and it is
+mapped to the nodes by $\partial\vect{f}_\alpha/\partial\x_a = G_{a\alpha}\I$. For a pressure face
+$V=\tfrac16\,\x_0\cdot(\x_1\times\x_2)$,
+\begin{equation}
+\frac{\partial V}{\partial\x_0} = \tfrac16\,\x_1\times\x_2 \ \text{(and cyclic)},\qquad
+\Bigl[\frac{\partial^2 V}{\partial\x_p\,\partial\x_{p+1}}\Bigr]_{ij} = \tfrac16\,\varepsilon_{ijk}\,x_{p+2,k},
+\end{equation}
+the diagonal blocks being zero and the Hessian symmetric. Tests check both against
+\code{torch.func} to round-off. On the user's test neuron (2848 unknowns) this halved the cost of an
+evaluation; a $9\times5$ characterisation grid (Section~\ref{sec:fullneuron}) went from 88\,s to
+65\,s with identical iterations. A further test compares the assembled residual and tangent with
+finite differences of $\Pi$
+(\code{test\_residual\_is\_energy\_gradient\_and\_tangent\_is\_its\_jacobian}). Everything is
+computed in double precision.
 
 The element contributions are assembled into a sparse matrix, and the rows and columns of fixed
 unknowns are dropped. The chamber terms $P_v'\g_v\g_v^{\mathsf T}$ of
