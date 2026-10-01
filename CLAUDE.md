@@ -19,7 +19,9 @@ commit/modify them unless asked.
 
 ```
 python run_app.py [file.step | project.mns | design.mad]   # GUI (or double-click "Membrane Neuron Simulator.bat" / desktop shortcut)
-python -m pytest tests                          # ~85 tests, ~10 min (solver benchmarks + app pipeline + activation)
+python -m pytest tests                          # ~95 tests, ~13 min (solver benchmarks + app pipeline + activation + API)
+python -m mns_api help                          # the headless command line (run inside a study folder; see agent/MANUAL.md)
+python -m mns_api new-study <folder> --from cad_models/full_neuron.mfn   # a study for the design agent
 python -m pytest tests/test_app.py -k ghost     # single test
 python examples/make_neuron_step.py             # writes examples/soft_neuron.step (named test assembly)
 python examples/make_activation_step.py         # writes examples/squeeze_valve.step (round-tube valve: TubeFluid, InletFluid, OutletFluid)
@@ -303,6 +305,38 @@ ghost volume (blue, darker = more liquid), Closed incompressible = linear law wi
 % ΔV (purple, default 10 at user's request; ≥1000 behaves like water's 22000 but solves slower),
 Vent (0 kPa, transparent). Membrane default E = 0.5 MPa.
 Thickness is measured from CAD when a role is assigned.
+
+**Agent API and design studies** (user, 2026-10-01: "build a full api ... a button that opens a command line ...
+start up a claude model ... not allowed to write code, only use the software ... user manual ... create designs and
+explore a design space ... a latex report per design and a general report"). "No code" means no ad-hoc scripts; the agent
+may write design files and LaTeX. Plan agreed in the session; all three spaces from the start; studies start from the
+user's brief.md + demo files.
+- `mns_api/` (Qt-free; `python -m mns_api` = `mns_api.cli`): every command prints ONE JSON line on the real stdout;
+  the CLI dup2's fd 1/2 to `<study>/.mns/cli.log` first (OCC/gmsh print at C level). Paths in output are made relative
+  to the study. `study.py` (Study/Design, folders `designs/<N|A|F###>_<name>/`, state.json, derive), `cadspec.py`
+  (design-file CAD -> gmsh OCC -> STEP with product names via the same regex trick as the examples; loose 0-2D
+  construction entities must be removed or they are written as extra products; `geometry_report` = overlaps by
+  intersecting copies + touching via `occ.getDistance`), `model.py` (roles/props with aliases validated against
+  `SPACE_ROLE_FIELDS`, build_design, `fill_measured` = GUI's _detect_thickness, preview.npz for the GUI, imports of
+  .mns/.mad/.mfn/.step; activation results are kept on import), `ops.py` (check/solve/sweep/fit, dpsweep, full
+  solve/characterise; results/, plots, renders, state metrics), `render.py` (offscreen PyVista multi-view PNG with
+  labels), `plots.py` (matplotlib, fixed palette), `report.py` (generated auto_*.tex + agent-written narrative.tex,
+  pdflatex twice; needs xcolor for hyperref colours), `jobs.py` (--background re-runs the CLI as a detached process,
+  CREATE_BREAKAWAY_FROM_JOB with fallback; `mns wait` polls status.json), `events.py` (events.jsonl, progress/<job>.json,
+  live/<design>.npz), `workspace.py` (new study: agent files, `.mns/bin/mns` (Git Bash) + `mns.cmd` bound to
+  sys.executable, start_agent.cmd). Light commands (status, design list/show) import no torch/gmsh: < 0.4 s; model
+  commands ~5 s start-up.
+- `app/sweep_core.py`: run_sweep, weights, equation fit/LaTeX/CSV moved out of the Qt dialog (sweep.py delegates);
+  `worker.wants_coords` adds deformed sheets to sweep rows (live view). `app/meshview.py`: Qt-free display meshes
+  (viewport re-exports them).
+- `app/study_window.py` (4th tab "Design study"): polls events/progress/live files every 0.7 s, follow mode, preview
+  meshes, pictures; New study runs `python -m mns_api new-study` in a QProcess; Start agent = `wt.exe -d <study> cmd /k
+  start_agent.cmd`. It never controls the agent.
+- `agent/` CLAUDE.md, MANUAL.md, settings.json ({SIMULATOR} filled in), brief_template.md, copied into each study
+  (`workspace.refresh_agent_files` updates an existing study). Verified with `claude -p` (haiku): deny rules block
+  python and *.py writes; **Claude Code ignores Write(...) rules (Edit(...) covers all edits)**; allow rules only apply
+  after the folder's trust dialog was accepted (first interactive start).
+- Tests: `tests/test_api.py` (9 tests, ~3 min, runs the CLI as a subprocess on a temp study).
 
 `docs/paper/membrane_neuron_simulator.tex` (+ compiled PDF) — technical reference of the whole formulation,
 linked from the thesis instead of describing the simulator there (user, 2026-09-29). **Keep it in sync when the

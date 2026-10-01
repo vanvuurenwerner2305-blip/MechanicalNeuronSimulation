@@ -8,10 +8,14 @@ Top-level window with the two spaces of the software, each a full window of its 
                                 tube (ActivationWindow), saved as a design (*.mad).
   Full neuron                 - both imported and linked (FullNeuronWindow): the design's membrane replaces a
                                 neuron membrane; fluid parameters, recording, sweeps; saved as *.mfn.
+  Design study                - a study folder worked on by the design agent through the mns command line,
+                                followed live (StudyWindow); the agent is started from here.
 
 Each space keeps its own CAD model and project. The inactive space is hidden, so its keyboard
 shortcuts (the same keys in both) do not clash.
 """
+from pathlib import Path
+
 from qtpy.QtCore import Qt
 from qtpy.QtWidgets import QMainWindow, QTabWidget
 
@@ -20,8 +24,10 @@ from .activation_window import ActivationWindow
 from .full_neuron import SUFFIX as FULL_SUFFIX
 from .full_neuron_window import FullNeuronWindow
 from .main_window import APP_NAME, MainWindow
+from .study_window import StudyWindow
 
-NEURON_TAB, ACTIVATION_TAB, FULL_TAB = "Inputs → pre-activation", "Pre-activation → activation", "Full neuron"
+NEURON_TAB, ACTIVATION_TAB, FULL_TAB, STUDY_TAB = ("Inputs → pre-activation", "Pre-activation → activation",
+                                                 "Full neuron", "Design study")
 
 
 class AppWindow(QMainWindow):
@@ -32,9 +38,12 @@ class AppWindow(QMainWindow):
         self.neuron = MainWindow()
         self.activation = ActivationWindow()
         self.full = FullNeuronWindow()
+        self.study = StudyWindow()
+        self.study.open_design.connect(self.open_path)
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
-        for window, title in ((self.neuron, NEURON_TAB), (self.activation, ACTIVATION_TAB), (self.full, FULL_TAB)):
+        for window, title in ((self.neuron, NEURON_TAB), (self.activation, ACTIVATION_TAB), (self.full, FULL_TAB),
+                              (self.study, STUDY_TAB)):
             window.setWindowFlags(Qt.Widget)   # embedded: menus, docks and toolbars stay inside the tab
             window.windowTitleChanged.connect(self._update_title)
             self.tabs.addTab(window, title)
@@ -49,7 +58,7 @@ class AppWindow(QMainWindow):
 
     @property
     def spaces(self):
-        return (self.neuron, self.activation, self.full)
+        return (self.neuron, self.activation, self.full, self.study)
 
     def current(self):
         return self.tabs.currentWidget()
@@ -65,7 +74,10 @@ class AppWindow(QMainWindow):
         """Open a STEP file in the current space, a .mns project in the neuron space or a design in the
         activation-function space."""
         lower = str(path).lower()
-        if lower.endswith(FULL_SUFFIX):
+        if lower.endswith("study.json") or (Path(path) / "study.json").exists():
+            self.show_space(self.study)
+            self.study.open_study(Path(path).parent if lower.endswith("study.json") else path)
+        elif lower.endswith(FULL_SUFFIX):
             self.show_space(self.full)
             self.full.open_project(path)
         elif lower.endswith(DESIGN_SUFFIX):
@@ -74,7 +86,7 @@ class AppWindow(QMainWindow):
         elif lower.endswith(".mns"):
             self.show_space(self.neuron)
             self.neuron.open_project(path)
-        elif self.current() is not self.full:
+        elif self.current() not in (self.full, self.study):
             self.current().open_step(path)
         else:
             self.show_space(self.neuron)

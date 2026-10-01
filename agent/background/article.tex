@@ -1,0 +1,1315 @@
+% Developing a Feasible Neuroplastic Mechanical Neuron in the Domain of Soft Robotics
+% LaTeX version of WernerM-Article2.docx (converted 2026-10-01).
+% Build: pdflatex main && bibtex main && pdflatex main && pdflatex main
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage[margin=25mm]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage[font=small,labelfont=bf]{caption}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta}
+\usepackage{booktabs}
+\usepackage[hidelinks]{hyperref}
+\usepackage[capitalise,nameinlink]{cleveref}
+\usepackage{titlesec}
+\usepackage[title]{appendix}
+
+\numberwithin{equation}{section}
+\setcounter{secnumdepth}{4}
+\titleformat{\paragraph}{\normalfont\normalsize\itshape}{\theparagraph}{1em}{}
+\titlespacing*{\paragraph}{0pt}{2ex plus 0.5ex minus 0.2ex}{1ex}
+
+\newcommand{\Wsum}{\textstyle\sum_{j} W_j + W_b + W_0}   % common denominator
+\newcommand{\pin}{p_{\mathrm{in}}}
+\newcommand{\pout}{p_{\mathrm{out}}}
+\newcommand{\patm}{p_{\mathrm{atm}}}
+\newcommand{\plow}{p_{\mathrm{low}}}
+\newcommand{\phigh}{p_{\mathrm{high}}}
+\newcommand{\pth}{p_{\mathrm{th}}}
+\newcommand{\R}{\mathbb{R}}
+
+% Labelled figure: the image with TikZ labels placed in image coordinates (0..1 in x and y)
+\newenvironment{labelledimage}[2][]{%
+  \begin{tikzpicture}[#1]
+  \node[anchor=south west, inner sep=0] (img) {\includegraphics[width=#2]{\labelledfile}};
+  \begin{scope}[x={(img.south east)}, y={(img.north west)},
+                lab/.style={font=\small, align=center, fill=white, fill opacity=0.85, text opacity=1,
+                            rounded corners=1pt, inner sep=2pt},
+                pin/.style={-{Stealth[length=2mm]}, thick}]}
+  {\end{scope}\end{tikzpicture}}
+\newcommand{\labelledfile}{}
+
+\title{Developing a Feasible Neuroplastic Mechanical Neuron\\in the Domain of Soft Robotics}
+\author{W.\,J. van Vuuren}  % TODO: co-authors and affiliation
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Onboard computation remains one of the open problems of soft robotics. This article develops a mechanically
+feasible neuron that can serve as the building block of a neuroplastic mechanical neural network. Taking the
+organisation of the biological neuron as inspiration, the proposed neuron encodes information in fluid pressure:
+input pressures act on flexible membranes that bound a sealed activation chamber, so that the inputs are integrated
+into a single field-based activation pressure without being consumed, and a pressure-controlled pneumatic valve
+converts this activation pressure into a nonlinear output signal. The equilibrium of the membranes shows that the
+activation pressure is a compliance-weighted combination of the input pressures, in which the mechanical weight of
+each input is the ratio of its membrane area to its volumetric stiffness. Two mechanisms for changing these weights
+after fabrication are proposed: limiting the deformation path of the membrane, and tuning the bulk modulus of an
+intermediate fluid between two membranes. The sensitivity of the activation pressure to the chamber compliance, the
+weight membranes, a bias membrane and the input pressures is derived. When the membrane stiffnesses are constant,
+the neuron is exactly an artificial neuron, a weighted sum with a bias followed by a sigmoid, with weights that are
+non-negative and, together with the bias and chamber weights, sum to one; the reachable hyperplanes therefore all
+contain the equal-pressure diagonal, whose crossing point is set by the bias pressure. With deformation-dependent
+stiffness, the neuron becomes a nonlinear, state-dependent computational element of which the artificial neuron is
+a special case.
+\end{abstract}
+
+% =====================================================================================================================
+\section{Introduction}
+% =====================================================================================================================
+
+\subsection{Background}
+
+One of the remaining frontiers in soft robotics is the development of robust onboard computation and control. A
+compelling long-term goal in this field is the creation of a fully mechanical robot capable of intelligent agency: a
+system that can sense its environment, interact with it, and adapt autonomously based on those
+interactions~\cite{rus2015soft}.
+
+Nature has already achieved this through neural systems. Although biological organisms contain many forms of
+computation, the brain remains the most sophisticated example of an integrated computational kernel. It is the
+central neural network that underlies animal agency, and it is built from neural networks composed of simple
+computational units known as neurons. In isolation, a single neuron is a modest computational element, but when
+many neurons are interconnected, complex behaviour emerges. This broader principle, where intricate global
+structure arises from the interaction of simple local rules, is widely observed in nature. Stephen Wolfram has
+similarly speculated that physical reality itself may arise from repeated application of simple computational
+rules, as developed in \emph{A New Kind of Science}~\cite{wolfram2002}.
+
+The human brain contains more than 100~billion neurons, with each neuron potentially connecting to up to
+10\,000 other neurons and passing signals through as many as 100~trillion synaptic
+connections~\cite{zhang_neurons,stevens1979}. This vast network of interactions is one of the reasons the human
+brain exhibits such remarkable computational capacity.
+
+For this reason, there is a strong need to develop a mechanical neuron that can serve as a foundational building
+block for mechanical neural networks (MNNs). Such a device would not merely mimic neural structure superficially; it
+would need to support reprogrammable behaviour so that the resulting MNN could continue learning, adapting, and
+reorganising in response to its environment. A true neuroplastic mechanical neuron would therefore provide the basis
+for autonomous mechanical systems that do not simply react but evolve their responses over time.
+
+\subsection{Objective and scope}
+
+The objective of this work is to develop and characterise a mechanically feasible neuron that can serve as a
+foundational building block for future neuroplastic mechanical neural networks. The proposed neuron is developed
+from the physical organisation and functional roles of a biological neuron, with pressure-based mechanical systems
+used to reproduce the processes of signal reception, integration, activation, and transmission. The intention is
+therefore not to reproduce a biological neuron in its entirety, but to use its physical organisation as inspiration
+for a mechanically feasible computational architecture.
+
+The mechanical behaviour of the proposed neuron is subsequently formulated mathematically to establish how its
+physical parameters determine its computational response. In particular, the analysis considers the mechanical
+integration of multiple input pressures, the influence of membrane stiffness and geometry on the resulting
+activation pressure, and the conversion of this activation into a nonlinear output. The ability to alter the
+mechanical parameters responsible for input weighting is also investigated, providing a physical basis for
+modifying the computational behaviour of the neuron after fabrication.
+
+The resulting mechanical formulation is further related to the conventional artificial neuron. When the relevant
+membrane stiffnesses are assumed to remain constant through deformation, the mechanical equilibrium can be
+rearranged into a weighted-sum form with a bias term, and the nonlinear output relationship gives the corresponding
+artificial-neuron formulation. This result provides a direct mathematical interpretation of the proposed mechanical
+neuron in terms of an artificial neural-network neuron. However, constant stiffness represents a restricted case of
+the more general mechanical system. Since membrane stiffness can vary with deformation, the effective mechanical
+weights may themselves depend on the state of the neuron. The general formulation therefore describes a nonlinear,
+state-dependent neural computation element, of which the conventional artificial neuron is a special case.
+
+Finally, the mechanically adjustable parameters of the proposed architecture are considered in the context of
+future neuroplasticity. This work does not implement an autonomous learning rule or demonstrate a complete
+neuroplastic mechanical neural network. Rather, it establishes the mechanically reconfigurable neuron required as a
+physical foundation for such a system. The development therefore progresses from biological inspiration to a
+mechanically feasible architecture, from mechanical behaviour to its mathematical computational representation, and
+finally to the reconfigurability required for future neuroplastic mechanical computation.
+
+% =====================================================================================================================
+\section{The neuron}
+% =====================================================================================================================
+
+\subsection{Neuron anatomy}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.85\textwidth]{figures/neuron_anatomy.png}  % TODO: image credit if made with BioRender
+  \caption{Anatomy of a biological neuron. The neuron consists of dendrites, which receive input signals from other
+    neurons; the soma (cell body), where inputs are integrated; the axon, which transmits electrical signals to other
+    neurons; and the synapse, where the axon communicates with the dendrites or soma of neighbouring neurons through
+    chemical or electrical signals.}
+  \label{fig:anatomy}
+\end{figure}
+
+This study focuses on the standard biological neuron and its major components, although alternative neuron
+topologies exist. As illustrated in \cref{fig:anatomy}, a typical neuron consists of a soma, dendrites, a single
+axon, and synapses~\cite{zhang_neurons}. While signal transmission in biological neurons is electrochemical in
+nature, this work primarily focuses on the computational aspect of information processing (the kernel) rather than
+the underlying mechanics.
+
+Inputs to a neuron are received by the dendrites from other neurons. The dendrites process and integrate these
+inputs through local computations~\cite{zhang_neurons,stevens1979}, which may involve complex interdependent
+nonlinear interactions~\cite{london2005,beniaguev2021,tranvanminh2015,larkum2022}. These interactions are integrated
+into a single value in the soma, which determines the neuron's response. When this integrated signal exceeds a
+certain threshold, the neuron generates an action potential, a binary-like signal corresponding to a ``fire'' or
+``no-fire'' state. This action potential then propagates along the axon to the synapses, which interface with the
+dendrites of downstream neurons, allowing the signal to traverse the network~\cite{zhang_neurons,stevens1979}.
+
+Although the magnitude of a neuron's action potential is effectively binary, the information it conveys is not
+necessarily so. Neurons can encode information through temporal dynamics, most notably rate coding, in which signal
+intensity is represented by the frequency of action potentials rather than their
+amplitude~\cite{larkum2022,afshar2014,izhikevich2003}. This type of neural signalling is analogous to pulse-width or
+pulse-frequency modulation: the information is not encoded in the spike magnitude but in the firing rate or spike
+timing. As a result, rich, continuous information processing emerges from sequences of discrete, all-or-nothing
+events.
+
+From this perspective, the fundamental operations of a neuron can be conceptualised as a sequence of systematic
+stages: input reception via synaptic--dendritic connections; dimensional collapse through inter-dendritic
+computation into a unified neuronal activation within the soma; propagation of the resulting action potential along
+the axon; and finally, transmission of this signal through synaptic connections to downstream neurons.
+
+Accordingly, a neuron can be viewed as a system that receives multiple input signals, combines them into a single
+activation through a parametric, potentially interdependent nonlinear relationship, and transmits the resulting
+activation signal to the inputs of other neurons.
+
+\subsection{Biological neural signal transmission}
+
+Biological neurons transmit information through two complementary physical substrates, transport and field, that
+operate in sequence across neuronal compartments. In dendrites, signalling is predominantly transport-based:
+synaptic inputs open ion channels and generate local ionic currents that propagate through the cytoplasm toward the
+soma, so information is conveyed by the movement of charge along dendritic cable-like structures~\cite{rall1994}.
+
+As these currents reach the soma, the neuron shifts into a field-based regime of integration. In this regime,
+changes in membrane potential regulate voltage-gated channels and conductances, enabling the cell to combine
+multiple inputs through a local electrical state rather than through long-range ionic transport across the entire
+compartment~\cite{koch2001,hodgkin1952}. This is the crucial computational step: the neuron does not simply pass the
+input through unchanged but converts it into an internal state that determines whether and how an output will be
+generated.
+
+At chemical synapses, the process reverses. Depolarisation of the presynaptic membrane triggers vesicle fusion and
+neurotransmitter release, which then diffuses across the cleft and produces transport-based ionic currents in the
+postsynaptic cell~\cite{sudhof2013}. In this way, the neuron transforms an incoming transport-based signal into a
+field-mediated internal response, and then back into a transport-based output.
+
+This separation of transport-based sensing, field-mediated integration, and transport-based output is especially
+important for mechanical neuron design because it enables non-destructive signal processing. The input is not
+consumed by the act of computation; rather, it is sampled and transformed into a local state that can drive an
+output response while preserving the integrity of the upstream signalling pathway. For artificial systems, this
+distinction addresses a central engineering challenge: how to build a neuron that can compute on incoming
+information without exhausting or destroying the signal that carries it.
+
+\subsection{Neural plasticity}
+
+Neural plasticity refers to the ability of a neuron to adapt by updating its internal parameters. In biological
+neural networks, plasticity is a persistent and ongoing process: synaptic strengths are continuously modified as
+organisms learn, adapt, and refine internal models of the world. This continual adaptation allows biological
+systems to remain responsive to changing environments rather than converging to a fixed functional
+state~\cite{demarin2014,mundkur2005}.
+
+MNNs can be broadly classified according to their degree of neural plasticity. The first class comprises non-plastic
+MNNs, in which the network parameters are determined prior to fabrication, often through analytical design,
+numerical optimisation, or simulation, and are immutable once the system is manufactured. Such systems perform
+computation through their mechanical structure but lack the ability to adapt or learn after deployment.
+
+The second class consists of neuroplastic MNNs, in which network parameters can be modified after fabrication.
+Within this class, further distinctions can be made based on the mechanism by which plasticity is achieved.
+Mechanically neuroplastic MNNs implement parameter updates entirely through mechanical processes, enabling
+adaptation without external domain intervention; the mechanical kernel itself is then solely responsible for the
+parameter updating. In contrast, hybrid neuroplastic MNNs retain a mechanically embodied network structure but rely
+on external systems to compute and apply parameter updates.
+
+Representative examples of hybrid neuroplastic MNNs include architected materials that learn
+behaviours~\cite{lee2022}, in which the mechanical network structure is adapted through electromechanical actuation,
+and \emph{Beyond Silicon}~\cite{vanvuuren2025}, where parameter updates to the mechanical network are performed
+manually.
+
+% =====================================================================================================================
+\section{Development of a mechanically feasible neuron}
+% =====================================================================================================================
+
+This section develops a conceptual mechanically feasible neuron by first defining the admissible design space and
+the functional requirements imposed on the physical system. The design is initially formulated in an
+implementation-agnostic manner, after which a topology inspired by the biological neuron is introduced. The
+resulting model is then characterised mathematically to determine how its parameters influence signal transmission,
+integration, thresholding, and plasticity.
+
+\subsection{Design-space definition}
+
+Before considering the physical structure of a mechanical neuron, it is necessary to define its computational
+behaviour. Rather than prescribing a specific mechanical implementation, this definition establishes the minimum
+computational requirements any proposed neuron must satisfy. Because signal processing in embodied systems relies
+directly on physical mechanisms, computational and physical constraints are intrinsically interconnected.
+
+The neuron is treated as a computational unit that receives multiple inputs, combines them according to a
+parameter-dependent rule, and produces an output signal. A given neuron $i$ receives an input vector
+\begin{equation}
+  \vec{x}_i \in \R^{n_i},
+  \label{eq:input-vector}
+\end{equation}
+where $n_i$ is the number of incoming signals. These inputs are received as transport-based signals, which are
+transformed into a field-based scalar activation signal according to
+\begin{equation}
+  z_i = \sigma_i\bigl(f_i(\vec{x}_i, \bm{\theta}_i)\bigr) \in \R .
+  \label{eq:neuron-map}
+\end{equation}
+In this expression, $f_i(\cdot, \bm{\theta}_i)$ represents the internal input-processing operation of the neuron.
+It maps the $n_i$-dimensional transport-based input signal vector to a single field-based scalar quantity. The
+parameter vector
+\begin{equation}
+  \bm{\theta}_i \in \Theta \subset \R^{p}
+  \label{eq:parameters}
+\end{equation}
+contains the physical parameters that determine the behaviour of the neuron, which must be dynamically changeable
+or reconfigurable to support plasticity. The function $\sigma_i(\cdot)$ represents the activation operation, which
+maps the field-based scalar activation signal into a transport-based output signal via a nonlinear mapping to be
+transmitted downstream.
+
+\subsection{Biologically inspired mechanical neuron topology}
+
+\subsubsection{Information encoding and signalling}
+
+Computational information within the mechanical neuron is encoded in fluid pressure, with kernel operations
+performed through the manipulation of pressure states. In an enclosed fluidic system, pressure is transmitted
+through the substrate as a pressure field and does not require continuous fluid flow. This represents a field-based
+signalling substrate, in which the pressure state is determined by the conditions throughout the enclosed fluid
+volume. In a flow-based system, by contrast, the pressure depends on the dynamics of fluid moving through the
+substrate. The signal is therefore transmitted through the transport of fluid along a channel and represents a
+transport-based signalling substrate.
+
+\subsubsection{Input-to-activation kernel}
+
+\paragraph{Conceptual design of the flexible-membrane input interface}
+
+\begin{figure}[t]
+  \centering
+  \renewcommand{\labelledfile}{figures/input_interface.png}
+  \begin{labelledimage}{0.62\textwidth}
+    \node[lab] at (0.215, 0.5) {Input fluid\\chamber};
+    \node[lab] at (0.785, 0.5) {Input fluid\\chamber};
+    \node[lab] at (0.5, 0.5) {Activation\\chamber};
+    \node[lab] (m) at (0.5, 0.09) {Membrane};
+    \draw[pin] (m.west) -- (0.338, 0.27);
+    \draw[pin] (m.east) -- (0.649, 0.27);
+  \end{labelledimage}
+  \caption{Two-input configuration of the flexible-membrane input interface. Each input channel is separated from
+    the central activation chamber by a flexible membrane.}
+  \label{fig:input-interface}
+\end{figure}
+
+The input-to-activation stage of the neuron is implemented using flexible membranes that separate the input fluidic
+channels from a central activation chamber. The activation chamber is filled with a confined fluid, while each
+input channel conveys an externally generated pressure signal. Pressure applied within an input channel causes its
+corresponding membrane to deform, thereby transmitting a force to the fluid contained in the central chamber. The
+contributions from the individual input pressures are consequently combined through the mechanical interaction of
+the membranes and the activation fluid. The resulting pressure within the central chamber constitutes the neuron's
+scalar activation signal.
+
+\Cref{fig:input-interface} illustrates a two-input configuration of this mechanism. Changes in the input pressures
+alter the forces acting on the respective membranes, which in turn modify the pressure of the fluid contained within
+the activation chamber. The chamber pressure therefore provides a single internal state that reflects the combined
+influence of the input signals.
+
+This configuration also provides a natural means of achieving non-destructive signal processing. The input signals
+are supplied by pressure sources operating at a prescribed steady-state pressure with continuous flow through the
+input channels. In contrast, the fluid within the activation chamber is enclosed and does not flow into or out of
+the chamber during operation. The input pressures therefore influence the activation state through
+membrane-mediated force transmission, rather than through the transfer of fluid into the activation chamber. The
+input signals can consequently be processed without being consumed or directly altered by the activation
+mechanism.
+
+The proposed arrangement thus implements the first stage of the mechanical neuron's computational operation:
+multiple transport-based input signals are converted into a single field-based activation signal.
+
+\paragraph{Mathematical model of the flexible-membrane input interface}
+
+The following characterises the mechanical behaviour of the membranes and activation chamber and establishes how
+the input pressures determine the resulting chamber pressure.
+
+At equilibrium, each flexible membrane deforms until the elastic restoring force generated by its deformation
+balances the net pressure force acting across it. The pressure difference across a membrane is determined by the
+pressure in the corresponding input channel and the pressure in the central activation chamber.
+
+For membrane $j$, let $p_j$ denote the pressure in input channel $j$, $p_a$ the pressure in the activation chamber,
+and $\patm$ the atmospheric pressure. If $A_j$ is the effective area of the membrane and $F_j^{e}$ is its elastic
+restoring force, the equilibrium condition is
+\begin{equation}
+  F_j^{e} = (p_j - p_a)\,A_j .
+  \label{eq:membrane-equilibrium}
+\end{equation}
+This expression assumes a sign convention in which positive membrane deformation is produced by an input pressure
+greater than the activation-chamber pressure. More generally, the membrane equilibrium may be written as
+\begin{equation}
+  F_j^{e}(\delta_j) - (p_j - p_a)\,A_j = 0,
+  \label{eq:membrane-equilibrium-general}
+\end{equation}
+where $\delta_j$ is the equilibrium deformation of membrane $j$. The elastic force is therefore a function of
+deformation, and the deformation is determined implicitly by the pressure difference across the membrane.
+
+To relate membrane deformation to its restoring force, the deformation is represented in terms of the volume
+displaced by the membrane rather than its local displacement field. Let $\Delta V_j$ denote the volumetric
+deformation of membrane $j$, defined as the change in activation-chamber volume produced by its deformation. A
+volumetric stiffness $K_j$ can then be introduced to describe the resistance of the membrane to this deformation.
+The elastic restoring force is expressed as
+\begin{equation}
+  F_j^{e} = K_j(\cdot)\,\Delta V_j .
+  \label{eq:volumetric-stiffness}
+\end{equation}
+This represents a generalised stiffness relation, in which the stiffness may vary with the current volumetric
+deformation. Substituting it into the membrane equilibrium gives
+\begin{subequations}
+\begin{align}
+  K_j(\cdot)\,\Delta V_j &= (p_j - p_a)\,A_j, \label{eq:dv-a}\\
+  \Delta V_j &= \frac{(p_j - p_a)\,A_j}{K_j(\cdot)} . \label{eq:dv-b}
+\end{align}
+\end{subequations}
+Under the assumption that the activation fluid is incompressible and the chamber is sealed, the total change in
+fluid volume must be zero. Including the $m$ input membranes, the condition is
+\begin{equation}
+  \sum_{j=1}^{m} \Delta V_j = 0 .
+  \label{eq:volume-conservation}
+\end{equation}
+Substituting the membrane deformation relations gives
+\begin{equation}
+  \sum_{j=1}^{m} \frac{(p_j - p_a)\,A_j}{K_j(\cdot)} = 0 .
+  \label{eq:volume-balance}
+\end{equation}
+For constant effective stiffnesses, solving for the activation-chamber pressure yields
+\begin{equation}
+  p_a = \frac{\displaystyle\sum_{j=1}^{m} \frac{A_j}{K_j(\cdot)}\,p_j}{\displaystyle\sum_{j=1}^{m} \frac{A_j}{K_j(\cdot)}} .
+  \label{eq:pa-compliance}
+\end{equation}
+Thus, the equilibrium activation pressure is a stiffness- and area-weighted combination of the input pressures. The
+weighting of each input is determined by its membrane's effective compliance, $A_j/K_j(\cdot)$. Since this quantity
+determines the relative contribution of each input pressure to the activation pressure, it is analogous to a weight
+in an artificial neural network. The effective mechanical weight of membrane $j$ is therefore defined as
+\begin{equation}
+  W_j(\cdot) = \frac{A_j}{K_j(\cdot)} .
+  \label{eq:weight}
+\end{equation}
+Using this definition, the activation pressure becomes
+\begin{equation}
+  p_a = \frac{\sum_{j=1}^{m} W_j(\cdot)\,p_j}{\sum_{j=1}^{m} W_j(\cdot)} .
+  \label{eq:pa-weights}
+\end{equation}
+Since $W_j(\cdot) > 0$, the activation pressure is a convex combination of the input pressures.
+
+\subsubsection{Mechanically reconfigurable weights}
+
+\paragraph{Weight-modification principle}
+
+The mechanical weight associated with each input must be physically adjustable for the neuron to exhibit
+neuroplastic behaviour. Since the weight is defined by the ratio between the effective membrane area and stiffness,
+it can be modified by changing either of these properties. The proposed approach focuses on modifying the effective
+stiffness through controlled deformation of the input membrane.
+
+The stiffness of membrane $j$ is not treated as a fixed quantity. Instead, it is considered a function of the
+membrane's equilibrium deformation. The deformation itself depends on the pressure difference across the membrane,
+although it may also be influenced by other physical, geometric, material, and boundary-condition variables. These
+dependencies are represented as
+\begin{equation}
+  K_j = K_j(\delta_j, \cdot)
+  \label{eq:k-of-delta}
+\end{equation}
+and
+\begin{equation}
+  \delta_j = \delta_j(p_j - p_a, \cdot),
+  \label{eq:delta-of-dp}
+\end{equation}
+where the notation $(\cdot)$ represents additional variables that may influence the respective relationship.
+Substituting these dependencies into the definition of the mechanical weight gives
+\begin{equation}
+  W_j = \frac{A_j}{K_j\bigl(\delta_j(p_j - p_a, \cdot), \cdot\bigr)} .
+  \label{eq:weight-composed}
+\end{equation}
+The weight may therefore be represented more generally as
+\begin{equation}
+  W_j = W_j(p_j - p_a, \cdot) .
+  \label{eq:weight-state}
+\end{equation}
+This relationship demonstrates that the mechanical weight is coupled to the equilibrium state of the membrane. By
+controlling the deformation of membrane $j$, its effective stiffness can be altered, and its corresponding weight can
+consequently be updated. The pressure difference across the membrane provides one means of influencing this
+deformation, but it is not the sole determinant of the weight. Rather, the weight depends on the complete mechanical
+state of the membrane and the other variables governing its deformation and stiffness.
+
+\paragraph{Proposed mechanical realisation of the weight update}
+
+\subparagraph{Deformation limiting.}
+
+\begin{figure}[t]
+  \centering
+  \begin{subfigure}[b]{0.36\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{figures/limit_outward.png}
+    \caption{Outward deformation limiting}
+    \label{fig:limit-outward}
+  \end{subfigure}\hspace{0.06\textwidth}%
+  \begin{subfigure}[b]{0.36\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{figures/limit_inward.png}
+    \caption{Inward deformation limiting}
+    \label{fig:limit-inward}
+  \end{subfigure}
+  \caption{Methods for altering membrane deformation. (a)~Outward membrane deformation restriction, limiting the
+    membrane's deformation away from the activation chamber. (b)~Inward membrane deformation restriction, limiting
+    the membrane's displacement into the activation chamber.}
+  \label{fig:deformation-limiting}
+\end{figure}
+
+Deformation-limited weight tuning operates by restricting the membrane's available deformation path. Since the
+membrane can deform in either direction, the limiting obstacle may be positioned either on the activation-chamber
+side, producing inward deformation limiting, or on the input-channel side, producing outward deformation limiting,
+as shown in \cref{fig:deformation-limiting}.
+
+By controlling the shape of the limiting obstacle, the allowable equilibrium deformation of the membrane can be
+controlled. Deformation can be limited independently in either direction, such that
+\begin{equation}
+  \delta_j =
+  \begin{cases}
+    \delta_j^{\mathrm{in}},  & p_a < p_j,\\[2pt]
+    \delta_j^{\mathrm{out}}, & p_a > p_j .
+  \end{cases}
+  \label{eq:deformation-limits}
+\end{equation}
+Here, $\delta_j^{\mathrm{in}}$ and $\delta_j^{\mathrm{out}}$ denote the inward and outward deformation limits,
+respectively. Since the effective stiffness is a function of the membrane deformation, $K_j = K_j(\delta_j, \cdot)$,
+the mechanical weight is consequently also affected:
+\begin{equation}
+  W_j = \frac{A_j}{K_j(\delta_j, \cdot)} .
+  \label{eq:weight-limited}
+\end{equation}
+Deformation limiting therefore provides a mechanical means of updating the weight. Changing the deformation path
+changes the membrane's equilibrium deformation and effective stiffness, which consequently changes the contribution
+of the corresponding input to the activation pressure.
+
+Inward deformation limiting is expected to introduce an additional complication because the limiting obstacle would
+be located inside the activation chamber. Changing its volume changes the volume available to the confined
+activation fluid, coupling the weight-update mechanism to the chamber's pressure. This complication is avoided when
+the deformation limit is implemented on the input-channel side.
+
+\subparagraph{Intermediate-fluid bulk-modulus tuning.}
+
+\begin{figure}[t]
+  \centering
+  \renewcommand{\labelledfile}{figures/bulk_modulus_weight.png}
+  \begin{labelledimage}{0.78\textwidth}
+    \node[lab, fill opacity=0] (i1) at (0.183, 1.10) {Input};
+    \node[lab, fill opacity=0] (ac) at (0.5, 1.10) {Activation chamber};
+    \node[lab, fill opacity=0] (i2) at (0.817, 1.10) {Input};
+    \node[lab, fill opacity=0] (w1) at (0.25, -0.12) {Weight chamber};
+    \node[lab, fill opacity=0] (w2) at (0.75, -0.12) {Weight chamber};
+    \draw[pin] (i1.south) -- (0.183, 0.86);
+    \draw[pin] (ac.south) -- (0.5, 0.86);
+    \draw[pin] (i2.south) -- (0.817, 0.86);
+    \draw[pin] (w1.north) -- (0.30, 0.20);
+    \draw[pin] (w2.north) -- (0.70, 0.20);
+  \end{labelledimage}
+  \caption{Conceptual schematic of an intermediate-fluid bulk-modulus-tuned input-weight kernel: flexible
+    membranes separated by an intermediate (weight) chamber whose tuneable compressibility controls the transmission
+    of deformation and force from the input-pressure chamber to the activation-pressure chamber.}
+  \label{fig:bulk-modulus}
+\end{figure}
+
+Force-transfer limiting is implemented by dividing the original membrane into two flexible membranes with a
+confined fluid layer between them (\cref{fig:bulk-modulus}). The input pressure acts on the outer membrane, while the
+activation-chamber pressure acts on the inner membrane. The pressure of the intermediate fluid, referred to as the
+weight pressure, transmits deformation between the two membranes.
+
+This configuration introduces three pressure variables: the input pressure $p_i$, the activation-chamber pressure
+$p_a$, and the weight pressure $p_w$. Let $\Delta V_1$ denote the deformation of membrane~1 into the intermediate
+chamber, with $K_1$ representing its volumetric stiffness. Similarly, let $\Delta V_2$ denote the deformation of
+membrane~2 into the activation chamber, with $K_2$ representing its volumetric stiffness.
+
+It is important to note that $\Delta V_j$ is defined as the change in the volume of the activation chamber.
+Consequently, $K_j$ represents the volumetric stiffness associated with deformation into the activation chamber due
+to the difference between the input pressure $p_i$ and the activation pressure $p_a$. The detailed derivation of
+$F_j$, $K_j$, and their dependence on the intermediate-fluid properties is provided in Appendix~\ref{app:bulk}.
+
+The intermediate fluid provides the tuneable mechanical element. Its bulk modulus $B$ determines its resistance to
+volumetric compression and therefore controls how effectively deformation is transferred from membrane~1 to
+membrane~2. A low bulk modulus allows the intermediate fluid to undergo a comparatively large volume change,
+reducing force transfer to membrane~2. In the limiting case $B = 0$, the intermediate fluid provides no resistance to
+compression, and the effective stiffness of the combined mechanism approaches
+\begin{equation}
+  K_j(B = 0) \rightarrow \infty .
+  \label{eq:k-b0}
+\end{equation}
+In contrast, as the bulk modulus increases, the intermediate fluid becomes less compressible and transfers an
+increasing proportion of the deformation between the two membranes. In the limiting case $B \rightarrow \infty$, the
+intermediate fluid is incompressible, and the deformation of the two membranes becomes fully coupled. The effective
+stiffness then approaches the sum of the individual membrane stiffnesses:
+\begin{equation}
+  K_j(B \rightarrow \infty) = K_1 + K_2 .
+  \label{eq:k-binf}
+\end{equation}
+The effective stiffness can therefore be represented as a function of the bulk modulus,
+\begin{equation}
+  K_j = K_j(B),
+  \label{eq:k-of-b}
+\end{equation}
+with the limiting behaviour
+\begin{equation}
+  K_j(0) = \infty, \qquad K_j(\infty) = K_1 + K_2 .
+  \label{eq:k-limits}
+\end{equation}
+Since the mechanical weight is inversely related to the effective stiffness, it follows that
+\begin{equation}
+  W_j(B) = \frac{A_j}{K_j(B)} .
+  \label{eq:weight-of-b}
+\end{equation}
+The bulk modulus of the intermediate fluid therefore provides a physical means of tuning the mechanical weight. By
+changing $B$, the force-transfer capability of the two-membrane system is altered, which changes the effective
+stiffness $K_j$ and consequently the influence of the corresponding input on the activation pressure. Bulk modulus
+is conventionally defined as the pressure change associated with volumetric strain, supporting this interpretation of
+$B$ as the fluid's resistance to compression.
+
+\subsubsection{Activation-to-output kernel}
+
+The activation pressure $p_a$ is a field-based internal state. To communicate this state to another mechanical
+neuron, the activation pressure must act on an output interface that generates a pressure-driven flow or pressure
+pulse in an external output channel.
+
+The proposed design uses a pressure-controlled pneumatic switching interface to perform this conversion. The
+interface consists of four fundamental components: a pressure source, an atmospheric vent, a flow resistor, and a
+mechanically actuated valve. The pressure source establishes the high-pressure state of the output signal, while the
+atmospheric vent establishes the low-pressure state. The flow resistor restricts fluid flow. The mechanically
+actuated valve is controlled by the activation pressure $p_a$, opening or closing according to whether the
+activation state is low or high.
+
+\paragraph{Inverted output configuration}
+
+\begin{figure}[t]
+  \centering
+  \begin{subfigure}[b]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{figures/output_inverted.png}
+    \caption{Inverted configuration}
+    \label{fig:output-inverted}
+  \end{subfigure}\hfill
+  \begin{subfigure}[b]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{figures/output_noninverted.png}
+    \caption{Non-inverted configuration}
+    \label{fig:output-noninverted}
+  \end{subfigure}
+  \caption{Activation-to-output configurations with a normally open, pressure-controlled mechanical valve driven by
+    $p_a$. (a)~Inverted: the valve sits between the pressure source and the output connection, and the output is
+    connected through a flow resistor to atmosphere, so that a low activation pressure maintains a high output
+    pressure and a high activation pressure produces a low output pressure. (b)~Non-inverted: the flow resistor sits
+    between the pressure source and the output connection, and the valve between the output and the atmospheric
+    vent, so that a low activation pressure produces a low output pressure and a high activation pressure produces a
+    high output pressure.}
+  \label{fig:output}
+\end{figure}
+
+The inverted output configuration is illustrated in \cref{fig:output-inverted}. In this configuration the
+pressure-controlled mechanical valve is on the pressure-source side, and the flow resistor is on the vent side. The
+output connection to the downstream neuron inputs is located between the flow resistor and the valve.
+
+Assume the pressure valve is normally open. When the activation pressure $p_a$ is low, the valve remains open and
+connects the output to the pressure source. Fluid continuously escapes through the flow resistor to atmosphere, but
+this loss is replenished by the pressure source. The output, which is connected to neuron inputs that do not draw
+fluid flow, therefore remains at a high pressure. When $p_a$ is high, the valve closes and disconnects the output
+from the pressure source. The output remains connected to atmosphere through the flow resistor, allowing fluid to
+escape without being replenished. The output pressure therefore decreases to the low-pressure state. Consequently,
+the configuration produces an inverted output relationship:
+\begin{equation*}
+  p_a \text{ low} \Rightarrow \pout \text{ high}, \qquad
+  p_a \text{ high} \Rightarrow \pout \text{ low}.
+\end{equation*}
+
+\paragraph{Non-inverted output configuration}
+
+The non-inverted output configuration is illustrated in \cref{fig:output-noninverted}. In this configuration, the
+flow resistor is positioned on the pressure-source side, while the pressure-controlled mechanical valve is positioned
+on the vent side. The output connection to the downstream neuron inputs is located between the flow resistor and
+the valve.
+
+Assuming again that the pressure valve is normally open, a low activation pressure $p_a$ keeps the valve open and
+connects the output to atmosphere. The output pressure can therefore escape through the valve, while the pressure
+source replenishes the output through the flow resistor. Because the replenishment flow is restricted, the output
+pressure decreases to the low-pressure state. When $p_a$ is high, the valve closes and disconnects the output from
+atmosphere. The output remains connected to the pressure source through the flow resistor, allowing its pressure to
+increase towards the source pressure. Once the valve is closed, the output pressure cannot escape through the vent
+and therefore remains at the high-pressure state. Consequently, the configuration produces a non-inverted output
+relationship:
+\begin{equation*}
+  p_a \text{ low} \Rightarrow \pout \text{ low}, \qquad
+  p_a \text{ high} \Rightarrow \pout \text{ high}.
+\end{equation*}
+
+% =====================================================================================================================
+\section{Mathematical model of the mechanical neuron}
+% =====================================================================================================================
+
+This section first characterises the mechanical behaviour of the proposed neuron by examining the effects of the
+activation-chamber stiffness, the membrane stiffness, the bias membrane term and the input pressures. This
+characterisation establishes how the physical properties and initial operating conditions of the neuron influence
+its response. Building on the mechanical characterisation, the analysis then establishes the computational
+expressiveness of the proposed neuron.
+
+\subsection{Mathematical model}
+
+The parameters $\plow$ and $\phigh$ define the lower and upper pressure bounds of the system, respectively. These
+bounds represent the minimum and maximum pressures considered.
+
+Using \cref{eq:pa-weights}, and singling out the first input, the activation pressure of the neuron is written as
+\begin{equation}
+  p_a = \frac{W_1 p_1 + \sum_{j\neq 1} W_j p_j + W_b p_b + W_0 \patm}{W_1 + \sum_{j\neq 1} W_j + W_b + W_0} .
+  \label{eq:pa-full}
+\end{equation}
+Here, $p_j$ is the $j$-th input pressure, while $W_j$ is the corresponding mechanical weight. The term $W_b p_b$
+acts as a bias, supplied by a bias membrane with weight $W_b$ and bias pressure $p_b$. The term $W_0$ represents the
+compliance of the activation chamber with respect to the atmosphere, and $\patm$ is the atmospheric pressure acting
+on the chamber housing.
+
+The activation-to-output kernel is represented by a sigmoid function:
+\begin{equation}
+  \pout(p_a) = \plow + \frac{\phigh - \plow}{1 + \exp\bigl[-k\,(p_a - \pth)\bigr]} .
+  \label{eq:sigmoid}
+\end{equation}
+Here, $p_a$ is the activation pressure, $\pth$ is the switching threshold, $\plow$ and $\phigh$ are the limiting
+output pressures, and $k$ controls the steepness and direction of the transition. A positive $k$ represents the
+non-inverted configuration, in which the output pressure increases with $p_a$, whereas a negative $k$ represents the
+inverted configuration, in which the output pressure decreases as $p_a$ increases.
+
+For simplicity, unless stated otherwise, all subsequent analyses assume that the membrane areas and stiffnesses
+remain constant. The membranes are therefore modelled as linear elastic elements, such that their restoring forces
+vary linearly with deformation.
+
+\subsection{Mechanical characterisation}
+
+For the mechanical characterisation, atmospheric pressure is used as the reference pressure, $\patm = 0$, and the
+pressure range considered in the model is bounded by
+\begin{equation*}
+  \plow = -100~\mathrm{kPa}, \qquad \phigh = 100~\mathrm{kPa}.
+\end{equation*}
+
+\subsubsection{Activation-chamber stiffness}
+
+The activation-chamber compliance is represented by $W_0$. With $\patm = 0$, \cref{eq:pa-full} becomes
+\begin{equation}
+  p_a = \frac{\sum_j W_j p_j + W_b p_b}{\sum_j W_j + W_b + W_0} .
+  \label{eq:pa-atm0}
+\end{equation}
+Defining the weighted input pressure as
+\begin{equation}
+  \pin = \sum_j W_j p_j + W_b p_b,
+  \label{eq:pin}
+\end{equation}
+the activation pressure becomes
+\begin{equation}
+  p_a = \frac{1}{\sum_j W_j + W_b + W_0}\,\pin .
+  \label{eq:pa-pin}
+\end{equation}
+Let
+\begin{equation}
+  \alpha = \frac{1}{\sum_j W_j + W_b + W_0} .
+  \label{eq:alpha}
+\end{equation}
+Then $p_a = \alpha\,\pin$. Substituting this relationship into \cref{eq:sigmoid} gives
+\begin{equation}
+  \pout(\pin) = \plow + \frac{\phigh - \plow}{1 + \exp\bigl[-k\,(\alpha\,\pin - \pth)\bigr]} .
+  \label{eq:sigmoid-pin}
+\end{equation}
+Thus, the activation-chamber compliance is incorporated into the activation function through the scaling factor
+$\alpha$. When the function is expressed in terms of the weighted input pressure, this factor modifies the
+effective gradient of the sigmoid:
+\begin{equation}
+  k_{\mathrm{eff}} = k\,\alpha .
+  \label{eq:keff}
+\end{equation}
+Therefore, increasing the chamber compliance reduces the effective gradient of the activation-to-output function.
+The complete algebraic transformation is provided in Appendix~\ref{app:compliance}.
+
+\subsubsection{Weight membrane}
+
+\paragraph{Sensitivity}
+
+To examine the influence of the first weight membrane, $W_1$ is treated as the variable parameter while the
+remaining pressures and weights are held constant. The activation pressure is
+\begin{equation}
+  p_a = \frac{W_1 p_1 + \sum_{j\neq 1} W_j p_j + W_b p_b + W_0 \patm}{W_1 + \sum_{j\neq 1} W_j + W_b + W_0} .
+  \label{eq:pa-w1}
+\end{equation}
+The sensitivity of the activation pressure to the mechanical weight $W_1$ is (Appendix~\ref{app:weight-sensitivity})
+\begin{equation}
+  \frac{\partial p_a}{\partial W_1} = \frac{p_1 - p_a}{W_1 + \sum_{j\neq 1} W_j + W_b + W_0} .
+  \label{eq:dpa-dw1}
+\end{equation}
+Thus, increasing $W_1$ shifts the activation pressure towards $p_1$. The corresponding sensitivity to the membrane
+stiffness $K_1$, using $W_1 = A_1/K_1$, is
+\begin{equation}
+  \frac{\partial p_a}{\partial K_1} =
+    -\frac{p_1 - p_a}{K_1 + \dfrac{K_1^2}{A_1}\Bigl(\sum_{j\neq 1} W_j + W_b + W_0\Bigr)} .
+  \label{eq:dpa-dk1}
+\end{equation}
+This expression shows how changes in the membrane stiffness affect the activation pressure. Because the mechanical
+contribution associated with the membrane is proportional to $A_1/K_1$, decreasing $K_1$ increases the relative
+contribution of $p_1$ to $p_a$.
+
+\paragraph{Range}
+
+Since $W_1 = A_1/K_1$, the limiting cases are
+\begin{equation}
+  \lim_{K_1 \rightarrow 0} p_a = p_1,
+  \label{eq:lim-k0}
+\end{equation}
+because $W_1 \rightarrow \infty$ and the contribution of $p_1$ dominates the weighted average. Conversely,
+\begin{equation}
+  \lim_{K_1 \rightarrow \infty} p_a =
+    \frac{\sum_{j\neq 1} W_j p_j + W_b p_b + W_0 \patm}{\sum_{j\neq 1} W_j + W_b + W_0},
+  \label{eq:lim-kinf}
+\end{equation}
+because $W_1 \rightarrow 0$. Thus, a membrane with zero stiffness makes $p_a$ approach $p_1$, whereas an infinitely
+stiff membrane makes its contribution negligible.
+
+\subsubsection{Bias membrane term}
+
+Starting from \cref{eq:pa-atm0}, and holding all other parameters constant, the quotient rule gives
+\begin{equation}
+  \frac{\partial p_a}{\partial W_b} = \frac{p_b - p_a}{\sum_j W_j + W_b + W_0} = \alpha\,(p_b - p_a),
+  \label{eq:dpa-dwb}
+\end{equation}
+where $\alpha$ is defined in \cref{eq:alpha}. Similarly,
+\begin{equation}
+  \frac{\partial p_a}{\partial p_b} = \frac{W_b}{\sum_j W_j + W_b + W_0} = \alpha\,W_b .
+  \label{eq:dpa-dpb}
+\end{equation}
+When $W_b$ is held constant, $\partial p_a/\partial p_b = \alpha W_b$ remains constant for fixed system parameters.
+Therefore, $p_b$ acts as a predictable and tuneable bias input. In contrast, holding $p_b$ constant does not make
+$\partial p_a/\partial W_b = \alpha(p_b - p_a)$ constant, because this sensitivity depends on the changing value of
+$p_a$. Consequently, $W_b$ does not act as a static bias.
+
+\subsubsection{Input pressure and ANN form}
+
+\paragraph{Input sensitivity}
+
+The input pressures $p_j$ are the externally applied pressure signals that drive the mechanical neuron. Each input
+acts on a membrane with an associated mechanical weight $W_j$, and the resulting pressure contributions are combined
+in the activation chamber. The purpose of this section is to determine how each input pressure influences the
+activation pressure and to establish the relationship between the mechanical model and the mathematical form of an
+artificial neural network (ANN).
+
+The sensitivity of the activation pressure to an individual input pressure $p_i$ is (Appendix~\ref{app:input-sensitivity})
+\begin{equation}
+  \frac{\partial p_a}{\partial p_i} = \frac{W_i}{\sum_j W_j + W_b + W_0} .
+  \label{eq:dpa-dpi}
+\end{equation}
+Using the definition of $\alpha$,
+\begin{equation}
+  \frac{\partial p_a}{\partial p_i} = \alpha\,W_i .
+  \label{eq:dpa-dpi-alpha}
+\end{equation}
+This result shows that the influence of each input pressure is determined by its corresponding mechanical weight
+relative to the total effective weight of the system. A larger $W_i$ produces a larger change in $p_a$ for a given
+change in $p_i$, while a smaller $W_i$ produces a weaker response.
+
+\paragraph{Special case: ANN form}
+
+Assuming that $W$ is constant for all membranes, the activation pressure can be written in the same form as an
+artificial neuron,
+\begin{equation}
+  p_a = \sum_j \left(\frac{\partial p_a}{\partial p_j}\right) p_j + b,
+  \label{eq:ann-sensitivity-form}
+\end{equation}
+where $b$ represents the artificial bias contribution. From the derivation in Appendix~\ref{app:ann}, the effective
+artificial input weights and bias are
+\begin{equation}
+  w_j = \frac{\partial p_a}{\partial p_j} = \alpha\,W_j
+  \label{eq:ann-weight}
+\end{equation}
+and
+\begin{equation}
+  b = \alpha\,W_b\,p_b = w_b\,p_b .
+  \label{eq:ann-bias}
+\end{equation}
+Thus,
+\begin{equation}
+  p_a = \sum_j w_j\,p_j + b .
+  \label{eq:ann-preactivation}
+\end{equation}
+This is the standard pre-activation form of an artificial neuron. In this representation, the pressure $p_j$
+corresponds to the neural-network input, the normalised mechanical weight $\alpha W_j$ corresponds to the ANN weight,
+and the bias-membrane contribution $\alpha W_b p_b$ corresponds to the ANN bias.
+
+The activation-to-output relationship is then applied to the activation pressure,
+\begin{equation}
+  \pout = F(p_a),
+  \label{eq:af}
+\end{equation}
+where $F$ is the sigmoid pressure-response function defined in \cref{eq:sigmoid}. Substituting the equivalent ANN
+expression for $p_a$ gives
+\begin{equation}
+  \pout = F\Bigl(\sum_j w_j\,p_j + b\Bigr) .
+  \label{eq:ann-full}
+\end{equation}
+This establishes that the complete input-to-output kernel of the proposed mechanical neuron is computationally
+equivalent to that of an artificial neuron when the membrane areas and effective stiffnesses remain constant
+throughout deformation. In this case, the sensitivity of the activation pressure to each input pressure is constant,
+allowing the activation pressure to be expressed as a weighted sum of the inputs and a bias term.
+
+\paragraph{General form}
+
+This, however, represents a special case of the more general mechanical formulation. In general, the membrane
+stiffness varies with deformation, and the deformation depends on both the activation pressure and the corresponding
+input pressure. Consequently, the sensitivity of the activation pressure to an input is generally state-dependent,
+\begin{equation}
+  \frac{\partial p_a}{\partial p_i} =
+    \frac{w_i + \sum_j p_j \dfrac{\partial w_j}{\partial p_i} + \dfrac{\partial b}{\partial p_i}}
+         {1 - \sum_j p_j \dfrac{\partial w_j}{\partial p_a} - \dfrac{\partial b}{\partial p_a}},
+  \label{eq:general-sensitivity}
+\end{equation}
+and the effective mechanical weight can therefore be expressed as a function of the instantaneous state and input.
+The activation pressure consequently takes the more general form
+\begin{equation}
+  p_a = \sum_j w_j(p_a, \vec{p}, p_b)\,p_j + b(p_a, \vec{p}, p_b), \qquad
+  \vec{p} = [p_1, p_2, \ldots, p_N]^{\mathsf{T}} .
+  \label{eq:general-form}
+\end{equation}
+The neuron is therefore not, in general, equivalent to a conventional fixed-weight artificial neuron. Instead, it
+constitutes a nonlinear, state-dependent neural computation element.
+
+\subsection{Computational expressiveness}
+
+The computational expressiveness of the proposed neuron is determined by the space of parameters that can be
+physically represented by its mechanical architecture. In the constant-stiffness case, where the neuron can be
+expressed in artificial-neuron form, the input sensitivity is given by \cref{eq:dpa-dpi}, while the corresponding
+bias is
+\begin{equation*}
+  b = \frac{W_b\,p_b}{\sum_j W_j + W_b + W_0} .
+\end{equation*}
+Consequently, the effective ANN parameters satisfy $\sum_j w_j + w_b + w_0 = 1$. Furthermore, since the underlying
+membrane areas and stiffnesses cannot be negative, the corresponding mechanical weights are constrained to be
+positive. The resulting neuron therefore occupies only a restricted subset of the parameter space of a conventional
+artificial neuron.
+
+The expressiveness is first examined within this artificial-neuron representation, corresponding to the special
+case of constant stiffness. The analysis then considers the general case, in which membrane stiffness varies with
+deformation and the effective weights become functions of the activation and input pressures. There, the neuron is
+treated as a nonlinear, state-dependent computational element, and its expressiveness is considered within this
+more general parameter space.
+
+\subsubsection{Constant-stiffness computational expressiveness}
+
+For the constant-stiffness case, the proposed neuron can be represented by the artificial-neuron formulation
+\begin{equation}
+  p_a = \sum_j w_j\,p_j + w_b\,p_b + w_0\,p_0 .
+  \label{eq:ann-with-reference}
+\end{equation}
+The parameters $w_j$, $w_b$, and $p_b$ are mechanically tuneable, whereas $w_0$ and $p_0$ are static parameters
+representing the compliance of the activation chamber to the atmospheric reference. Consequently, an $N$-input
+mechanical neuron has $N+2$ tuneable parameters: $N$ input weights, the mechanical bias weight $w_b$, and the
+tuneable bias pressure $p_b$. In contrast, a conventional $N$-input artificial neuron has $N+1$ parameters,
+consisting of $N$ weights and a single independent bias term. The additional mechanical parameter arises because the
+bias contribution is physically represented by the product $w_b p_b$, rather than by a single independently
+specified parameter.
+
+The pre-activation relation defines a hyperplane in the input--output space, with the weights determining its
+orientation. Defining $w_j = \tan\theta_j$, each weight determines the inclination $\theta_j$ of the hyperplane
+relative to the corresponding input axis. Since the mechanical parameters from which the weights are formed are
+non-negative, $w_j \geq 0$, and therefore $\theta_j \geq 0$. Consequently,
+\begin{equation}
+  \frac{\partial p_a}{\partial p_j} = w_j \geq 0,
+  \label{eq:monotone}
+\end{equation}
+meaning that increasing any input pressure cannot decrease the pre-activation pressure. The mechanical neuron is
+therefore monotonically non-decreasing with respect to each input, and strictly increasing where $w_j > 0$. The
+additional constraint
+\begin{equation}
+  \sum_j w_j + w_b + w_0 = 1
+  \label{eq:normalisation}
+\end{equation}
+further restricts the representable parameter space by removing one degree of freedom from the weights. This
+constraint also imposes a geometric property on the resulting hyperplane: it must contain the equal-pressure
+diagonal, defined by
+\begin{equation}
+  p_1 = p_2 = \cdots = p_N = p_b = p_0 = p_a .
+  \label{eq:diagonal}
+\end{equation}
+As shown in Appendix~\ref{app:hyperplane}, fixing $p_b$ reduces this diagonal to a specific point through which the
+hyperplane must pass. Since $p_b$ is itself tuneable, this point can be moved along the equal-pressure diagonal,
+providing an additional degree of freedom in the position of the hyperplane. Thus, although the constant-stiffness
+mechanical neuron has $N+2$ tuneable mechanical parameters, the normalisation constraint leaves $N+1$ independent
+degrees of freedom, matching the number of independent parameters of a conventional $N$-input artificial neuron.
+However, the resulting parameter space remains restricted by the positivity and normalisation constraints and
+therefore does not span the full parameter space of a conventional artificial neuron.
+
+\subsubsection{General computational expressiveness}
+
+For the general case, the normalisation constraint in \cref{eq:normalisation} remains present. Therefore, the
+derivation presented in Appendix~\ref{app:hyperplane} remains applicable, and the equal-pressure diagonal continues to
+satisfy the general formulation. For a fixed $p_b$, the computational surface must consequently pass through the
+point on the diagonal corresponding to $p_b$,
+\begin{equation*}
+  (p_1, \ldots, p_N, p_a) = (p_b, \ldots, p_b, p_b) .
+\end{equation*}
+Thus, $p_b$ continues to determine the point at which the computational surface intersects the equal-pressure
+diagonal, while the state-dependent weights determine the local shape and orientation of the surface around this
+point.
+
+The positivity constraint on the mechanical parameters also remains. Although the membrane stiffness is no longer
+constant, its value remains physically positive,
+\begin{equation*}
+  K_i(\delta_i) > 0,
+\end{equation*}
+for all admissible deformations $\delta_i$. Consequently, the effective mechanical weights remain within the
+positive domain. However, unlike the constant-stiffness case, $K_i(\delta_i)$ is generally neither constant nor
+necessarily monotonic with deformation. The effective weights therefore vary with the mechanical state, and the
+resulting input-to-output mapping is not necessarily monotonically increasing with each input. The general neuron
+consequently remains constrained to the physically positive mechanical parameter domain while allowing a nonlinear,
+state-dependent computational surface within that domain.
+
+% =====================================================================================================================
+\section{Conclusion}
+% =====================================================================================================================
+
+This article established the theoretical, structural, and mathematical framework for a mechanically feasible
+neuroplastic neuron designed for soft robotic applications. By translating biological neural processes into fluidic
+mechanisms, the proposed design demonstrates how pressure-driven inputs can be integrated through membrane
+interactions into a unified activation state without consuming or destroying the driving input signals.
+Furthermore, physical mechanisms for mechanical weight tuning, namely deformation limiting and intermediate-fluid
+bulk-modulus regulation, provide a proposed physical medium for post-fabrication reconfigurability and future
+neuroplasticity.
+
+Mathematically, the proposed architecture maps directly onto the weighted-sum and sigmoidal activation forms of a
+conventional artificial neural network under linear, constant-stiffness assumptions. When membrane stiffness varies
+with deformation, the system generalises into a nonlinear, state-dependent neural computation element. While
+physical constraints impose positivity and normalisation bounds on the reachable parameter space, the architecture
+retains the expressiveness to serve as a building block for physical neural computation.
+
+Future research directions include the physical fabrication and empirical characterisation of individual units to
+analyse real-world fluid dynamics and mechanical response boundaries. Beyond single-unit mechanics, exploring the
+integration of these neurons into multi-layered architectures presents a critical pathway toward fully autonomous,
+self-learning mechanical neural networks capable of physical adaptation in soft robotic systems. Central to this
+progression is establishing fully mechanical parameter-update mechanisms, enabling synaptic weights to adapt locally
+without relying on external domain interventions.
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+% =====================================================================================================================
+\clearpage
+\begin{appendices}
+\renewcommand{\theequation}{\thesection.\arabic{equation}}
+
+\section{Intermediate-fluid bulk-modulus tuning}
+\label{app:bulk}
+
+\subsection{Definitions and sign convention}
+
+The force-transfer-limiting mechanism consists of two flexible membranes separated by a confined intermediate fluid.
+The input pressure $p_i$ acts on membrane~1, the activation-chamber pressure $p_a$ acts on membrane~2, and the
+intermediate fluid develops the weight pressure $p_w$.
+
+The effective areas of membranes 1 and 2 are denoted by $A_1$ and $A_2$, respectively. Their volumetric
+deformations into the adjacent chambers are denoted by $\Delta V_1$ and $\Delta V_2$, with corresponding volumetric
+stiffnesses $K_1$ and $K_2$. The deformation relevant to the activation response is the deformation of membrane~2,
+\begin{equation}
+  \Delta V_j = \Delta V_2 .
+\end{equation}
+The effective stiffness of the complete force-transfer mechanism is defined as
+\begin{equation}
+  K_j = \frac{F_j}{\Delta V_j},
+\end{equation}
+where $F_j$ is the effective force producing deformation into the activation chamber.
+
+\subsection{Individual membrane force balances}
+
+For membrane~1, the pressure difference between the input chamber and intermediate chamber produces the force
+\begin{equation}
+  F_1 = (p_i - p_w)\,A_1 .
+\end{equation}
+Using the volumetric stiffness relation $F_1 = K_1\,\Delta V_1$, the deformation of membrane~1 is
+\begin{equation}
+  \Delta V_1 = \frac{(p_i - p_w)\,A_1}{K_1} .
+\end{equation}
+For membrane~2, the pressure difference between the intermediate chamber and activation chamber produces the force
+\begin{equation}
+  F_2 = (p_w - p_a)\,A_2 .
+\end{equation}
+Similarly, $F_2 = K_2\,\Delta V_2$, and therefore
+\begin{equation}
+  \Delta V_j = \Delta V_2 = \frac{(p_w - p_a)\,A_2}{K_2} .
+\end{equation}
+
+\subsection{Intermediate-fluid compressibility}
+
+Let $V_p$ denote the initial volume of the intermediate fluid and $B$ its bulk modulus. For small changes, the bulk
+modulus relates the pressure change to the relative volume change according to
+\begin{equation}
+  \Delta p_w = -B\,\frac{\Delta V_p}{V_p} .
+\end{equation}
+Using the pressure increment relative to the initial weight pressure $p_{w,0}$,
+\begin{equation}
+  p_w - p_{w,0} = -B\,\frac{\Delta V_p}{V_p} .
+\end{equation}
+With the adopted deformation convention, the change in intermediate-fluid volume is
+\begin{equation}
+  \Delta V_p = \Delta V_2 - \Delta V_1 .
+\end{equation}
+Thus,
+\begin{equation}
+  p_w - p_{w,0} = -\frac{B}{V_p}\,(\Delta V_2 - \Delta V_1) .
+\end{equation}
+Substituting the individual membrane deformations gives
+\begin{equation}
+  p_w - p_{w,0} = -\frac{B}{V_p}\left[\frac{(p_w - p_a)\,A_2}{K_2} - \frac{(p_i - p_w)\,A_1}{K_1}\right] .
+  \label{eq:weight-pressure}
+\end{equation}
+This equation determines the weight pressure $p_w$ as a function of the input pressure, activation pressure,
+membrane properties, and intermediate-fluid bulk modulus.
+
+\subsection{Effective stiffness}
+
+The effective force associated with the complete two-membrane mechanism is written as
+\begin{equation}
+  F_j = F_1 + F_2 = (p_i - p_w)\,A_1 + (p_w - p_a)\,A_2 .
+\end{equation}
+The effective stiffness is therefore, with $\Delta V_j = \Delta V_2$,
+\begin{equation}
+  K_j = \frac{F_j}{\Delta V_j} = \frac{(p_i - p_w)\,A_1 + (p_w - p_a)\,A_2}{\Delta V_2} .
+\end{equation}
+Substituting the expression for $\Delta V_2$ gives
+\begin{equation}
+  K_j = \frac{(p_i - p_w)\,A_1 + (p_w - p_a)\,A_2}{\dfrac{(p_w - p_a)\,A_2}{K_2}}
+      = K_2\,\frac{(p_i - p_w)\,A_1 + (p_w - p_a)\,A_2}{(p_w - p_a)\,A_2} .
+\end{equation}
+Because $p_w$ depends on the bulk modulus $B$, the effective stiffness is also a function of $B$, $K_j = K_j(B)$, and
+the corresponding mechanical weight is
+\begin{equation}
+  W_j(B) = \frac{A_j}{K_j(B)} .
+\end{equation}
+
+\subsection{Limiting cases}
+
+\subsubsection{Completely compressible intermediate fluid}
+For a completely compressible intermediate fluid, $B = 0$. The intermediate fluid provides no resistance to
+volumetric deformation and cannot sustain a pressure increase. Consequently, the force-transfer mechanism does not
+produce a finite activation-side deformation associated with the input force, $\Delta V_j \rightarrow 0$. Therefore,
+\begin{equation}
+  K_j(B = 0) = \frac{F_j}{\Delta V_j} \rightarrow \infty .
+\end{equation}
+Thus, the completely compressible limit corresponds to an effectively infinitely stiff force-transfer mechanism.
+
+\subsubsection{Completely incompressible intermediate fluid}
+For a completely incompressible intermediate fluid, $B \rightarrow \infty$. The intermediate-fluid volume cannot
+change, so $\Delta V_p \rightarrow 0$. Under the adopted sign convention, this requires the deformation of the two
+membranes to be equal:
+\begin{equation}
+  \Delta V_1 = \Delta V_2 = \Delta V_j .
+\end{equation}
+The two membrane stiffnesses therefore act together in the fully coupled limit:
+\begin{equation}
+  F_j = K_1\,\Delta V_j + K_2\,\Delta V_j = (K_1 + K_2)\,\Delta V_j,
+\end{equation}
+and the effective stiffness becomes
+\begin{equation}
+  K_j(B \rightarrow \infty) = \frac{F_j}{\Delta V_j} = K_1 + K_2 .
+\end{equation}
+The limiting behaviour of the force-transfer mechanism is therefore
+\begin{equation}
+  K_j(0) \rightarrow \infty, \qquad K_j(\infty) = K_1 + K_2 .
+\end{equation}
+The intermediate-fluid bulk modulus consequently provides a tuneable parameter that controls the effective
+stiffness of the two-membrane system and, through $W_j(B) = A_j/K_j(B)$, the corresponding mechanical weight. Bulk
+modulus is conventionally defined as the ratio between pressure change and volumetric strain, with the sign
+determined by the selected convention for compression and volume change.
+
+% ---------------------------------------------------------------------------------------------------------------------
+\section{Activation-chamber compliance}
+\label{app:compliance}
+
+Starting with the activation model with $\patm = 0$,
+\begin{equation}
+  p_a = \frac{\sum_j W_j p_j + W_b p_b}{\sum_j W_j + W_b + W_0},
+\end{equation}
+define $\pin = \sum_j W_j p_j + W_b p_b$, so that
+\begin{equation}
+  p_a = \left(\frac{1}{\sum_j W_j + W_b + W_0}\right)\pin = \alpha\,\pin,
+  \qquad \alpha = \frac{1}{\sum_j W_j + W_b + W_0} .
+\end{equation}
+The activation-to-output function is
+\begin{equation}
+  \pout(p_a) = \plow + \frac{\phigh - \plow}{1 + \exp\bigl[-k\,(p_a - \pth)\bigr]} .
+\end{equation}
+Substituting $p_a = \alpha\,\pin$ yields
+\begin{equation}
+  \pout(\pin) = \plow + \frac{\phigh - \plow}{1 + \exp\bigl[-k\,(\alpha\,\pin - \pth)\bigr]} .
+\end{equation}
+The exponent can be rearranged as
+\begin{equation}
+  -k\,(\alpha\,\pin - \pth) = -k\alpha\left(\pin - \frac{\pth}{\alpha}\right) .
+\end{equation}
+Consequently,
+\begin{equation}
+  \pout(\pin) = \plow + \frac{\phigh - \plow}{1 + \exp\bigl[-k_{\mathrm{eff}}\,(\pin - p_{\mathrm{th,eff}})\bigr]},
+\end{equation}
+where
+\begin{equation}
+  k_{\mathrm{eff}} = k\,\alpha = \frac{k}{\sum_j W_j + W_b + W_0}
+  \qquad\text{and}\qquad
+  p_{\mathrm{th,eff}} = \frac{\pth}{\alpha} = \pth\Bigl(\sum_j W_j + W_b + W_0\Bigr) .
+\end{equation}
+The activation-chamber compliance therefore acts as a multiplicative scaling factor on the weighted input pressure.
+Consequently, it changes the gradient of the sigmoid response: increasing the chamber compliance reduces the
+effective gradient, while decreasing the compliance produces a steeper response.
+
+% ---------------------------------------------------------------------------------------------------------------------
+\section{Weight-membrane sensitivity}
+\label{app:weight-sensitivity}
+
+Define
+\begin{equation}
+  N = W_1 p_1 + \sum_{j\neq 1} W_j p_j + W_b p_b + W_0 \patm,
+  \qquad
+  D = W_1 + \sum_{j\neq 1} W_j + W_b + W_0,
+\end{equation}
+so that the activation pressure is $p_a = N/D$. Differentiating with respect to $W_1$, while treating all other
+pressures and weights as constant, gives
+\begin{equation}
+  \frac{\partial p_a}{\partial W_1}
+    = \frac{\dfrac{\partial N}{\partial W_1}\,D - N\,\dfrac{\partial D}{\partial W_1}}{D^2} .
+\end{equation}
+Since $\partial N/\partial W_1 = p_1$ and $\partial D/\partial W_1 = 1$, it follows that
+\begin{equation}
+  \frac{\partial p_a}{\partial W_1} = \frac{p_1 D - N}{D^2} .
+\end{equation}
+Using $N = p_a D$,
+\begin{equation}
+  \frac{\partial p_a}{\partial W_1} = \frac{p_1 D - p_a D}{D^2},
+\end{equation}
+which simplifies to
+\begin{equation}
+  \boxed{\frac{\partial p_a}{\partial W_1} = \frac{p_1 - p_a}{D}} .
+\end{equation}
+The mechanical weight is related to the membrane stiffness by $W_1 = A_1/K_1$. Therefore,
+\begin{equation}
+  \frac{\partial W_1}{\partial K_1} = -\frac{A_1}{K_1^2} .
+\end{equation}
+Applying the chain rule,
+\begin{equation}
+  \frac{\partial p_a}{\partial K_1} = \frac{\partial p_a}{\partial W_1}\,\frac{\partial W_1}{\partial K_1}
+    = -\frac{A_1}{K_1^2}\,\frac{p_1 - p_a}{D} .
+\end{equation}
+Hence,
+\begin{equation}
+  \boxed{\frac{\partial p_a}{\partial K_1}
+    = -\frac{A_1\,(p_1 - p_a)}{K_1^2\bigl(W_1 + \sum_{j\neq 1} W_j + W_b + W_0\bigr)}} .
+\end{equation}
+
+% ---------------------------------------------------------------------------------------------------------------------
+\section{Input-pressure sensitivity}
+\label{app:input-sensitivity}
+
+With $\patm = 0$, the activation pressure is
+\begin{equation}
+  p_a = \frac{\sum_j W_j p_j + W_b p_b}{\sum_j W_j + W_b + W_0} .
+\end{equation}
+The denominator is independent of the input pressures $p_i$. Differentiating with respect to $p_i$ therefore gives
+\begin{equation}
+  \frac{\partial p_a}{\partial p_i}
+    = \frac{\partial\bigl(\sum_j W_j p_j + W_b p_b\bigr)/\partial p_i}{\sum_j W_j + W_b + W_0} .
+\end{equation}
+Since
+\begin{equation}
+  \frac{\partial}{\partial p_i}\Bigl(\sum_j W_j p_j\Bigr) = W_i
+\end{equation}
+and the bias term $W_b p_b$ is independent of $p_i$,
+\begin{equation}
+  \frac{\partial p_a}{\partial p_i} = \frac{W_i}{\sum_j W_j + W_b + W_0} .
+\end{equation}
+Using $\alpha$,
+\begin{equation}
+  \boxed{\frac{\partial p_a}{\partial p_i} = \alpha\,W_i} .
+\end{equation}
+
+% ---------------------------------------------------------------------------------------------------------------------
+\section{Equivalent ANN weights and bias}
+\label{app:ann}
+
+With $\patm = 0$, the activation pressure is
+\begin{equation}
+  p_a = \alpha\Bigl(\sum_j W_j p_j + W_b p_b\Bigr),
+\end{equation}
+where $\alpha$ is defined in \cref{eq:alpha}. Differentiating with respect to an input pressure $p_j$ gives
+\begin{equation}
+  \frac{\partial p_a}{\partial p_j} = \alpha\,W_j .
+\end{equation}
+The activation pressure can therefore be expressed in the artificial-neural-network form
+\begin{equation}
+  p_a = \sum_j \left(\frac{\partial p_a}{\partial p_j}\right) p_j + b .
+\end{equation}
+Substituting the derived input sensitivities gives
+\begin{equation}
+  p_a = \sum_j \alpha\,W_j\,p_j + b = \alpha \sum_j W_j\,p_j + b .
+\end{equation}
+Equating this expression with the original activation-pressure equation gives
+\begin{equation}
+  \alpha \sum_j W_j\,p_j + b = \alpha\Bigl(\sum_j W_j\,p_j + W_b\,p_b\Bigr) .
+\end{equation}
+After cancelling the common input-pressure term,
+\begin{equation}
+  \boxed{b = \alpha\,W_b\,p_b = \frac{W_b\,p_b}{\sum_j W_j + W_b + W_0}} .
+\end{equation}
+Consequently, the activation pressure has the equivalent artificial-neural-network form
+\begin{equation}
+  \boxed{p_a = \sum_j w_j\,p_j + b},
+\end{equation}
+where the effective ANN weights are
+\begin{equation}
+  \boxed{w_j = \frac{\partial p_a}{\partial p_j} = \alpha\,W_j = \frac{W_j}{\sum_k W_k + W_b + W_0}} .
+\end{equation}
+Applying the activation-to-output function then gives
+\begin{equation}
+  \boxed{\pout = F(p_a) = F\Bigl(\sum_j w_j\,p_j + b\Bigr)} .
+\end{equation}
+
+% ---------------------------------------------------------------------------------------------------------------------
+\section{Equal-pressure hyperplane}
+\label{app:hyperplane}
+
+Consider the pre-activation relation
+\begin{equation}
+  p_a = \sum_j w_j\,p_j + w_b\,p_b + w_0\,p_0
+\end{equation}
+subject to
+\begin{equation}
+  \sum_j w_j + w_b + w_0 = 1 .
+\end{equation}
+Let all input and reference pressures be equal to some arbitrary pressure $p$, $p_j = p_b = p_0 = p$. Substituting
+into the pre-activation equation gives
+\begin{equation}
+  p_a = \sum_j w_j\,p + w_b\,p + w_0\,p = \Bigl(\sum_j w_j + w_b + w_0\Bigr)p .
+\end{equation}
+Using the normalisation constraint, $p_a = p$. Therefore
+\begin{equation}
+  \boxed{p_1 = p_2 = \cdots = p_N = p_b = p_0 = p_a}
+\end{equation}
+satisfies the pre-activation equation for any value of $p$. Hence, the hyperplane necessarily contains this
+one-dimensional equal-pressure diagonal.
+
+Thus, the normalisation constraint does not merely restrict the magnitudes of the weights; it geometrically
+constrains the family of representable hyperplanes to those passing through the equal-pressure diagonal. For a
+fixed value of $p_b$, the hyperplane is constrained to pass through the corresponding point on the equal-pressure
+diagonal,
+\begin{equation}
+  (p_1, p_2, \ldots, p_N, p_a) = (p_b, p_b, \ldots, p_b, p_b) .
+\end{equation}
+Since $p_b$ is a mechanically tuneable parameter, this point can be moved along the diagonal, providing control over
+the position of the hyperplane. The input weights $w_j$, meanwhile, determine its orientation, with $w_b$ determined
+by the normalisation constraint. Thus, the mechanical parameters provide control over both the orientation and
+position of the hyperplane, although only within the restrictions imposed by the non-negative mechanical parameters
+and the normalisation constraint.
+
+\end{appendices}
+\end{document}

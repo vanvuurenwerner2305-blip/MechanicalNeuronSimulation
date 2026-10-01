@@ -142,6 +142,27 @@ it; a connection uses its contact face. Defaults: laminar segments `32*mu*L*mdot
 `(mdot/(0.61*A))**2/(2*rho_up)`. The gas density follows the ideal gas law. A closed tube keeps a small
 area (about 2 % of A0) from the contact gap between its walls.
 
+## Design studies with an agent
+
+The **Design study** tab runs an AI design agent (Claude Code) on a study folder and follows it live:
+
+1. **New study…**: choose an empty folder, write the brief (goal, free parameters and ranges, what to measure,
+   budget) and add your starting models (`.mns`, `.mad`, `.mfn`); they are imported as designs.
+2. **Start agent**: opens Windows Terminal in the study folder with Claude Code running. The first time,
+   accept Claude Code's "trust this folder" question. The agent works only through the `mns` command
+   line: its rules are in the study's `CLAUDE.md`, its manual in `MANUAL.md`, and `.claude/settings.json`
+   blocks scripts and edits outside the study.
+3. Watch the tab: the agent's current command and its reason, the design list, the event log, the
+   deforming shape during solves, and every plot and picture. **Open in its space** opens a design in the
+   neuron, activation or full-neuron tab.
+
+At the end, `report/study.pdf` holds the overall findings, and `designs/<ID>_<name>/` holds each design:
+`design.yaml` (parameters, CAD, roles), `model.step`, the simulator project, `results/`, `renders/` and
+`report/design.pdf`.
+
+The same command line works by hand (`<study>/.mns/bin/mns`, or `python -m mns_api` with this folder on
+`PYTHONPATH`): `mns help` lists the commands, and `agent/MANUAL.md` documents them and the design file format.
+
 ## Layout
 
 ```
@@ -150,6 +171,10 @@ app/                    desktop application (PyQt5 via qtpy, PyVista viewport, g
   project.py            roles, property schemas, solver settings, .mns project files
   builder.py            project + CAD -> membrane_sim.Environment, chamber/membrane coupling detection
   main_window.py        main window; panels.py, viewport.py, sweep.py, workers.py
+  sweep_core.py         sweep, weights, equation fit and exports without Qt (shared with mns_api)
+  study_window.py       Design study tab (follows a study folder; starts the agent)
+mns_api/                headless API and the `mns` command line (design files -> CAD -> runs -> reports)
+agent/                  the agent's CLAUDE.md, MANUAL.md, settings.json and brief template (copied into studies)
 membrane_sim/           solver core (usable on its own, see examples/soft_neuron_3d.py)
   shell.py              large-strain membrane triangle + Morley bending (node coords + edge rotations)
   fluid.py              FluidVolume: chamber pressure P(dV); dV from the moving shells only
