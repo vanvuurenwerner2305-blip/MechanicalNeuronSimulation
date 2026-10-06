@@ -1,0 +1,23 @@
+# Python packages of the Membrane Neuron Simulator (Python 3.10 to 3.12; tested with 3.11).
+# Install with install.bat, or: python -m pip install -r requirements.txt
+# The ranges hold the versions the tests pass with (numpy 1.26, torch 2.5, pyvista 0.48, PyQt5 5.15, ...).
+
+# solver
+numpy>=1.26,<2
+scipy>=1.11,<2
+torch>=2.5,<2.6        # newer builds failed to load on Windows (WinError 1114 in c10.dll)
+# CAD import and meshing (STEP)
+gmsh>=4.12,<5
+# GUI: PyQt5 only (PySide6 or PyQt6 next to it can break the 3D view)
+PyQt5>=5.15,<5.16
+qtpy>=2.2,<3
+pyvista>=0.48,<0.49
+pyvistaqt>=0.11,<0.12
+matplotlib>=3.8,<4
+plotly>=5.18,<7
+# agentic research study (mns command line and reports)
+pyyaml>=6
+psutil>=5.9
+pillow>=10
+# tests
+pytest>=7

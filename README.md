@@ -4,22 +4,49 @@ Desktop simulation software for fluid-driven membranes and shells. You build the
 import it as STEP, click each solid to give it a role (membrane, shell, rigid body, fluid chamber),
 and solve for static equilibrium with a Newton–Raphson solver.
 
-The window has two **spaces** (tabs at the top), each with its own model:
+The window has five tabs, each with its own model:
 
-- **Neuron: inputs → activation** — membranes between fluid chambers, solves and input sweeps.
-- **Activation function** — the valve that turns the activation pressure into a tube's open area:
-  simulate it once and save it as an activation-function design (`*.mad`) to use as a part.
+- **Inputs → pre-activation**: membranes between fluid chambers, with solves and input sweeps (`*.mns`).
+- **Pre-activation → activation**: the valve that turns the pre-activation pressure into a tube's open
+  area and the activation pressure. Simulate it once and save it as a design (`*.mad`) to use as a part.
+- **Full neuron**: both linked, with fluid parameters, recording and characterisation (`*.mfn`). Shows
+  when its components are out of date and updates them.
+- **Analysis**: plots a full neuron's stored characterisation against its swept parameters.
+- **Agentic research study**: an AI design agent (Claude Code) works on a study folder, followed live.
+
+## Installation
+
+On a fresh Windows machine:
+
+1. Install Python 3.10–3.12. Use [Anaconda](https://www.anaconda.com/download), or Python 3.11 from
+   [python.org](https://www.python.org/downloads/) with "Add python.exe to PATH" ticked.
+2. Download this repository (green **Code** button → *Download ZIP*, then unzip; or `git clone`).
+3. Double-click **`install.bat`**. It creates a Python environment in
+   `%LOCALAPPDATA%\MembraneNeuronSimulator\venv` and installs the packages of
+   [`requirements.txt`](requirements.txt). The first run downloads about 1 GB; run it again to repair the
+   environment.
+4. Double-click **`Membrane Neuron Simulator.bat`** to start the program.
+
+The environment lives in a short path outside the project folder because Windows limits paths to 260
+characters, and some packages (torch) nest deeply. Without `install.bat`, install the packages into any
+Python 3.10–3.12 with `python -m pip install -r requirements.txt`. Use PyQt5 only: PySide6 or PyQt6 next to
+it can break the 3D view.
+
+Optional:
+- [MiKTeX](https://miktex.org/download) (`pdflatex` on the path) for the PDF reports of studies and sweeps.
+- [Claude Code](https://claude.com/claude-code) for the agentic research study tab.
+
+## Running
 
 ```
 python run_app.py                    # start the application
 python run_app.py model.step         # ...and import a STEP file
 python run_app.py project.mns        # ...or open a saved neuron project
-python run_app.py valve.mad          # ...or an activation-function design
+python run_app.py valve.mad          # ...or an activation design
+python run_app.py neuron.mfn         # ...or a full neuron
+python run_app.py --analyse neuron.mfn   # ...in the Analysis tab
 python -m pytest tests               # solver benchmarks + application pipeline tests
 ```
-
-Requirements (Anaconda): numpy, scipy, torch, pyvista, pyvistaqt, PyQt5, matplotlib, plus
-`pip install gmsh` for STEP import and meshing.
 
 The full user manual is [`docs/manual/user_manual.pdf`](docs/manual/user_manual.pdf) (LaTeX source next to it).
 
@@ -156,6 +183,7 @@ The same command line works by hand (`<study>/.mns/bin/mns`, or `python -m mns_a
 ## Layout
 
 ```
+install.bat             installer (Python environment + requirements.txt); Membrane Neuron Simulator.bat starts the app
 app/                    desktop application (PyQt5 via qtpy, PyVista viewport, gmsh CAD kernel)
   cad.py                STEP import, per-body surface meshing, mid-surface extraction
   project.py            roles, property schemas, solver settings, .mns project files

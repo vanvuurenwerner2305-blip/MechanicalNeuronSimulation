@@ -88,20 +88,32 @@ pressures up in load steps.
 %==========================================================================================================
 \section{Installation and start-up}
 
-The program is written in Python and runs on Windows with Anaconda (Python 3.11). It needs
-\code{numpy}, \code{scipy}, \code{torch}, \code{pyvista}, \code{pyvistaqt}, \code{PyQt5} and \code{matplotlib}, all
-part of or installable into Anaconda, plus \code{gmsh}, installed with \code{pip install gmsh}. Building the
-reports of design studies needs a \LaTeX\ installation (MiKTeX) with \code{pdflatex} on the path.
+The program is written in Python (3.10 to 3.12; tested with 3.11) and runs on Windows. To install it:
+\begin{enumerate}
+\item install Python, from Anaconda or from python.org (tick \emph{Add python.exe to PATH});
+\item double-click \code{install.bat} in the \code{MembraneNeuronSimulator} folder. It creates a Python environment in
+\code{\%LOCALAPPDATA\%\textbackslash MembraneNeuronSimulator\textbackslash venv} and installs the packages listed in
+\code{requirements.txt} (\code{numpy}, \code{scipy}, \code{torch}, \code{gmsh}, \code{PyQt5}, \code{pyvista},
+\code{pyvistaqt}, \code{matplotlib} and a few more). The first run downloads about 1\,GB; run it again to repair the
+environment.
+\end{enumerate}
+The environment is kept in a short path outside the project folder because Windows limits paths to 260 characters.
+Without the installer, \code{python -m pip install -r requirements.txt} installs the same packages into any Python
+3.10--3.12; use PyQt5 only, since PySide6 or PyQt6 next to it can break the 3D view. Building PDF reports needs a
+\LaTeX\ installation (MiKTeX) with \code{pdflatex} on the path, and the agentic research study needs Claude Code.
 
 Start the program in one of these ways:
 \begin{itemize}
-\item double-click the desktop shortcut or \code{Membrane Neuron Simulator.bat};
+\item double-click the desktop shortcut or \code{Membrane Neuron Simulator.bat} (it uses the environment of
+\code{install.bat}, otherwise Anaconda's Python);
 \item from a terminal in the \code{MembraneNeuronSimulator} folder:
 \begin{verbatim}
 python run_app.py                  # empty window
 python run_app.py model.step       # import a STEP file
 python run_app.py project.mns      # open a neuron project
 python run_app.py valve.mad        # open an activation design
+python run_app.py neuron.mfn       # open a full neuron
+python run_app.py --analyse neuron.mfn   # ...in the Analysis tab
 \end{verbatim}
 \end{itemize}
 

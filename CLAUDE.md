@@ -30,7 +30,10 @@ python examples/make_icon.py app                # redraws app/icon.png + app/ico
 ```
 
 Environment: Anaconda Python 3.11 at `C:\Users\werne\anaconda3` (torch 2.5, scipy, pyvista, pyvistaqt,
-PyQt5, matplotlib, `gmsh` pip-installed). Windows.
+PyQt5, matplotlib, `gmsh` pip-installed). Windows. For other machines: `requirements.txt` (tested version ranges;
+keep it in step with new imports) and `install.bat`, which makes a venv in `%LOCALAPPDATA%\MembraneNeuronSimulator\venv`
+(not in the repo: the long project path plus torch's nesting exceeds Windows' 260-character limit).
+`Membrane Neuron Simulator.bat` prefers that venv, then Anaconda's pythonw.
 
 ## Architecture
 
