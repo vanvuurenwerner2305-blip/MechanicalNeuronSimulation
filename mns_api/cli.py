@@ -27,27 +27,26 @@ HELP = {
     "templates": "mns templates - the design templates for `mns design new --template`.",
     "cad": "mns cad build <ID> | inspect <ID> | render <ID> [--views iso,front,top,right,section-x:0.5] "
            "[--exploded 0.3] [--only Body1,Body2] [--name file]",
-    "check": "mns check <ID> - mesh and assemble the model: which chamber loads which membrane, inputs, paths, links, "
+    "check": "mns check <ID> - mesh and assemble the model: which chamber loads which membrane, inputs, links, "
              "flow connections, warnings (no solve).",
     "solve": "mns solve <ID> [--set Part.field=value ...] - one static solve (neuron or full neuron) at the design's "
              "pressures; --set changes values for this run only.",
-    "sweep": "mns sweep <ID> --input Chamber=from:to:n [--input Chamber2=from:to:n] [--preactivation Chamber|none] "
-             "[--tolerance 1.0] [--method lowest|greedy] [--set ...] - neuron sweep, weights and neuron equation.",
-    "fit": "mns fit <ID> [--tolerance 0.5] [--method lowest|greedy] - refit the neuron equation from the stored sweep.",
+    "sweep": "mns sweep <ID> --input Chamber=from:to:n [--input Chamber2=from:to:n] [--set ...] - neuron sweep over "
+             "one or two input pressures (chamber pressures and linked designs' outputs at every point).",
     "dpsweep": "mns dpsweep <ID> [--dp from:to:n] [--set study.field=v ...] - activation-function study: the Δp sweep "
                "that maps the membrane's pressure difference to tube area, flow and outputs (saved in model.mad).",
     "characterise": "mns characterise <ID> --axis Part.field=from:to:n [--axis ...] [--record key,key] [--set ...] - "
                     "full neuron over a grid of chamber parameters (stored in model.mfn).",
     "compare": "mns compare [ID ...] [--metrics m1,m2] [--x parameter --y metric] - a table of the designs' "
                "parameters and metrics; --x/--y also plot one against the other.",
-    "report": "mns report design <ID> | study [--build] - write the generated LaTeX parts (tables, figures, equation); "
+    "report": "mns report design <ID> | study [--build] - write the generated LaTeX parts (tables, figures); "
               "--build compiles the PDF.",
     "note": "mns note \"text\" [--design ID] - post a message to the study log (shown live in the GUI).",
     "jobs": "mns jobs - recent background jobs and their state.",
     "wait": "mns wait <job> [--timeout 540] - wait for a background job and print its output.",
     "cancel": "mns cancel <job> - stop a background job.",
 }
-LONG = ("solve", "sweep", "dpsweep", "characterise", "fit")
+LONG = ("solve", "sweep", "dpsweep", "characterise")
 
 
 class Failure(Exception):
@@ -66,9 +65,6 @@ def build_parser():
     p.add_argument("--input", action="append", default=[])
     p.add_argument("--axis", action="append", default=[])
     p.add_argument("--record", default=None)
-    p.add_argument("--preactivation", default=None)
-    p.add_argument("--tolerance", type=float, default=None)
-    p.add_argument("--method", default="lowest")
     p.add_argument("--dp", default=None)
     p.add_argument("--space", default=None)
     p.add_argument("--template", default=None)
@@ -207,7 +203,7 @@ def _error(exc):
 
 
 def _design_arg(args):
-    if args.command in ("check", "solve", "sweep", "fit", "dpsweep", "characterise") and args.args:
+    if args.command in ("check", "solve", "sweep", "dpsweep", "characterise") and args.args:
         return args.args[0][:4]
     if args.command in ("cad",) and len(args.args) > 1:
         return args.args[1][:4]
@@ -224,12 +220,9 @@ def _one_line(args, result):
     if not isinstance(result, dict):
         return f"{args.command} done"
     bits = [args.command]
-    for key in ("converged", "points", "met", "max_error_kPa", "seconds", "status"):
+    for key in ("converged", "points", "seconds", "status"):
         if key in result:
             bits.append(f"{key}={result[key]}")
-    eq = result.get("equation")
-    if isinstance(eq, dict) and "max_error_kPa" in eq:
-        bits.append(f"equation error {eq['max_error_kPa']} kPa (met={eq['met']})")
     if result.get("warnings"):
         bits.append(f"{len(result['warnings'])} warning(s)")
     return " ".join(str(b) for b in bits)
@@ -336,12 +329,7 @@ def dispatch(args, study):
         for text in args.input:
             name, _, rng = text.partition("=")
             inputs.append((name.strip(), parse_range(rng)))
-        return ops.neuron_sweep(design, inputs, args.preactivation, args.tolerance or 1.0, args.method, _sets(args),
-                                args.max_minutes, render)
-    if c == "fit":
-        if design.space != "neuron":
-            raise ApiError("mns fit is for neuron designs (after mns sweep).")
-        return ops.neuron_fit(design, args.tolerance or 1.0, args.method)
+        return ops.neuron_sweep(design, inputs, _sets(args), args.max_minutes, render)
     if c == "dpsweep":
         if design.space != "activation":
             raise ApiError(f"mns dpsweep is for activation designs; {design.id} is a {design.space} design.")

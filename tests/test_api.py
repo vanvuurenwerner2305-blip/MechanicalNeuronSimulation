@@ -96,19 +96,18 @@ def test_neuron_design_from_template_to_report(study):
     assert set(built["touching"]["PreActivation"]) >= {"Membrane1", "Membrane2"}
     check = mns(study, "check", "N001")
     assert check["preactivation_default"] == "PreActivation"
-    assert [p["input"] for p in check["input_paths_into_preactivation"]] == ["Input1", "Input2"]
+    assert "input_paths_into_preactivation" not in check
     solve = mns(study, "solve", "N001", "--no-render", "--set", "Input1.pressure=5")
     assert solve["converged"] and solve["set"] == {"Input1.pressure": 5}
     assert 0 < solve["chambers"]["PreActivation"]["P_kPa"] < 5
-    sweep = mns(study, "sweep", "N001", "--input", "Input1=0:10:3", "--no-render", "--tolerance", "2")
-    assert sweep["converged"] == 3 and sweep["equation"]["met"]
-    fit = mns(study, "fit", "N001", "--tolerance", "0.05")
-    assert fit["ok"] and "max_error_kPa" in fit
-    assert (study / "designs" / "N001_basic" / "results" / "equation.tex").exists()
+    sweep = mns(study, "sweep", "N001", "--input", "Input1=0:10:3", "--no-render")
+    assert sweep["converged"] == 3 and "equation" not in sweep
+    assert (study / "designs" / "N001_basic" / "results" / "sweep.csv").exists()
+    assert not mns(study, "fit", "N001")["ok"]                     # the equation fit was removed
     report = mns(study, "report", "design", "N001")
     assert report["unwritten_sections"] == ["Aim", "Design", "Results", "Findings"]
     tex = (study / "designs" / "N001_basic" / "report" / "auto_results.tex").read_text(encoding="utf-8")
-    assert "\\begin{align}" in tex and "Static solve" in tex
+    assert "Sweep" in tex and "Static solve" in tex and "equation" not in tex.lower()
 
 
 def test_derive_changes_a_parameter_and_rebuilds(study):

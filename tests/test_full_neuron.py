@@ -266,3 +266,114 @@ def test_the_next_point_starts_on_the_line_through_the_last_two():
     assert torch.allclose(guess[0], torch.tensor([6.0, 2.5]))
     assert predicted_state(states, (1, 0), (1, 1), axes) is None      # turning onto another axis: no line
     assert predicted_state({(1, 0): states[(1, 0)]}, (1, 0), (2, 0), axes) is None
+
+
+# -----------------------------
+# Out of date components (the .mns / .mad saved with changes after the import)
+# -----------------------------
+
+@pytest.fixture
+def sources(neuron_mns, design, tmp_path):
+    """Copies of the neuron and the design that a test may change, and a full neuron made of them."""
+    from app.activation import ActivationProject
+    mns, mad = tmp_path / "neuron.mns", tmp_path / "valve.mad"
+    Project.load(neuron_mns).save(mns)
+    ActivationProject.load(design).save(mad)
+    full = FullNeuronProject()
+    full.import_neuron(mns)
+    full.import_design(mad)
+    full.link = {"part": "Membrane_Right", "driving": AUTOMATIC}
+    return full, mns, mad
+
+
+def test_a_saved_change_to_the_neuron_marks_it_out_of_date_and_update_keeps_local_edits(sources, tmp_path):
+    from app.full_neuron import CURRENT, OUTDATED
+    full, mns, _ = sources
+    assert full.reference_status(NEURON) == CURRENT and full.outdated() == []
+    full.part("Chamber_Left").props["pressure"] = 7.5               # edited in the full neuron
+    source = Project.load(mns)
+    source.save(mns)                                                # saved without changes: still current
+    assert full.reference_status(NEURON) == CURRENT
+    next(p for p in source.parts if p.name == "Membrane_Left").props["thickness"] = 1.5
+    source.save(mns)
+    assert full.reference_status(NEURON) == OUTDATED and full.outdated() == [NEURON]
+    changes = full.neuron_changes()
+    assert changes["source"] == ["Membrane_Left thickness: 1 → 1.5"]
+    assert changes["kept"] == ["Chamber_Left pressure: 7.5 here (10 in the source)"] and changes["conflicts"] == []
+    assert full.part("Membrane_Left").props["thickness"] == 1.0     # the old version until updated
+    assert full.update_neuron() == []
+    assert full.part("Membrane_Left").props["thickness"] == 1.5
+    assert full.part("Chamber_Left").props["pressure"] == 7.5
+    assert full.reference_status(NEURON) == CURRENT
+    path = tmp_path / "full.mfn"                                    # the base is saved with the workbench
+    full.save(path)
+    loaded = FullNeuronProject.load(path)
+    assert loaded.reference_status(NEURON) == CURRENT and loaded.neuron_changes()["source"] == []
+
+
+def test_a_value_changed_in_both_places_is_a_conflict(sources):
+    full, mns, _ = sources
+    full.part("Chamber_Left").props["pressure"] = 7.5
+    source = Project.load(mns)
+    next(p for p in source.parts if p.name == "Chamber_Left").props["pressure"] = 12.0
+    source.save(mns)
+    assert full.neuron_changes()["conflicts"] == ["Chamber_Left pressure: 7.5 here; 10 → 12 in the source"]
+    full.update_neuron(keep_conflicts=False)
+    assert full.part("Chamber_Left").props["pressure"] == 12.0
+
+
+def test_removing_the_linked_membrane_unlinks_it(sources):
+    full, mns, _ = sources
+    source = Project.load(mns)
+    next(p for p in source.parts if p.name == "Membrane_Right").set_role("Ignore")
+    source.save(mns)
+    notes = full.update_neuron()
+    assert full.link["part"] is None and "no longer a membrane" in notes[0]
+
+
+def test_the_design_is_kept_in_the_workbench_until_updated(sources, tmp_path):
+    from app.full_neuron import CURRENT, MISSING, OUTDATED
+    full, _, mad = sources
+    area = full.design().membrane_area
+    path = tmp_path / "full.mfn"
+    full.save(path)
+    data = json.loads(mad.read_text(encoding="utf-8"))
+    data["results"]["membrane_area"] = 2 * area
+    mad.write_text(json.dumps(data), encoding="utf-8")
+    loaded = FullNeuronProject.load(path)
+    assert loaded.reference_status(ACTIVATION) == OUTDATED
+    assert loaded.design().membrane_area == pytest.approx(area)     # the embedded version is used
+    linked = loaded.linked_project()
+    assert linked.pinned_designs["Membrane_Right"].membrane_area == pytest.approx(area)
+    before = loaded.fingerprint()
+    assert "membrane area" in loaded.update_design()[0]
+    assert loaded.design().membrane_area == pytest.approx(2 * area)
+    assert loaded.reference_status(ACTIVATION) == CURRENT and loaded.fingerprint() != before
+    loaded.save(path)
+    mad.unlink()                                                     # the workbench still works without the file
+    again = FullNeuronProject.load(path)
+    assert again.reference_status(ACTIVATION) == MISSING
+    assert again.design().membrane_area == pytest.approx(2 * area)
+
+
+def test_version_1_workbench_files_are_tracked(sources, tmp_path):
+    from app.full_neuron import CURRENT, OUTDATED
+    full, mns, _ = sources
+    full.part("Chamber_Left").props["pressure"] = 7.5
+    path = tmp_path / "full.mfn"
+    full.save(path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for key in ("neuron_base", "design_data", "design_sha1"):
+        del data[key]
+    data["version"] = 1
+    path.write_text(json.dumps(data), encoding="utf-8")
+    old = FullNeuronProject.load(path)
+    assert old.fingerprint() == full.fingerprint()                  # stored characterisations stay current
+    assert old.reference_status(NEURON) == CURRENT                  # fluid values differ: edited here
+    assert old.reference_status(ACTIVATION) == CURRENT
+    source = Project.load(mns)
+    next(p for p in source.parts if p.name == "Membrane_Left").props["thickness"] = 1.5
+    source.save(mns)
+    assert old.reference_status(NEURON) == OUTDATED
+    old.update_neuron()
+    assert old.part("Chamber_Left").props["pressure"] == 7.5

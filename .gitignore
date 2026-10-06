@@ -10,3 +10,7 @@ docs/paper/*.aux
 docs/paper/*.log
 docs/paper/*.out
 docs/paper/*.toc
+docs/manual/*.aux
+docs/manual/*.log
+docs/manual/*.out
+docs/manual/*.toc

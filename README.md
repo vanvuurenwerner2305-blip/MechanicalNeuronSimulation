@@ -6,7 +6,7 @@ and solve for static equilibrium with a Newton–Raphson solver.
 
 The window has two **spaces** (tabs at the top), each with its own model:
 
-- **Neuron: inputs → activation** — membranes between fluid chambers, sweeps and the neuron equation.
+- **Neuron: inputs → activation** — membranes between fluid chambers, solves and input sweeps.
 - **Activation function** — the valve that turns the activation pressure into a tube's open area:
   simulate it once and save it as an activation-function design (`*.mad`) to use as a part.
 
@@ -20,6 +20,8 @@ python -m pytest tests               # solver benchmarks + application pipeline 
 
 Requirements (Anaconda): numpy, scipy, torch, pyvista, pyvistaqt, PyQt5, matplotlib, plus
 `pip install gmsh` for STEP import and meshing.
+
+The full user manual is [`docs/manual/user_manual.pdf`](docs/manual/user_manual.pdf) (LaTeX source next to it).
 
 ## Workflow
 
@@ -54,32 +56,10 @@ Requirements (Anaconda): numpy, scipy, torch, pyvista, pyvistaqt, PyQt5, matplot
    - displacement or area-stretch contours, with a slider through the load steps;
    - a table of chamber pressures and volumes;
    - VTK and CSV export.
-7. **Sweep** (F6) maps the response over one or two input chamber pressures (line plot or heat
-   map, CSV export). Each point starts from the previous solution, so sweeps are several times
-   faster than separate solves. With an **activation chamber** chosen, every point also records
-   the mechanical weight of each input path into it, **W_j = dV_j / (p_j − p_a)**, where dV_j is the
-   volume the path pushes into the activation chamber. A path lumps everything between input
-   chamber j and the activation chamber: one membrane, or membrane – weight chamber – membrane
-   for bulk modulus tuning. A membrane with nothing behind it is an input from the surroundings
-   (0 kPa). The activation chamber's own fluid adds W_0 about its rest pressure p_0, so
-   p_a = (Σ W_j p_j + W_0 p_0) / (Σ W_j + W_0); the table shows this rebuilt p_a as a check.
-   After the sweep the weights are fitted as polynomials W(Δp), **one for Δp > 0 and one for
-   Δp < 0** (a weight sampled on one side only uses that polynomial for both; points with Δp = 0
-   are left out; the least squares is weighted by |Δp|, i.e. it fits the displaced volume W·Δp),
-   of the lowest degrees for which the equation, solved for p_a from each point's inputs, is
-   within the **equation tolerance** (default 1 kPa) of every simulated p_a. Every side of every
-   weight has its own degree, all starting constant.
-   *Degree search*: **Lowest total order** (default) tries every combination of degrees with total
-   order 0, 1, 2, ... and stops at the first that meets the tolerance, so the result is the lowest
-   possible total order; **Biggest own error first** instead keeps giving one order more to the
-   weight that causes the biggest error on its own (faster, but errors of different weights can
-   cancel, so it can end higher). Change the tolerance or search and press **Regenerate equation**
-   to refit from the sweep's results without simulating again. The **Neuron equation** tab shows
-   the equation rendered (click a weight to plot its fitted polynomial over the sampled points
-   underneath) and as LaTeX (Copy LaTeX, two-sided weights as `cases`), with its error. The
-   fit runs in the background; with many sides and a tight tolerance the exhaustive search can
-   take tens of seconds. The export
-   writes `<name>.csv` (all points), `<name>_weights.csv` (the fits) and `<name>_equation.tex`.
+7. **Sweep** (F6) maps the response over one or two input chamber pressures: every chamber's pressure
+   and any linked activation design's outputs at every point (table, line plot or heat map, CSV export).
+   Each point starts from the previous solution, so sweeps are several times faster than separate
+   solves. For more parameters, use the Full neuron tab's characterisation and the Analysis tab.
 
 `examples/make_neuron_step.py` writes `examples/soft_neuron.step`, the soft neuron as a named
 STEP assembly, for trying the workflow.
@@ -142,9 +122,19 @@ it; a connection uses its contact face. Defaults: laminar segments `32*mu*L*mdot
 `(mdot/(0.61*A))**2/(2*rho_up)`. The gas density follows the ideal gas law. A closed tube keeps a small
 area (about 2 % of A0) from the contact gap between its walls.
 
-## Design studies with an agent
+## Analysis of a characterisation
 
-The **Design study** tab runs an AI design agent (Claude Code) on a study folder and follows it live:
+The **Analysis** tab plots a full neuron's stored characterisation (File → Open a `.mfn`, or **Analyse…** in the
+Full neuron tab) without simulating anything. Choose the result (Z) and tick swept parameters as plot axes in turn:
+one gives a curve, two a surface, three a row of surfaces, four a grid and five layers of grids (scroll wheel over
+the plots). Unticked parameters are held at their slider's value; from the third axis on a parameter shows a number
+of its values instead. **Interpolate** switches between the simulated points only and linear interpolation between
+them. Click a point to see the neuron deformed there in the 3D view; the model tree shows every part's settings
+(read only).
+
+## Agentic research studies
+
+The **Agentic research study** tab runs an AI design agent (Claude Code) on a study folder and follows it live:
 
 1. **New study…**: choose an empty folder, write the brief (goal, free parameters and ranges, what to measure,
    budget) and add your starting models (`.mns`, `.mad`, `.mfn`); they are imported as designs.
@@ -171,8 +161,9 @@ app/                    desktop application (PyQt5 via qtpy, PyVista viewport, g
   project.py            roles, property schemas, solver settings, .mns project files
   builder.py            project + CAD -> membrane_sim.Environment, chamber/membrane coupling detection
   main_window.py        main window; panels.py, viewport.py, sweep.py, workers.py
-  sweep_core.py         sweep, weights, equation fit and exports without Qt (shared with mns_api)
-  study_window.py       Design study tab (follows a study folder; starts the agent)
+  sweep_core.py         input sweep and its CSV without Qt (shared with mns_api)
+  analysis.py, analysis_window.py   Analysis tab (slices of a stored characterisation)
+  study_window.py       Agentic research study tab (follows a study folder; starts the agent)
 mns_api/                headless API and the `mns` command line (design files -> CAD -> runs -> reports)
 agent/                  the agent's CLAUDE.md, MANUAL.md, settings.json and brief template (copied into studies)
 membrane_sim/           solver core (usable on its own, see examples/soft_neuron_3d.py)
@@ -181,7 +172,6 @@ membrane_sim/           solver core (usable on its own, see examples/soft_neuron
   contact.py            exact signed distance to closed triangle meshes, penalty contact
   solver.py             Newton-Raphson: consistent tangent, sparse LU + Woodbury, line search
   environment.py        Environment: build, solve (fresh or warm-started), reset
-  characterise.py       input-path weights W_j = dV_j/(p_j - p_a), W(dp) polynomial fit, LaTeX neuron equation
 examples/               soft neuron script and STEP generator
 cad_models/             user CAD files
 tests/                  analytical benchmarks, consistency checks, application pipeline tests

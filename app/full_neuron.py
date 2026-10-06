@@ -4,8 +4,14 @@ design (*.mad) linked into one neuron and solved as in the neuron space, with th
 its pre-simulated model (the "Activation membrane" role on the linked neuron part).
 
 Here only the fluids' parameters can be changed (pressures, volumes, stiffness, ...), not the kinds of anything
-(roles, chamber models) and not the design (that would need simulating it again). The neuron project is embedded
-in the workbench file (*.mfn), so the original .mns is not changed. What to record at every solve is chosen from
+(roles, chamber models) and not the design (that would need simulating it again). Both components are embedded in
+the workbench file (*.mfn) as the versions they were imported (or last updated) at, so the original .mns and .mad
+are not changed and later changes to them do not leak in unnoticed.
+
+References (as in a CAD assembly): when a component's source file is saved with changes, `reference_status` says
+it is out of date; `update_neuron` / `update_design` take the new version. Updating the neuron is a three-way merge:
+`neuron_base` is the source as it was imported, so a value changed in the source since is taken, and a value changed
+here (a fluid parameter, a solver setting) is kept (`neuron_changes` lists both, and conflicts). What to record at every solve is chosen from
 the chamber pressures and volumes and the design's pre-activation Δp, named outputs, tube area and mass flow.
 
 Both models are shown side by side; each has a position and a rotation (about its own centre) that only
@@ -18,6 +24,7 @@ the .mfn (`characterisation`, see `make_dataset` and `Characterisation`), so tha
 """
 import copy
 import hashlib
+import os
 import json
 import math
 import time
@@ -75,11 +82,30 @@ def identity():
 # Project
 # -----------------------------
 
+CURRENT, OUTDATED, MISSING = "current", "out of date", "not found"   # reference_status
+
+
+def neuron_state(project) -> dict:
+    """What an update compares: the project's dict with absolute paths and without display settings."""
+    data = copy.deepcopy(project.to_dict())
+    data["step_path"] = str(Path(data["step_path"]).resolve()) if data.get("step_path") else None
+    parts = {}
+    for part in data["parts"]:
+        part.pop("visible", None)
+        if part["props"].get("design"):
+            part["props"]["design"] = str(Path(part["props"]["design"]).resolve())
+        parts[part["name"]] = part
+    return {"step_path": data["step_path"], "parts": parts, "solver": data.get("solver", {})}
+
+
 class FullNeuronProject:
     def __init__(self):
         self.neuron = None          # Project (embedded copy; its fluid parameters are edited here)
-        self.neuron_source = None   # the .mns it was imported from (for information)
-        self.design_path = None     # the .mad (not embedded: the design is fixed)
+        self.neuron_source = None   # the .mns it was imported from
+        self.neuron_base = None     # neuron_state of the source when it was imported / last updated
+        self.design_path = None     # the .mad it was imported from
+        self.design_data = None     # the design as imported / last updated (ActivationProject dict, embedded)
+        self.design_sha1 = None     # sha1 of that .mad file's bytes
         self.link = {"part": None, "driving": AUTOMATIC}   # neuron part replaced by the design's membrane
         self.transforms = {NEURON: identity(), ACTIVATION: identity()}
         self.record = None          # keys of recorded quantities (None: the defaults)
@@ -92,6 +118,7 @@ class FullNeuronProject:
     def import_neuron(self, path):
         project = Project.load(path)
         self.neuron, self.neuron_source = project, str(Path(path).resolve())
+        self.neuron_base = neuron_state(project)
         linked = [p.name for p in project.parts if p.role == ACTIVATION_MEMBRANE]
         if linked:  # the project already names the membrane the design replaces
             part = next(p for p in project.parts if p.name == linked[0])
@@ -101,8 +128,11 @@ class FullNeuronProject:
         self.record = None
         return project
 
-    def import_design(self, path):
-        project = ActivationProject.load(path)
+    @staticmethod
+    def _read_design(path):
+        """(ActivationProject, sha1 of the file) of a usable design file."""
+        raw = Path(path).read_bytes()
+        project = ActivationProject.from_dict(json.loads(raw.decode("utf-8")), Path(path).parent)
         if not project.results:
             raise ValueError(f"{Path(path).name} has no simulated results: simulate it in the Pre-activation → "
                              "activation space and save it first.")
@@ -110,17 +140,161 @@ class FullNeuronProject:
         if not design.has_volume:
             raise ValueError(f"{Path(path).name} was simulated before the membrane's swept volume was recorded: "
                              "open it in the Pre-activation → activation space, simulate it again and save it.")
+        return project, hashlib.sha1(raw).hexdigest()
+
+    def import_design(self, path):
+        project, sha1 = self._read_design(path)
         self.design_path = str(Path(path).resolve())
+        self.design_data, self.design_sha1 = project.to_dict(), sha1
+        self._design_key = None
         self.record = None
         return project
 
+    def design_project(self) -> ActivationProject:
+        """The embedded design (the version imported / last updated, not the file as it is now)."""
+        if self.design_data is None:
+            raise ValueError("Import a pre-activation-to-activation design (*.mad) first.")
+        return ActivationProject.from_dict(self.design_data, Path(self.design_path).parent)
+
     def design(self) -> ActivationDesign:
-        """The linked design (cached until the file changes: decoding its stored FEM solution takes a moment)."""
-        path = Path(self.design_path)
-        key = (str(path), path.stat().st_mtime_ns)
-        if getattr(self, "_design_key", None) != key:
-            self._design, self._design_key = ActivationDesign.load(path), key
+        """The linked design (embedded version; cached: decoding its stored FEM solution takes a moment)."""
+        if getattr(self, "_design_key", None) != self.design_sha1:
+            self._design = ActivationDesign.of(self.design_project(), Path(self.design_path).stem)
+            self._design_key = self.design_sha1
         return self._design
+
+    # -----------------------------
+    # References to the source files (out of date / update)
+    # -----------------------------
+
+    def _source_state(self, kind):
+        """neuron_state of the .mns / sha1 of the .mad as the file is now (cached per file version);
+        None if the file is gone or unreadable."""
+        path = self.neuron_source if kind == NEURON else self.design_path
+        try:
+            st = os.stat(path)
+        except (OSError, TypeError):
+            return None
+        key = (path, st.st_mtime_ns, st.st_size)
+        cache = self.__dict__.setdefault("_source_cache", {})
+        if cache.get(kind, (None,))[0] != key:
+            try:
+                state = (neuron_state(Project.load(path)) if kind == NEURON
+                         else hashlib.sha1(Path(path).read_bytes()).hexdigest())
+            except Exception:
+                state = None
+            cache[kind] = (key, state)
+        return cache[kind][1]
+
+    def reference_status(self, kind):
+        """CURRENT, OUTDATED or MISSING for the imported neuron (NEURON) or design (ACTIVATION); None if there is
+        none or it has no source file."""
+        if kind == NEURON and (self.neuron is None or not self.neuron_source):
+            return None
+        if kind == ACTIVATION and self.design_data is None:
+            return MISSING if self.design_path else None
+        state = self._source_state(kind)
+        if state is None:
+            return MISSING
+        if kind == NEURON:
+            if self.neuron_base is None:   # a file saved before references were tracked
+                self.neuron_base = self._legacy_base(state)
+            return CURRENT if state == self.neuron_base else OUTDATED
+        return CURRENT if state == self.design_sha1 else OUTDATED
+
+    def _legacy_base(self, source):
+        """For files without neuron_base: if the source differs from the embedded copy only in values that can be
+        edited here (fluid parameters, solver), those were edited here; otherwise the copy is the old version."""
+        embedded = neuron_state(self.neuron)
+        return copy.deepcopy(source) if _editable_free(source) == _editable_free(embedded) else embedded
+
+    def outdated(self):
+        """The components whose source file was saved with changes, of [NEURON, ACTIVATION]."""
+        return [k for k in (NEURON, ACTIVATION) if self.reference_status(k) == OUTDATED]
+
+    def neuron_changes(self):
+        """What updating the neuron would do: {"source": [...], "kept": [...], "conflicts": [...]} of lines; source =
+        changed in the .mns since the import, kept = changed here only, conflicts = changed in both."""
+        if self.neuron_base is None:
+            self.reference_status(NEURON)
+        new, base, here = self._source_state(NEURON), self.neuron_base, neuron_state(self.neuron)
+        if new is None:
+            raise ValueError(f"{self.neuron_source} cannot be read.")
+        out = {"source": [], "kept": [], "conflicts": []}
+        if new["step_path"] != base["step_path"]:
+            out["source"].append(f"CAD file: {Path(base['step_path'] or '').name} → {Path(new['step_path']).name}")
+        for name in base["parts"]:
+            if name not in new["parts"]:
+                out["source"].append(f"{name}: removed")
+        for name, part in new["parts"].items():
+            old = base["parts"].get(name)
+            if old is None:
+                out["source"].append(f"{name}: added ({part['role']})")
+            elif old["role"] != part["role"]:
+                out["source"].append(f"{name}: role {old['role']} → {part['role']}")
+            else:
+                mine = here["parts"].get(name)
+                mine = mine["props"] if mine and mine["role"] == old["role"] else old["props"]
+                for key in sorted(set(part["props"]) | set(old["props"])):
+                    _compare(out, f"{name} {key}", old["props"].get(key), part["props"].get(key), mine.get(key))
+        for key in sorted(set(new["solver"]) | set(base["solver"])):
+            _compare(out, f"Solver {key}", base["solver"].get(key), new["solver"].get(key), here["solver"].get(key))
+        return out
+
+    def update_neuron(self, keep_conflicts=True):
+        """Take the .mns as it is now, keeping the values changed here (fluid parameters, solver settings; also
+        where the source changed them too if keep_conflicts). Returns notes for the log."""
+        if self.neuron_base is None:
+            self.reference_status(NEURON)
+        source = Project.load(self.neuron_source)
+        new, base, here = neuron_state(source), self.neuron_base, neuron_state(self.neuron)
+        old_parts = {p.name: p for p in self.neuron.parts}
+        for part in source.parts:
+            b, h = base["parts"].get(part.name), here["parts"].get(part.name)
+            if b is None or h is None or not (b["role"] == h["role"] == part.role):
+                continue
+            for key, value in h["props"].items():
+                changed_here = value != b["props"].get(key)
+                changed_there = new["parts"][part.name]["props"].get(key) != b["props"].get(key)
+                if changed_here and (keep_conflicts or not changed_there):
+                    part.props[key] = copy.deepcopy(old_parts[part.name].props[key])
+            part.visible = old_parts[part.name].visible
+        for key, value in here["solver"].items():
+            changed_there = new["solver"].get(key) != base["solver"].get(key)
+            if value != base["solver"].get(key) and (keep_conflicts or not changed_there):
+                setattr(source.solver, key, value)
+        self.neuron, self.neuron_base = source, new
+        notes = []
+        if self.link.get("part") and self.link["part"] not in self.link_candidates():
+            notes.append(f"The linked membrane {self.link['part']} is no longer a membrane of the neuron: link again "
+                         "(Link tab).")
+            self.link = {"part": None, "driving": AUTOMATIC}
+        elif self.link.get("driving") not in (None, AUTOMATIC) and \
+                self.link["driving"] not in [p.name for p in self.chambers()]:
+            notes.append(f"The driving chamber {self.link['driving']} is gone: set to Automatic.")
+            self.link["driving"] = AUTOMATIC
+        known = {(p, f) for p, f, _, _ in self.parameters()}
+        for a in self.sweep["axes"]:
+            if (a.get("part"), a.get("field")) not in known:
+                notes.append(f"Sweep parameter {a.get('part')} {a.get('field')} no longer exists; it is left out.")
+        return notes
+
+    def update_design(self):
+        """Take the .mad as it is now (it must have simulated results). Returns notes on what changed."""
+        old = self.design() if self.design_data is not None else None
+        project, sha1 = self._read_design(self.design_path)
+        self.design_data, self.design_sha1 = project.to_dict(), sha1
+        new = self.design()
+        notes = []
+        if old is not None:
+            if tuple(old.dp_range) != tuple(new.dp_range):
+                notes.append(f"Δp range {old.dp_range[0]:.4g} … {old.dp_range[1]:.4g} → "
+                             f"{new.dp_range[0]:.4g} … {new.dp_range[1]:.4g} kPa")
+            if old.output_names != new.output_names:
+                notes.append(f"outputs {', '.join(old.output_names)} → {', '.join(new.output_names)}")
+            if not math.isclose(old.membrane_area, new.membrane_area, rel_tol=1e-9):
+                notes.append(f"membrane area {old.membrane_area:.4g} → {new.membrane_area:.4g} mm²")
+        return notes
 
     def link_candidates(self):
         """Neuron parts the design's membrane can replace: membranes, shells and activation membranes."""
@@ -168,14 +342,8 @@ class FullNeuronProject:
             for p, f in swept:
                 if part["name"] == p:
                     part["props"].pop(f, None)
-        design = None
-        if self.design_path and Path(self.design_path).exists():
-            path = Path(self.design_path)
-            key = (str(path), path.stat().st_mtime_ns)
-            if getattr(self, "_hash_key", None) != key:
-                self._hash, self._hash_key = hashlib.sha1(path.read_bytes()).hexdigest(), key
-            design = self._hash
-        text = json.dumps({"neuron": data, "link": self.link, "design": design}, sort_keys=True, default=str)
+        text = json.dumps({"neuron": data, "link": self.link, "design": self.design_sha1}, sort_keys=True,
+                          default=str)
         return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
     def dataset(self):
@@ -200,6 +368,7 @@ class FullNeuronProject:
             project.set_role(part, ACTIVATION_MEMBRANE)
             part.props.update(design=self.design_path, driving=self.link.get("driving") or AUTOMATIC,
                               thickness=thickness)
+            project.pinned_designs = {part.name: self.design()}   # the embedded version, not the file
         elif self.design_path:
             raise ValueError("Link the design: choose the neuron membrane it replaces (Link tab).")
         return project
@@ -248,9 +417,20 @@ class FullNeuronProject:
             for part in neuron["parts"]:
                 if part["props"].get("design"):
                     part["props"]["design"] = _relative(part["props"]["design"], path)
-        return {"type": FILE_TYPE, "version": 1, "neuron": neuron,
+        base = copy.deepcopy(self.neuron_base)
+        if base:
+            base["step_path"] = _relative(base["step_path"], path) if base["step_path"] else None
+            for part in base["parts"].values():
+                if part["props"].get("design"):
+                    part["props"]["design"] = _relative(part["props"]["design"], path)
+        design = copy.deepcopy(self.design_data)
+        if design:
+            design["step_path"] = _relative(design["step_path"], path)
+        return {"type": FILE_TYPE, "version": 2, "neuron": neuron,
                 "neuron_source": _relative(self.neuron_source, path) if self.neuron_source else None,
+                "neuron_base": base,
                 "design": _relative(self.design_path, path) if self.design_path else None,
+                "design_data": design, "design_sha1": self.design_sha1,
                 "link": self.link, "transforms": self.transforms, "record": self.record, "sweep": self.sweep,
                 "characterisation": self.characterisation}
 
@@ -270,7 +450,22 @@ class FullNeuronProject:
         if data.get("neuron"):
             project.neuron = Project.from_dict(data["neuron"], path.parent)
         project.neuron_source = resolve(data.get("neuron_source"))
+        base = data.get("neuron_base")
+        if base:
+            base["step_path"] = resolve(base["step_path"])
+            for part in base["parts"].values():
+                if part["props"].get("design"):
+                    part["props"]["design"] = resolve(part["props"]["design"])
+            project.neuron_base = base
         project.design_path = resolve(data.get("design"))
+        if data.get("design_data"):
+            design = data["design_data"]
+            design["step_path"] = resolve(design["step_path"])
+            project.design_data, project.design_sha1 = design, data.get("design_sha1")
+        elif project.design_path and Path(project.design_path).exists():
+            # version 1 only referenced the design: take the file as it is now
+            design, project.design_sha1 = cls._read_design(project.design_path)
+            project.design_data = design.to_dict()
         project.link = dict({"part": None, "driving": AUTOMATIC}, **(data.get("link") or {}))
         project.transforms = {k: dict(identity(), **(data.get("transforms") or {}).get(k, {}))
                               for k in (NEURON, ACTIVATION)}
@@ -284,6 +479,31 @@ class FullNeuronProject:
         project.characterisation = data.get("characterisation")
         project.path = str(path)
         return project
+
+
+def _editable_free(state):
+    """A neuron_state without the values that can be edited in the full neuron (chamber fields, solver)."""
+    state = copy.deepcopy(state)
+    for part in state["parts"].values():
+        if part["role"] == CHAMBER:
+            for key in [k for k in part["props"] if k not in LOCKED_FIELDS]:
+                del part["props"][key]
+    state["solver"] = {}
+    return state
+
+
+def _fmt(value):
+    return "(none)" if value is None else (f"{value:.6g}" if isinstance(value, float) else str(value))
+
+
+def _compare(out, label, base, new, here):
+    """Sort one value into neuron_changes' lists."""
+    if base != new and here != base and here != new:
+        out["conflicts"].append(f"{label}: {_fmt(here)} here; {_fmt(base)} → {_fmt(new)} in the source")
+    elif base != new:
+        out["source"].append(f"{label}: {_fmt(base)} → {_fmt(new)}")
+    elif here != base:
+        out["kept"].append(f"{label}: {_fmt(here)} here ({_fmt(base)} in the source)")
 
 
 # -----------------------------

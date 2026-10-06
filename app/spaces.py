@@ -8,7 +8,9 @@ Top-level window with the two spaces of the software, each a full window of its 
                                 tube (ActivationWindow), saved as a design (*.mad).
   Full neuron                 - both imported and linked (FullNeuronWindow): the design's membrane replaces a
                                 neuron membrane; fluid parameters, recording, sweeps; saved as *.mfn.
-  Design study                - a study folder worked on by the design agent through the mns command line,
+  Analysis                    - a full neuron's stored characterisation plotted against its swept parameters
+                                (AnalysisWindow; read only).
+  Agentic research study      - a study folder worked on by the design agent through the mns command line,
                                 followed live (StudyWindow); the agent is started from here.
 
 Each space keeps its own CAD model and project. The inactive space is hidden, so its keyboard
@@ -21,13 +23,15 @@ from qtpy.QtWidgets import QMainWindow, QTabWidget
 
 from .activation import DESIGN_SUFFIX
 from .activation_window import ActivationWindow
+from .analysis_window import AnalysisWindow
 from .full_neuron import SUFFIX as FULL_SUFFIX
 from .full_neuron_window import FullNeuronWindow
 from .main_window import APP_NAME, MainWindow
 from .study_window import StudyWindow
 
-NEURON_TAB, ACTIVATION_TAB, FULL_TAB, STUDY_TAB = ("Inputs → pre-activation", "Pre-activation → activation",
-                                                 "Full neuron", "Design study")
+NEURON_TAB, ACTIVATION_TAB, FULL_TAB, ANALYSIS_TAB, STUDY_TAB = ("Inputs → pre-activation",
+                                                               "Pre-activation → activation", "Full neuron",
+                                                               "Analysis", "Agentic research study")
 
 
 class AppWindow(QMainWindow):
@@ -38,12 +42,16 @@ class AppWindow(QMainWindow):
         self.neuron = MainWindow()
         self.activation = ActivationWindow()
         self.full = FullNeuronWindow()
+        self.analysis = AnalysisWindow()
         self.study = StudyWindow()
         self.study.open_design.connect(self.open_path)
+        self.full.open_source.connect(self.open_source)
+        self.analysis.open_source.connect(self.open_source)
+        self.full.analyse.connect(self.open_analysis)
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
         for window, title in ((self.neuron, NEURON_TAB), (self.activation, ACTIVATION_TAB), (self.full, FULL_TAB),
-                              (self.study, STUDY_TAB)):
+                              (self.analysis, ANALYSIS_TAB), (self.study, STUDY_TAB)):
             window.setWindowFlags(Qt.Widget)   # embedded: menus, docks and toolbars stay inside the tab
             window.windowTitleChanged.connect(self._update_title)
             self.tabs.addTab(window, title)
@@ -58,7 +66,7 @@ class AppWindow(QMainWindow):
 
     @property
     def spaces(self):
-        return (self.neuron, self.activation, self.full, self.study)
+        return (self.neuron, self.activation, self.full, self.analysis, self.study)
 
     def current(self):
         return self.tabs.currentWidget()
@@ -77,6 +85,8 @@ class AppWindow(QMainWindow):
         if lower.endswith("study.json") or (Path(path) / "study.json").exists():
             self.show_space(self.study)
             self.study.open_study(Path(path).parent if lower.endswith("study.json") else path)
+        elif lower.endswith(FULL_SUFFIX) and self.current() is self.analysis:
+            self.analysis.open_project(path)
         elif lower.endswith(FULL_SUFFIX):
             self.show_space(self.full)
             self.full.open_project(path)
@@ -86,11 +96,24 @@ class AppWindow(QMainWindow):
         elif lower.endswith(".mns"):
             self.show_space(self.neuron)
             self.neuron.open_project(path)
-        elif self.current() not in (self.full, self.study):
+        elif self.current() not in (self.full, self.analysis, self.study):
             self.current().open_step(path)
         else:
             self.show_space(self.neuron)
             self.neuron.open_step(path)
+
+    def open_analysis(self, path):
+        self.show_space(self.analysis)
+        self.analysis.open_project(path)
+
+    def open_source(self, path):
+        """Show a full neuron's component file in its own tab (opened there unless it is open already)."""
+        window = self.activation if str(path).lower().endswith(DESIGN_SUFFIX) else self.neuron
+        current = getattr(window.project, "path", None) if window.project is not None else None
+        if current and Path(current).resolve() == Path(path).resolve():
+            self.show_space(window)
+        else:
+            self.open_path(path)
 
     def closeEvent(self, event):
         for window in self.spaces:

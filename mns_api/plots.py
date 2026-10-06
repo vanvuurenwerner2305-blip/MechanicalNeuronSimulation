@@ -9,7 +9,6 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np  # noqa: E402
 from matplotlib.colors import LinearSegmentedColormap  # noqa: E402
 
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
@@ -45,18 +44,6 @@ def _grid(n, width=4.2, height=3.0):
     return fig, axes.ravel()[:n]
 
 
-def lines(path, x, series, xlabel, ylabel, title=""):
-    """series: [(label, y values)] over the same x."""
-    fig, ax = plt.subplots(figsize=(5.6, 3.6))
-    for k, (label, y) in enumerate(series):
-        ax.plot(x, y, "o-", color=color(k), label=label, markersize=4)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    if title:
-        ax.set_title(title)
-    if len(series) > 1:
-        ax.legend()
-    return _save(fig, path)
 
 
 def panels(path, x, panels_, xlabel, title=""):
@@ -74,27 +61,6 @@ def panels(path, x, panels_, xlabel, title=""):
     return _save(fig, path)
 
 
-def heatmap(path, x, y, z, xlabel, ylabel, zlabel, title="", diverging=False):
-    """z[j, i] at (x[i], y[j])."""
-    fig, ax = plt.subplots(figsize=(5.4, 4.0))
-    z = np.asarray(z, float)
-    if diverging:
-        lim = np.nanmax(np.abs(z)) or 1.0
-        cmap = LinearSegmentedColormap.from_list("mns_div", ["#1c5cab", "#86b6ef", "#efefef", "#f2a07f", "#b8441a"])
-        image = ax.pcolormesh(x, y, z, cmap=cmap, vmin=-lim, vmax=lim, shading="nearest")
-    else:
-        image = ax.pcolormesh(x, y, z, cmap=BLUES, shading="nearest")
-    fig.colorbar(image, ax=ax, label=zlabel)
-    for j in range(len(y)):
-        for i in range(len(x)):
-            if np.isfinite(z[j, i]) and len(x) * len(y) <= 49:
-                ax.text(x[i], y[j], f"{z[j, i]:.3g}", ha="center", va="center", fontsize=7, color=INK)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    ax.grid(False)
-    if title:
-        ax.set_title(title)
-    return _save(fig, path)
 
 
 def scatter_compare(path, points, xlabel, ylabel, title=""):
@@ -111,25 +77,3 @@ def scatter_compare(path, points, xlabel, ylabel, title=""):
         ax.set_title(title)
     return _save(fig, path)
 
-
-def weight_fits(path, weights):
-    """weights: [(title, dp samples, W samples, [(side label, dp curve, W curve)], xlabel)]."""
-    fig, axes = _grid(len(weights), 4.4, 3.2)
-    for ax, (title, dp, W, curves, xlabel) in zip(axes, weights):
-        dp, W = np.asarray(dp, float), np.asarray(W, float)
-        ok = np.isfinite(W)
-        main = np.abs(dp) >= 0.05 * np.nanmax(np.abs(dp)) if len(dp) else ok
-        ax.plot(dp[ok & main], W[ok & main], "o", color=SERIES[0], label="sampled W", markersize=4.5)
-        for k, (label, x, y) in enumerate(curves):
-            ax.plot(x, y, "-", color=SERIES[1 + k], label=label)
-        shown = np.concatenate([W[ok & main]] + [np.asarray(y) for _, _, y in curves]) if (ok & main).any() else W
-        shown = shown[np.isfinite(shown)]
-        if len(shown):
-            lo, hi = shown.min(), shown.max()
-            pad = 0.15 * (hi - lo or abs(hi) or 1.0)
-            ax.set_ylim(min(lo - pad, 0.0) if lo >= 0 else lo - pad, hi + pad)
-        ax.set_title(title, fontsize=9)
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel("W [mm³/kPa]")
-        ax.legend()
-    return _save(fig, path)

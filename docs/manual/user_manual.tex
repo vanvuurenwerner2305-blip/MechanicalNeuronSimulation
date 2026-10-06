@@ -1,0 +1,637 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[most]{tcolorbox}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\menu}[1]{\textsf{\textbf{#1}}}
+\newcommand{\key}[1]{\fbox{\footnotesize\textsf{#1}}}
+\newcommand{\dV}{\Delta V}
+\newtcolorbox{tip}{colback=blue!4,colframe=blue!40!black,boxrule=0.4pt,arc=1pt,left=4pt,right=4pt,top=2pt,bottom=2pt,
+  fonttitle=\bfseries\small,title=Tip}
+\newtcolorbox{warn}{colback=orange!6,colframe=orange!60!black,boxrule=0.4pt,arc=1pt,left=4pt,right=4pt,top=2pt,
+  bottom=2pt,fonttitle=\bfseries\small,title=Watch out}
+\setlist{itemsep=2pt,topsep=4pt}
+\renewcommand{\arraystretch}{1.15}
+\sloppy
+
+\title{Membrane Neuron Simulator\\[0.3em]\large User manual}
+\author{W.\ van Vuuren}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent The Membrane Neuron Simulator computes the static equilibrium of fluid-driven soft devices: rubber
+membranes between fluid chambers that push on each other, on rigid stops and on soft tubes. You draw the device
+in CAD, import it as STEP, give every solid a role, and solve. This manual explains how to use the program, from
+installing it to characterising a complete mechanical neuron. The formulation behind the solver (elements, pressure
+loads, contact and the Newton method) is in the separate technical reference,
+\code{docs/paper/membrane\_neuron\_simulator.pdf}.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%==========================================================================================================
+\section{Overview}
+
+A mechanical neuron has two stages, and the program has one workspace (a \emph{space}) for each, plus one for
+the combination, one to analyse its characterisation and one for automated studies. The spaces are the five tabs
+at the top of the window:
+
+\begin{center}
+\begin{tabularx}{\textwidth}{@{}lX l@{}}
+\toprule
+Tab & What you do there & Saved as \\
+\midrule
+\menu{Inputs → pre-activation} & Input chambers push on membranes into a closed pre-activation chamber. Solve
+  and sweep the inputs. & \code{.mns} \\
+\menu{Pre-activation → activation} & A membrane, driven by the pressure difference $\Delta p$ across it, squeezes a
+  soft tube; gas flows through the tube. Compute the \emph{activation function} once and save it as a design. &
+  \code{.mad} \\
+\menu{Full neuron} & Link a \code{.mns} and a \code{.mad}: the activation design replaces one neuron membrane.
+  Solve and characterise the complete neuron over many parameters. & \code{.mfn} \\
+\menu{Analysis} & Plot a full neuron's stored characterisation against its swept parameters (read only,
+  Section~\ref{sec:analysis}). & --- \\
+\menu{Agentic research study} & Let an AI design agent explore designs through the program's command line, and follow it
+  live (experimental side project, Section~\ref{sec:study}). & a study folder \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Each tab is a complete window with its own menus, toolbar and model, so you can have a neuron open in the first tab
+and a valve in the second at the same time.
+
+\paragraph{Units and sign conventions.} Lengths are in mm, Young's moduli in MPa, pressures in kPa and volumes in
+mm$^3$. All pressures are \textbf{gauge}: the surroundings are 0~kPa. A membrane face that touches no chamber sees
+0~kPa. The only exception is the flow-resistance equations of the activation space, which use SI units
+(Section~\ref{sec:flowlaws}).
+
+\paragraph{What is simulated.} Everything is quasi-static: the program finds the equilibrium shape for the given
+pressures, not the motion towards it. Membranes are large-strain rubber sheets (incompressible neo-Hookean by
+default); shells add bending stiffness; fluid chambers either hold a set pressure or change pressure with their
+volume; rigid bodies and soft solids are kept apart by contact. The solver is a Newton--Raphson method that ramps the
+pressures up in load steps.
+
+%==========================================================================================================
+\section{Installation and start-up}
+
+The program is written in Python and runs on Windows with Anaconda (Python 3.11). It needs
+\code{numpy}, \code{scipy}, \code{torch}, \code{pyvista}, \code{pyvistaqt}, \code{PyQt5} and \code{matplotlib}, all
+part of or installable into Anaconda, plus \code{gmsh}, installed with \code{pip install gmsh}. Building the
+reports of design studies needs a \LaTeX\ installation (MiKTeX) with \code{pdflatex} on the path.
+
+Start the program in one of these ways:
+\begin{itemize}
+\item double-click the desktop shortcut or \code{Membrane Neuron Simulator.bat};
+\item from a terminal in the \code{MembraneNeuronSimulator} folder:
+\begin{verbatim}
+python run_app.py                  # empty window
+python run_app.py model.step       # import a STEP file
+python run_app.py project.mns      # open a neuron project
+python run_app.py valve.mad        # open an activation design
+\end{verbatim}
+\end{itemize}
+
+The program runs without a console. If it misbehaves, errors are written to
+\code{\%USERPROFILE\%\textbackslash.membrane\_neuron\_simulator\textbackslash errors.log} and \code{crash.log}.
+
+%==========================================================================================================
+\section{Preparing the CAD model}
+\label{sec:cad}
+
+The simulator does not draw geometry; it reads a STEP file in which every region is its own solid body. These rules
+apply to every space.
+
+\begin{enumerate}
+\item \textbf{One solid per region.} Each membrane or shell is a thin solid; each fluid chamber is a solid that
+  fills the fluid space; frames, housings and stops are solids. In Fusion~360 a multi-body part or an assembly both
+  work.
+\item \textbf{Bodies touch, they do not overlap.} A membrane and the chambers on either side of it share faces. A
+  chamber fills exactly the space between its walls. Overlaps make the coupling detection unreliable.
+\item \textbf{A membrane is a plate with one main face.} The program builds the membrane's mid-surface from its
+  \emph{largest} CAD face, moved half the measured thickness into the solid. Make each membrane a single flat or
+  curved face (a disc, plate or dome), not a face split into patches.
+\item \textbf{A chamber must cover the membrane face it loads.} The coupling is found geometrically: points just
+  beyond each membrane face are tested against every chamber solid.
+\item \textbf{Name your bodies.} Part names (or Fusion~360 body names) are carried over and appear in the model
+  tree. Names such as \code{Membrane\_1}, \code{Chamber\_A}, \code{Housing} or \code{TubeFluid} let the program
+  guess roles for you.
+\item \textbf{Export in millimetres} as STEP (\code{.step} or \code{.stp}).
+\end{enumerate}
+
+\begin{tip}
+Two generated examples show a correct model: \code{python examples/make\_neuron\_step.py} writes
+\code{examples/soft\_neuron.step} (a neuron), and \code{python examples/make\_activation\_step.py} writes
+\code{examples/squeeze\_valve.step} (a valve with \code{TubeFluid}, \code{InletFluid} and \code{OutletFluid}).
+\end{tip}
+
+%==========================================================================================================
+\section{The window}
+
+The neuron and activation tabs share the same layout:
+
+\begin{itemize}
+\item \textbf{3D view} (centre). Left-drag rotates, right-drag or the wheel zooms, middle-drag pans. Click a part to
+  select it; \key{Ctrl}+click adds parts to the selection. Clicking the same spot again selects the part
+  \emph{behind} the selected one, so you can reach inner parts without hiding anything.
+\item \textbf{Model tree} (left). Every solid with its role colour. Untick a part to hide it. Right-click a selection
+  for \menu{Assign role}, \menu{Show only these} and \menu{Show all}. In the activation space the tree also lists
+  the \menu{Flow connections}.
+\item \textbf{Side tabs} (right): \menu{Part} (role and properties of the selection), extra tabs of the space,
+  \menu{Solver}, \menu{Results}.
+\item \textbf{Message log} (bottom). Everything the program does and finds: couplings, warnings, convergence.
+  Long jobs run in the background; the \menu{Cancel} button next to the log stops them.
+\item \textbf{View toolbar}: view mode, element edges, a \menu{Transparency} slider for unselected parts and a
+  \menu{Section} cut (axis plus position slider).
+\end{itemize}
+
+\begin{center}
+\begin{tabular}{@{}ll@{\qquad}ll@{}}
+\toprule
+Key & Action & Key & Action \\
+\midrule
+\key{Ctrl}+\key{O} & Open STEP & \key{F5} & Solve / Simulate \\
+\key{Ctrl}+\key{Shift}+\key{O} & Open project / design & \key{F6} & Sweep (neuron) \\
+\key{Ctrl}+\key{S} & Save & \key{1} \key{2} \key{3} & Model / Mesh / Results view \\
+\key{Ctrl}+\key{Shift}+\key{S} & Save as & \key{E} & Show element edges \\
+\key{Ctrl}+\key{M} & Mesh & \key{R} & Reset camera \\
+\key{Ctrl}+\key{K} & Check model & \key{F1} & Quick guide \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%==========================================================================================================
+\section{Inputs → pre-activation (the neuron)}
+\label{sec:neuron}
+
+\subsection{Workflow}
+
+\begin{enumerate}
+\item \menu{File → Open STEP} (\key{Ctrl}+\key{O}). Every solid appears in the model tree as \emph{Unassigned}.
+\item \textbf{Assign roles} (Section~\ref{sec:neuronroles}). Select one or more parts and choose the role in the
+  \menu{Part} tab, or right-click → \menu{Assign role}. \menu{Edit → Auto-assign roles from names} fills in
+  unassigned parts from their names. To reach parts inside a housing, untick the housing, click through it, or use a
+  section cut.
+\item \textbf{Set the properties} of each part in the \menu{Part} tab. Thicknesses are measured from the CAD when
+  the role is assigned. Selecting several parts of the same role edits them together.
+\item \menu{Simulation → Check model} (\key{Ctrl}+\key{K}). This meshes the model and writes to the log which
+  chamber loads which membrane, from which side, and any warnings (for example a chamber that touches no
+  membrane). Fixed nodes are drawn in blue in the mesh view.
+\item \menu{Simulation → Solve} (\key{F5}), then read the \menu{Results} tab (Section~\ref{sec:results}).
+\item \menu{Simulation → Sweep} (\key{F6}) to map the response over one or two inputs
+  (Section~\ref{sec:sweep}).
+\item \menu{File → Save project} (\key{Ctrl}+\key{S}) stores roles, properties and solver settings in a
+  \code{.mns} file. The STEP file is referenced, not copied; keep it next to the project.
+\end{enumerate}
+
+\subsection{Roles and properties}
+\label{sec:neuronroles}
+
+\begin{center}
+\begin{tabularx}{\textwidth}{@{}l X@{}}
+\toprule
+Role & Simulated as \\
+\midrule
+Membrane & Rubber sheet on the solid's mid-surface, no bending stiffness. \\
+Shell & The same, with bending stiffness (use it for stiffer, thicker sheets). \\
+Rigid body & Undeformable obstacle (housing, stop). Membranes cannot pass through it. \\
+Fluid chamber & Pressure on every membrane or shell face it touches. \\
+Activation membrane & A membrane replaced by a pre-computed activation design (\code{.mad}); see
+  Section~\ref{sec:full}. \\
+Ignore / Unassigned & Left out of the simulation. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\paragraph{Membrane and shell properties.}
+\begin{description}[font=\normalfont\itshape,leftmargin=1.5em]
+\item[Material model] Neo-Hookean (incompressible rubber, default) or St.\ Venant--Kirchhoff (then also
+  \emph{Poisson's ratio}, default 0.45).
+\item[Young's modulus] Default 0.5~MPa for a membrane, 1.0~MPa for a shell. Silicone rubbers are typically
+  0.05--1~MPa.
+\item[Thickness] Measured from the CAD solid when the role is assigned; type a value to override it.
+\item[Elements per shortest side] Mesh density along the shorter in-plane side (default 10). 8--14 is the useful
+  range; keep it the same across designs you compare.
+\item[Fixed edges] \emph{All boundary edges} (default) or only \emph{Edges touching rigid bodies}.
+\item[Edge support] (shells) \emph{Clamped} edges keep their slope, \emph{Pinned} edges can rotate.
+\item[Pre-tension] (membranes) Isotropic in-plane tension in N/mm before any pressure is applied.
+\end{description}
+
+\paragraph{Rigid body.} Only \emph{Elements per shortest side} (the surface mesh used for contact). Curved surfaces
+need a finer mesh, because contact is checked at the membrane's nodes against this mesh.
+
+\paragraph{Fluid chamber.} The \emph{Pressure model} decides how the pressure behaves; the chamber is coloured
+accordingly in the 3D view.
+
+\begin{center}
+\begin{tabularx}{\textwidth}{@{}l l X@{}}
+\toprule
+Model & Colour & Behaviour and settings \\
+\midrule
+Constant pressure (input) & green & Held at \emph{Pressure}. These are the neuron's inputs. \\
+Closed: ideal gas (isothermal) & blue & Sealed air, at \emph{Pressure} when sealed. Boyle's law on the gas share.
+  \emph{Ghost volume} (mm$^3$) adds volume that is connected but not drawn (tubing). \emph{Incompressible fluid}
+  (\%) fills part of the chamber with liquid; the colour gets darker as it rises. \\
+Closed: incompressible & purple & Sealed liquid, $P = P_0 - K(V - V_\text{fluid})$. \emph{Stiffness} in kPa per \%
+  volume change (default 10; water is about 22\,000; above about 1\,000 the results barely change while solving
+  gets slower). \emph{Fluid volume} defaults to the body volume; less liquid than the cavity gives suction, more
+  inflates it. \\
+Vent (open to surroundings) & transparent & Always 0~kPa. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\subsection{Solver settings}
+\label{sec:solver}
+
+The \menu{Solver} tab holds settings that rarely need changing:
+\begin{description}[font=\normalfont\itshape,leftmargin=1.5em]
+\item[Load steps] (default 10) The pressures are ramped from 0 to full in this many steps. A step that fails is
+  cut automatically, so this is a starting value.
+\item[Max Newton iterations] (default 40) per load step.
+\item[Residual tolerance] (default $10^{-8}$) relative convergence criterion.
+\item[Contact stiffness] (MPa/mm) The penalty stiffness of contact. 0 (default) chooses it automatically so that the
+  penetration stays at about 1--5\,\% of the thinnest part at the highest pressure.
+\end{description}
+
+\subsection{Results}
+\label{sec:results}
+
+After a solve, the view switches to \menu{Results} (\key{3}). The \menu{Results} tab offers:
+\begin{itemize}
+\item the contour field: displacement magnitude, displacement X, Y or Z, or area stretch (how much a membrane's area
+  has grown; above about 2 the rubber is stretched far);
+\item a slider through the converged load steps; step \emph{0 (start)} shows the chamber pressures on the undeformed
+  shape (for example the initial suction of an under-filled liquid chamber);
+\item \emph{Same colour range for all load steps}, to compare steps by eye;
+\item a table of every chamber's pressure and volume change;
+\item export to CSV (table) and VTK (meshes, for ParaView), and \menu{File → Screenshot}.
+\end{itemize}
+
+\subsection{Sweeps}
+\label{sec:sweep}
+
+\menu{Simulation → Sweep} (\key{F6}) opens the sweep dialog.
+
+\begin{enumerate}
+\item Choose one or two input chambers with a range (\emph{From}, \emph{To} in kPa) and a number of
+  \emph{Points}. Two inputs give a grid.
+\item Press \menu{Run}. Each point starts from its neighbour's solution, so a sweep is several times faster than
+  separate solves.
+\end{enumerate}
+The table lists every chamber's pressure at every point, and the outputs of any linked activation design. The plot
+shows the chosen \emph{Plot output} against the inputs (a line, or a heat map for two inputs). \menu{Export CSV…}
+writes all points, with the chambers' volume changes.
+
+\begin{tip}
+To sweep more than two parameters, or other chamber values than input pressures, link the neuron in the
+\menu{Full neuron} tab, run a characterisation (Section~\ref{sec:full}) and look at it in the \menu{Analysis} tab
+(Section~\ref{sec:analysis}).
+\end{tip}
+
+%==========================================================================================================
+\section{Pre-activation → activation (the valve)}
+\label{sec:activation}
+
+The device is a valve: the pressure difference $\Delta p$ across a membrane squeezes a soft tube, through a part
+bonded to the membrane (a pusher, rigid or deformable), against a rigid body. Gas flows through the tube from a
+supply to a sink. The program computes how the tube's cross-section, the mass flow and the pressures along the
+tube change with $\Delta p$. You simulate it once, save it as a design (\code{.mad}) and then use it as a part in a
+neuron without simulating it again.
+
+\subsection{Building the model}
+
+In CAD, make solids for the membrane, the pusher (touching the membrane's face and the tube), the tube, the rigid
+body behind it, and the gas: one body filling the tube exactly, a supply body against the tube's inlet end and a
+sink body against its outlet end. The tube needs two planar end faces normal to its axis.
+
+\begin{center}
+\begin{tabularx}{\textwidth}{@{}l X@{}}
+\toprule
+Role & Simulated as \\
+\midrule
+Membrane / Shell & As in the neuron space, clamped along its edges. Positive $\Delta p$ pushes it towards the tube.
+  It is bonded to every free rigid body or solid its face touches. \\
+Channel (tube) & 3D solid (quadratic 10-node tetrahedra, compressible neo-Hookean, $E$ = 0.5~MPa,
+  $\nu$ = 0.45), fixed at its two end faces. \\
+Fluid, Constant pressure & A supply or sink held at \emph{Pressure}. \\
+Fluid, Dynamic pressure & The pressure follows from the flow. The fluid filling the tube is cut into
+  \emph{Segments} (default 10) along it, each a flow resistance in series with its own pressure on the tube wall. \\
+Solid & Deformable 3D part (for example a soft pusher). \emph{Support}: free (held by what it is bonded to) or
+  fixed where it touches fixed rigid bodies. \\
+Rigid body & \emph{Motion}: Fixed (an obstacle, such as the block the tube lies on) or Free (moves and tilts as a
+  rigid body, for example a rigid pusher). \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{warn}
+A deformable (Solid) pusher can fail to converge on round tubes. Use a free rigid pusher there.
+\end{warn}
+
+\subsection{Flow connections}
+
+Wherever two fluid bodies touch, and wherever a dynamic fluid faces the outside, the program creates a \emph{flow
+connection}. They are listed under \menu{Flow connections} in the model tree and in the \menu{Flow} tab; selecting
+one highlights its contact face. Each is one of:
+\begin{itemize}
+\item \textbf{Opening} (no resistance) — the default between two fluids;
+\item \textbf{Orifice} — a resistance given by your equation;
+\item \textbf{Closed} — the default towards the outside.
+\end{itemize}
+
+\subsection{Flow resistance equations}
+\label{sec:flowlaws}
+
+A resistance equation gives the pressure drop in \textbf{Pa} for a mass flow \code{mdot} in \textbf{kg/s}, in SI
+units. Available variables:
+
+\begin{center}\small
+\begin{tabular}{@{}ll@{\qquad}ll@{}}
+\toprule
+\code{mdot} & mass flow (kg/s) & \code{A}, \code{P} & area (m$^2$), perimeter (m) \\
+\code{rho} & density at the mean pressure & \code{h}, \code{w} & height and width of the section \\
+\code{rho\_up} & upstream density & \code{L} & segment length \\
+\code{mu} & viscosity (Pa\,s) & \code{Dh} & hydraulic diameter $4A/P$ \\
+\code{p}, \code{p\_up}, \code{p\_down} & mean, up-, downstream pressure & & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+A segment uses the smallest cross-section in it; a connection uses its contact face (for a typical model, the whole
+bore). The defaults are
+\begin{itemize}
+\item segment (laminar): \code{32*mu*L*mdot/(rho*A*Dh**2)};
+\item orifice: \code{(mdot/(0.61*A))**2/(2*rho\_up)}.
+\end{itemize}
+A smaller orifice than the contact face needs its area typed into the equation, for example
+\code{(mdot/(0.61*0.05e-6))**2/(2*rho\_up)}.
+
+\begin{tip}
+Size an orifice between the resistance of the open and of the closed tube. An orifice much smaller than the
+closed tube takes the whole pressure drop, and the tube then never controls the flow.
+\end{tip}
+
+\subsection{Study settings and simulating}
+
+The \menu{Study} tab sets the $\Delta p$ sweep and the gas:
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Setting & Default & Meaning \\
+\midrule
+$\Delta p$ from / to, Points & 0 / 20~kPa, 21 & the pre-activation range \\
+Pressure tolerance & 0.01~kPa & structure--flow iteration converged \\
+Max flow iterations & 30 & per $\Delta p$ point \\
+Gas constant $R$, Temperature & 287.05~J/(kg\,K), 293.15~K & ideal gas, $\rho = p_\text{abs}/(RT)$ \\
+Atmospheric pressure & 101.325~kPa & gauge to absolute \\
+Viscosity $\mu$ & $1.81\times10^{-5}$~Pa\,s & air \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Press \menu{Simulate} (\key{F5}). At every $\Delta p$ the structure and the flow are iterated until the pressures on
+the tube wall stop changing; the live plot follows the newest point.
+
+\subsection{Outputs and results}
+
+A dynamic fluid has a list of named \emph{Outputs}: the gas pressure of one segment, for example \emph{activation}
+at segment 10. Add, rename or remove them in the \menu{Part} tab; choosing a segment highlights it in yellow in the 3D
+view. Changing outputs does not require a new simulation.
+
+The \menu{Results} tab shows the minimum tube area and the mass flow against $\Delta p$, the pressures at the tube
+ends and at the outputs against $\Delta p$, and the area and pressure profile along the tube at the selected point.
+\menu{Save design…}, \menu{Export CSV…}, \menu{Export VTK…} and \menu{Screenshot…} are underneath.
+
+\paragraph{Saving.} \menu{File → Save design} (\key{Ctrl}+\key{S}) stores the roles, connections, settings, the
+results and the deformed shapes in one \code{.mad} file. Opening it shows the curves without simulating again. From
+Python, \code{ActivationDesign.load("valve.mad")} gives \code{.area(dp)}, \code{.mass\_flow(dp)} and
+\code{.end\_pressure(dp)}.
+
+\begin{warn}
+A design is valid only for the supply and sink pressures it was simulated with. Change those and simulate again.
+\end{warn}
+
+%==========================================================================================================
+\section{Full neuron}
+\label{sec:full}
+
+The full neuron combines a neuron project (\code{.mns}) and an activation design (\code{.mad}). One membrane of the
+neuron is replaced by the design's pre-computed curve of swept volume against $\Delta p$, so the valve is not
+simulated again.
+
+\subsection{Linking a design into a neuron}
+
+There are two ways:
+\begin{itemize}
+\item \textbf{In the neuron space}: give the membrane the role \emph{Activation membrane}, choose the \code{.mad} file
+  under \emph{Activation design} and, if needed, the \emph{Driving chamber} (the chamber whose pressure pushes the
+  membrane towards the tube; \emph{Automatic} takes the closed chamber it touches). Solves and sweeps then also report
+  the design's outputs.
+\item \textbf{In the Full neuron tab} (recommended for characterisation):
+  \begin{enumerate}
+  \item \menu{File → Import inputs to pre-activation…} (\key{Ctrl}+\key{I}) loads a \code{.mns}; a copy is embedded
+    in the full neuron, the original is not changed.
+  \item \menu{File → Import pre-activation to activation…} (\key{Ctrl}+\key{Shift}+\key{I}) loads a \code{.mad}. It
+    must have been simulated with a version that records swept volume; otherwise simulate it again.
+  \item In the \menu{Link} tab, choose the neuron part to replace and the driving chamber.
+  \end{enumerate}
+\end{itemize}
+
+Copies of both imported files are kept in the full neuron, so it keeps working if the files are moved, and later
+changes to them do not reach it until you update (Section~\ref{sec:outdated}).
+
+The model tree shows two groups, \emph{Inputs to pre-activation} and \emph{Pre-activation to activation}. Click a
+group to move or rotate it in the view (display only). Only chamber values (pressures, stiffness, volumes) can be
+edited here, not the chamber models or the design.
+
+\subsection{Solving and characterising}
+
+\menu{Solve once at the set values} (\key{F5}) solves the neuron at the current chamber values.
+
+\menu{Run characterisation} (\key{F6}) solves a grid. In the \menu{Record \& run} tab:
+\begin{enumerate}
+\item add sweep axes with \menu{Add parameter}: a part, a field (any numeric chamber value), from, to and points.
+  You can sweep as many as you want; the number of solves is the product of the points;
+\item tick what to record: chamber pressures \code{P:<chamber>} and volume changes \code{dV:<chamber>}, the
+  pre-activation \code{dp}, the design outputs \code{out:<name>}, the tube area and the mass flow;
+\item optionally \emph{Store the deformed shapes}, to see every point in 3D after reopening (larger file).
+\end{enumerate}
+The grid is solved in a snake-like order so that each point starts from a prediction made from its neighbours.
+Dense axes are cheap: most of the cost is in the first few kPa where membranes are slack.
+
+When the run finishes, the dataset is stored in the \code{.mfn} file and the file is saved. Opening the file later
+shows the stored dataset; a warning appears when the model has changed since. The \menu{Results} tab lists every
+point; \menu{Export CSV…} writes the table. From Python, the stored dataset can be interpolated at any parameter
+values without simulating again.
+
+\begin{warn}
+If $\Delta p$ leaves the range the activation design was simulated over, the result is \textbf{extrapolated}: rows are
+marked orange, the 3D view shows a red overlay and a message lists the points. Simulate the design over a wider
+$\Delta p$ range.
+\end{warn}
+
+\menu{Analyse…} in the \menu{Results} tab (\menu{Simulation → Analyse characterisation}, \key{F7}) saves the full
+neuron and opens its characterisation in the \menu{Analysis} tab.
+
+\subsection{Out-of-date components}
+\label{sec:outdated}
+
+As in a CAD assembly, the full neuron keeps using the versions of the \code{.mns} and \code{.mad} it imported. When
+you save changes to one of those files (in its own tab or anywhere else), the full neuron notices within a couple of
+seconds:
+\begin{itemize}
+\item its group in the model tree turns orange with a warning sign, and hovering it says why;
+\item \menu{Update} appears in the toolbar (with the number of out-of-date components) and in the \menu{File} menu;
+\item the status bar and the log name the changed file. A file that is no longer found is reported in red; the copy
+  kept in the full neuron is then used.
+\end{itemize}
+Right-click a group for \menu{Update from <file>} or \menu{Open <file> in its tab}; clicking a group shows the same
+two buttons in its properties.
+
+Updating a \textbf{neuron} shows what changed: values changed in the \code{.mns} since it was imported are taken,
+values you changed in the full neuron (fluid parameters, solver settings) are kept, and for a value changed in both
+places a check box chooses which wins. If the linked membrane is no longer a membrane, the link is cleared. Updating
+a \textbf{design} takes the new version at once (it must have simulated results). Results and the stored
+characterisation made with the old version are then reported as outdated: run them again.
+
+%==========================================================================================================
+\section{Analysis}
+\label{sec:analysis}
+
+The \menu{Analysis} tab plots a full neuron's stored characterisation without simulating anything. Open a
+\code{.mfn} with \menu{File → Open full neuron…} (\key{Ctrl}+\key{O}), or press \menu{Analyse…} in the
+\menu{Full neuron} tab. The model tree and the properties show every part's settings, read only (a swept setting
+shows its range and the value currently shown); change them in their own tabs.
+
+\begin{enumerate}
+\item Choose the result to plot as \emph{Z} (anything recorded, for example the pre-activation chamber's
+  pressure).
+\item Tick swept parameters as plot axes, in order. The first gives a curve, the second a surface, the third a row
+  of surfaces, the fourth a grid of surfaces and the fifth layers of grids: move the \textbf{scroll wheel} over the
+  plots to go up and down the layers.
+\item From the third ticked parameter on, the parameter shows \emph{how many} of its values to use instead of a
+  slider. Every unticked parameter is held at its slider's value.
+\item \emph{Interpolate between the simulated points}: off, only simulated points are used and the sliders snap to
+  them; on, values in between are interpolated linearly from the neighbouring points.
+\end{enumerate}
+
+All panels share one Z scale and colour bar. Red points were extrapolated beyond the activation design's range,
+black crosses did not converge, and gaps were not solved. \emph{Surfaces as} switches between 3D surfaces and flat
+colour maps. Surfaces are drawn by the graphics card: drag to turn them (all panels turn together), right-drag or the
+scroll wheel to zoom (the wheel changes layers instead when five axes are ticked). Click a point in a plot to show the
+neuron and the design deformed there in the \menu{3D view} (interpolated when interpolation is on); the point is
+ringed in orange and its values are listed under \emph{Point shown in 3D}.
+
+\begin{tip}
+The program can also be started straight into this tab: \code{python run\_app.py --analyse neuron.mfn}.
+\end{tip}
+
+%==========================================================================================================
+\section{Design studies with an AI agent}
+\label{sec:study}
+
+The \menu{Agentic research study} tab runs a design agent (Claude Code) on a study folder and lets you follow it. The agent
+cannot write or run code: it only uses the program's \code{mns} command line, builds designs from parametric design
+files, runs them, and writes a \LaTeX\ report per design and one for the study.
+
+\begin{warn}
+The agentic research study is very experimental and a side project next to the simulator itself. Expect rough edges, and check
+the agent's designs and conclusions yourself before relying on them.
+\end{warn}
+
+\begin{enumerate}
+\item \menu{New study…}: choose an empty folder, write the \emph{brief} (the goal, the free parameters and their
+  ranges, what to measure, the time budget) and add your starting models (\code{.mns}, \code{.mad},
+  \code{.mfn}). They are imported as the first designs.
+\item \menu{Start agent} opens Windows Terminal in the study folder with Claude Code running. The first time, accept
+  Claude Code's question whether to trust the folder.
+\item Watch the tab. With \emph{Follow the agent} ticked it shows the design the agent works on, the deforming shape
+  during solves, the agent's current command and its reason, the design list, the event log, and every plot and
+  picture. \menu{Open in its space} opens a design in the matching tab.
+\item \menu{Edit brief}, \menu{Open folder} and \menu{Study report} give quick access to the folder.
+\end{enumerate}
+
+At the end, \code{report/study.pdf} holds the overall findings. Each design has a folder
+\code{designs/<ID>\_<name>/} with \code{design.yaml} (parameters, geometry, roles), \code{model.step}, the
+simulator project, \code{results/}, \code{renders/} and \code{report/design.pdf}.
+
+You can use the same command line yourself, in the study folder: \code{mns help} lists the commands, and
+\code{MANUAL.md} in the study folder documents them and the design-file format. For example:
+\begin{verbatim}
+mns design derive N001 thin --set Membrane1.thickness=0.3 --why "thinner"
+mns sweep N002 --input Input1=0:20:5 --input Input2=0:20:5
+mns report study --build
+\end{verbatim}
+
+%==========================================================================================================
+\section{Troubleshooting}
+
+\begin{center}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright}p{0.32\textwidth} X@{}}
+\toprule
+Symptom & What to try \\
+\midrule
+A chamber ``touches no membrane'' in Check model & The chamber's faces must meet the membrane face exactly.
+  Inspect with a section cut; fix overlaps or gaps in CAD. \\
+A membrane's mid-surface looks wrong & The membrane must have one main face (Section~\ref{sec:cad}). \\
+The solve does not reach full load & More \emph{Load steps}; fewer elements per side; check for a physical limit
+  point (a membrane ballooning past its peak pressure, or snap-through). The log reports the load factor reached. \\
+Very large area stretch ($>2$) & The membrane hits a wall or is over-stretched: bigger chamber, thicker or stiffer
+  membrane. \\
+A full neuron component is marked out of date & Its file was saved with changes: right-click the group →
+  \menu{Update} (Section~\ref{sec:outdated}). \\
+The tube never controls the flow & The orifice is much smaller than the closed tube; enlarge it. \\
+Some $\Delta p$ points did not converge & They are marked in the plot. Raise \emph{Max flow iterations}, use a
+  coarser tube mesh, or use a rigid pusher. \\
+``EXTRAPOLATING'' & Simulate the activation design over a wider $\Delta p$ range. \\
+The program closes or hangs & Read \code{errors.log} and \code{crash.log} in
+  \code{\%USERPROFILE\%\textbackslash.membrane\_neuron\_simulator}. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{Known limitations}
+
+\begin{itemize}
+\item Static only: no dynamics, no time.
+\item Contact is checked at mesh nodes; use a mesh fine enough to follow the obstacle's curvature. A sheet does not
+  contact itself.
+\item A membrane's mid-surface comes from its single largest CAD face.
+\item Flow is steady, isothermal and lumped (uniform pressure per segment). No choked flow unless you write it into
+  the resistance equation. A fully closed tube keeps about 2\,\% of its open area (the contact gap).
+\item A deformable Solid pusher may not converge on round tubes.
+\item An activation design is valid only for the supply and sink pressures it was simulated with.
+\end{itemize}
+
+\section{Files}
+
+\begin{center}
+\begin{tabularx}{\textwidth}{@{}l X@{}}
+\toprule
+File & Contents \\
+\midrule
+\code{.step} & Your CAD model (not changed by the program). \\
+\code{.mns} & Neuron project: STEP path, roles, properties, solver settings, sweep settings. \\
+\code{.mad} & Activation design: roles, connections, study settings, results and deformed shapes. \\
+\code{.mfn} & Full neuron: embedded copies of the neuron and the design (with their file paths, to detect
+  changes), the link and the stored characterisation. \\
+\code{<name>.csv} & Sweep export. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\end{document}

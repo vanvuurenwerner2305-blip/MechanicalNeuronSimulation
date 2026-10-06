@@ -490,8 +490,8 @@ def import_full(study, path, name, why=""):
                             source=path.with_suffix(".mfn#neuron"))
     out.append(neuron)
     activation = None
-    if full.design_path and Path(full.design_path).exists():
-        activation = import_project(study, ActivationProject.load(full.design_path), "activation",
+    if full.design_data is not None:   # the version embedded in the .mfn
+        activation = import_project(study, full.design_project(), "activation",
                                     Path(full.design_path).stem, why or f"activation design of {path.name}",
                                     source=Path(full.design_path).resolve())
         out.append(activation)

@@ -1,5 +1,5 @@
 """
-Design study tab: a study folder worked on by the design agent (Claude Code, through the `mns` command line),
+Agentic research study tab: a study folder worked on by the design agent (Claude Code, through the `mns` command line),
 followed live. Nothing here controls the agent; the tab only reads the study folder:
 
   .mns/events.jsonl        what the agent ran and why, designs created, files written (polled)
@@ -44,7 +44,7 @@ class NewStudyDialog(QDialog):
 
     def __init__(self, parent=None, start_dir=""):
         super().__init__(parent)
-        self.setWindowTitle("New design study")
+        self.setWindowTitle("New agentic research study")
         self.resize(640, 460)
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -125,7 +125,7 @@ class StudyWindow(QMainWindow):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Design study")
+        self.setWindowTitle("Agentic research study")
         self.root = None
         self.worker = None
         self.offset = 0

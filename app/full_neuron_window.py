@@ -11,11 +11,12 @@ from types import SimpleNamespace
 
 import numpy as np
 import pyvista as pv
-from qtpy.QtCore import QSettings, Qt, QTimer
-from qtpy.QtGui import QColor
-from qtpy.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox,
-                            QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
-                            QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
+from qtpy.QtCore import QSettings, Qt, QTimer, Signal
+from qtpy.QtGui import QBrush, QColor
+from qtpy.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+                            QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox,
+                            QHBoxLayout, QHeaderView, QLabel, QListWidget, QListWidgetItem, QMainWindow, QMenu,
+                            QMessageBox, QPlainTextEdit, QProgressBar,
                             QPushButton, QScrollArea, QSlider, QSpinBox, QStyle, QTableWidget,
                             QTableWidgetItem, QTabWidget, QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
@@ -28,8 +29,8 @@ from .activation import channel_axis, detect_connections, segment_faces
 from .activation_window import OUTPUT_COLORS, _raised
 from .builder import generate_mesh, mesh_sizes
 from .cad import CadModel
-from .full_neuron import (ACTIVATION, LOCKED_FIELDS, NEURON, SUFFIX, FullNeuronProject, default_axis, make_dataset,
-                          run_grid, shell_bodies, transform_points, values_or_nan)
+from .full_neuron import (ACTIVATION, CURRENT, LOCKED_FIELDS, MISSING, NEURON, OUTDATED, SUFFIX, FullNeuronProject,
+                          default_axis, make_dataset, run_grid, shell_bodies, transform_points, values_or_nan)
 from .panels import FieldForm, SolverPanel, color_icon, fmt
 from .project import (ACTIVATION_MEMBRANE, AUTOMATIC, CHAMBER, DEFORMABLE, FLUID, RIGID, ROLE_COLORS, ROLE_FIELDS,
                       PartSettings, part_color)
@@ -41,6 +42,8 @@ FILTER = f"Full neuron (*{SUFFIX})"
 DESIGN_BASE = 100000     # pick ids of the design's parts: DESIGN_BASE + index
 GROUP_NAMES = {NEURON: "Inputs to pre-activation", ACTIVATION: "Pre-activation to activation"}
 LINK_COLOR = "#c2185b"
+STATUS_COLORS = {OUTDATED: "#e65100", MISSING: "#c62828"}
+WATCH_MS = 1500          # how often the source files are checked for saved changes
 MODEL, RESULTS = "Model", "Results"
 
 GUIDE = """
@@ -60,9 +63,14 @@ volume, liquid share, stiffness or fluid volume; from, to, points) and tick ever
 characterisation</b> (F6) solves every combination and keeps the dataset with the model (saved in the *.mfn), so the
 neuron can later be used without simulating it again. <b>Solve</b> (F5) solves once at the set values. Click a row in
 the Results tab to see that point in 3D (neuron and design coloured by displacement).</li>
-<li><b>File → Save</b> keeps everything in one *.mfn file (the neuron's parameters are stored in it; the original
-.mns is not changed).</li>
+<li><b>File → Save</b> keeps everything in one *.mfn file (copies of both components are stored in it; the original
+.mns and .mad are not changed).</li>
 </ol>
+<p><b>Out of date components</b> (as in a CAD assembly): the full neuron keeps using the versions of the .mns and
+.mad it imported. When you save changes to one of them (in its own tab or elsewhere), its group in the model tree is
+marked <span style="color:#e65100">out of date</span> and <b>Update</b> appears in the toolbar. Updating takes the new
+version; fluid parameters and solver settings you changed here are kept (you are asked about values changed in both
+places). Right-click a group to update it or to open its file in its own tab.</p>
 """
 
 
@@ -106,8 +114,46 @@ class TransformForm(QWidget):
         self.on_change()
 
 
+class UpdateDialog(QDialog):
+    """What updating the neuron from its .mns will change, with the choice for values changed in both places."""
+
+    def __init__(self, name, changes, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Update {name}")
+        self.resize(640, 420)
+        layout = QVBoxLayout(self)
+        text = QLabel(f"<b>{name}</b> was saved with changes since it was imported. Update the full neuron to it?")
+        text.setWordWrap(True)
+        layout.addWidget(text)
+        lines = []
+        for key, title in (("source", "Changed in the source (taken)"),
+                           ("kept", "Changed here (kept)"),
+                           ("conflicts", "Changed in both places")):
+            if changes[key]:
+                lines += [title + ":"] + [f"   {line}" for line in changes[key]] + [""]
+        box = QPlainTextEdit("\n".join(lines).strip() or "Only display settings differ.")
+        box.setReadOnly(True)
+        layout.addWidget(box, 1)
+        self.keep = QCheckBox("Where both changed a value, keep the value set here (untick: take the source's)")
+        self.keep.setChecked(True)
+        self.keep.setVisible(bool(changes["conflicts"]))
+        layout.addWidget(self.keep)
+        note = QLabel("Results and the stored characterisation were made with the old version and will be marked "
+                      "as outdated.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #555;")
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Update")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
 class FullNeuronWindow(QMainWindow):
     TITLE = TITLE
+    open_source = Signal(str)   # open a component's source file in its own tab
+    analyse = Signal(str)       # open the saved .mfn in the Analysis tab
 
     def __init__(self):
         super().__init__()
@@ -130,9 +176,13 @@ class FullNeuronWindow(QMainWindow):
         self.selection = None          # ("group", key) | ("neuron", i) | ("design", j) | None
         self.mode = MODEL
         self.worker = None
+        self.statuses = {NEURON: None, ACTIVATION: None}   # reference_status of each component
         self._build_ui()
         self._build_actions()
         self._update_actions()
+        self.watch = QTimer(self)
+        self.watch.timeout.connect(self.check_sources)
+        self.watch.start(WATCH_MS)
         self.log_message("Full neuron: File → Import inputs to pre-activation (*.mns) and File → Import pre-activation "
                          "to activation (*.mad), then link them in the Link tab. Help → Quick guide explains the rest.")
 
@@ -150,6 +200,8 @@ class FullNeuronWindow(QMainWindow):
         self.tree.setColumnWidth(0, 190)
         self.tree.itemSelectionChanged.connect(self._tree_selected)
         self.tree.itemChanged.connect(self._tree_checked)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._tree_menu)
         dock = QDockWidget("Model", self)
         dock.setObjectName("full_model_dock")
         dock.setWidget(self.tree)
@@ -300,6 +352,10 @@ class FullNeuronWindow(QMainWindow):
         self.show_dataset_button = QPushButton("Show the stored characterisation")
         self.show_dataset_button.clicked.connect(self.show_dataset)
         row.addWidget(self.show_dataset_button)
+        self.analyse_button = QPushButton("Analyse…")
+        self.analyse_button.setToolTip("Plot the stored characterisation in the Analysis tab")
+        self.analyse_button.clicked.connect(self.open_analysis)
+        row.addWidget(self.analyse_button)
         export = QPushButton("Export CSV…")
         export.clicked.connect(self.export_csv)
         row.addWidget(export)
@@ -332,6 +388,10 @@ class FullNeuronWindow(QMainWindow):
         self.a_sweep = self._action("Run characterisation", self.run_sweep, "F6", S.SP_BrowserReload,
                                     "Solve every combination of the swept parameters, record, and keep the dataset "
                                     "with the model")
+        self.a_update = self._action("Update", self.update_all, None, S.SP_MessageBoxWarning,
+                                     "A component was saved with changes since it was imported: take the new version")
+        self.a_analyse = self._action("Analyse characterisation…", self.open_analysis, "F7", S.SP_FileDialogDetailedView,
+                                      "Plot the stored characterisation in the Analysis tab")
         self.a_reset_cam = self._action("Reset camera", self.viewport.reset_camera, "R")
         self.a_guide = self._action("Quick guide", self.show_guide, "F1")
         self.view_actions = {}
@@ -344,7 +404,8 @@ class FullNeuronWindow(QMainWindow):
 
         menu = self.menuBar()
         m = menu.addMenu("&File")
-        for a in (self.a_import_neuron, self.a_import_design, None, self.a_open, self.a_save, self.a_save_as):
+        for a in (self.a_import_neuron, self.a_import_design, self.a_update, None, self.a_open, self.a_save,
+                  self.a_save_as):
             m.addSeparator() if a is None else m.addAction(a)
         m = menu.addMenu("&View")
         for a in (*self.view_actions.values(), self.a_reset_cam):
@@ -352,6 +413,7 @@ class FullNeuronWindow(QMainWindow):
         m = menu.addMenu("&Simulation")
         m.addAction(self.a_solve)
         m.addAction(self.a_sweep)
+        m.addAction(self.a_analyse)
         m = menu.addMenu("&Help")
         m.addAction(self.a_guide)
 
@@ -361,6 +423,9 @@ class FullNeuronWindow(QMainWindow):
         for a in (self.a_import_neuron, self.a_import_design, self.a_save, None, self.a_solve, self.a_sweep, None,
                   *self.view_actions.values()):
             tb.addSeparator() if a is None else tb.addAction(a)
+        tb.insertAction(self.a_solve, self.a_update)
+        tb.insertAction(self.view_actions[MODEL], self.a_analyse)
+        tb.insertSeparator(self.view_actions[MODEL])
         tb.addSeparator()
         tb.addWidget(QLabel(" Transparency: "))
         self.transparency = QSlider(Qt.Horizontal)
@@ -376,6 +441,10 @@ class FullNeuronWindow(QMainWindow):
         ready = self.project.neuron is not None
         for a in (self.a_import_neuron, self.a_import_design, self.a_open):
             a.setEnabled(not busy)
+        outdated = [k for k, v in self.statuses.items() if v == OUTDATED]
+        self.a_update.setVisible(bool(outdated))
+        self.a_update.setEnabled(bool(outdated) and not busy)
+        self.a_update.setText("Update" + (f" ({len(outdated)})" if len(outdated) > 1 else ""))
         for a in (self.a_save, self.a_save_as):
             a.setEnabled(ready and not busy)
         for a in (self.a_solve, self.a_sweep):
@@ -383,6 +452,9 @@ class FullNeuronWindow(QMainWindow):
         self.solve_button.setEnabled(ready and not busy)
         self.sweep_button.setEnabled(ready and not busy and bool(self.project.sweep_axes()))
         self.view_actions[RESULTS].setEnabled(self._can_show())
+        has_data = bool(self.project.characterisation) and not busy
+        self.a_analyse.setEnabled(has_data)
+        self.analyse_button.setEnabled(has_data)
         name = Path(self.project.path).name if self.project.path else ""
         self.setWindowTitle(f"{TITLE} — {name}" if name else TITLE)
         parts = []
@@ -393,7 +465,9 @@ class FullNeuronWindow(QMainWindow):
         link = self.project.link.get("part")
         self.status_label.setText(" + ".join(parts) + (f" · linked through {link}" if link else
                                                        (" · not linked" if len(parts) == 2 else ""))
-                                  + (" · results outdated" if self.outdated and self.rows else ""))
+                                  + (" · results outdated" if self.outdated and self.rows else "")
+                                  + "".join(f" · {self._source_name(k)} {v}" for k, v in self.statuses.items()
+                                            if v in (OUTDATED, MISSING)))
 
     def log_message(self, text):
         self.log.appendPlainText(text)
@@ -465,10 +539,9 @@ class FullNeuronWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
 
     def _load_design_cad(self):
-        from .activation import ActivationProject
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            design = ActivationProject.load(self.project.design_path)
+            design = self.project.design_project()
             if not Path(design.step_path).exists():
                 raise ValueError(f"STEP file not found: {design.step_path}")
             bodies = self.design_cad.load_step(design.step_path)
@@ -497,6 +570,7 @@ class FullNeuronWindow(QMainWindow):
         t["position"] = [float(n[:, 0].max() + gap - d[:, 0].min()), float(cn[1] - cd[1]), float(cn[2] - cd[2])]
 
     def _after_import(self):
+        self.statuses = {k: self.project.reference_status(k) for k in (NEURON, ACTIVATION)}
         self.build, self.rows, self.row, self.linked = None, [], None, None
         self.bodies, self.axes_info, self.showing = None, [], None
         self.outdated = False
@@ -524,8 +598,11 @@ class FullNeuronWindow(QMainWindow):
             if project.neuron is not None:
                 self._load_neuron_cad()
             self.surfaces[ACTIVATION] = {}
-            if project.design_path:
+            self.design_project = None
+            if project.design_data is not None:
                 self._load_design_cad()
+            elif project.design_path:
+                raise ValueError(f"The design {project.design_path} was not found.")
         except Exception as exc:
             QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, TITLE, f"Could not open the full neuron:\n{exc}")
@@ -538,6 +615,7 @@ class FullNeuronWindow(QMainWindow):
             self.log_message(f"Stored characterisation: {int(c.solved.sum())}/{c.size} point(s)"
                              + ("" if project.dataset_current() else
                                 " - the model changed since it was run: run it again"))
+        self._announce_statuses()
 
     def save_project(self, save_as=False):
         path = self.project.path
@@ -564,10 +642,23 @@ class FullNeuronWindow(QMainWindow):
                    "design"))
         for key, parts, kind in models:
             source = self.project.neuron_source if key == NEURON else self.project.design_path
-            group = QTreeWidgetItem([GROUP_NAMES[key], Path(source).name if source else "(not imported)"])
+            status = self.statuses.get(key)
+            label = Path(source).name if source else "(not imported)"
+            group = QTreeWidgetItem([GROUP_NAMES[key], label + (f" — {status}" if status in STATUS_COLORS else "")])
             font = group.font(0)
             font.setBold(True)
             group.setFont(0, font)
+            if status in STATUS_COLORS:
+                group.setIcon(0, self.style().standardIcon(QStyle.SP_MessageBoxWarning))
+                for column in (0, 1):
+                    group.setForeground(column, QBrush(QColor(STATUS_COLORS[status])))
+            if source:
+                tip = f"{source}\n" + {
+                    CURRENT: "Up to date with the file.",
+                    OUTDATED: "The file was saved with changes since it was imported: right-click → Update.",
+                    MISSING: "The file was not found: the copy kept in the full neuron is used."}.get(status, "")
+                for column in (0, 1):
+                    group.setToolTip(column, tip)
             group.setData(0, Qt.UserRole, ("group", key))
             group.setFlags(group.flags() | Qt.ItemIsUserCheckable)
             group.setCheckState(0, Qt.Checked if self.visible[key] else Qt.Unchecked)
@@ -662,6 +753,7 @@ class FullNeuronWindow(QMainWindow):
             elif key == NEURON and self.project.neuron is not None:
                 info.setText(f"{len(self.project.neuron.parts)} parts. Only fluid parameters can be changed here.")
             layout.addWidget(info)
+            self._add_source_box(layout, key)
         else:
             kind, i = sel
             part = self._part(kind, i)
@@ -1343,7 +1435,136 @@ class FullNeuronWindow(QMainWindow):
         self.viewport._add("link_ends", pv.PolyData(np.array([a, b])), color=LINK_COLOR, point_size=12,
                            render_points_as_spheres=True, pickable=False)
 
+    def open_analysis(self):
+        """Show the stored characterisation in the Analysis tab (it reads the saved file)."""
+        if not self.project.characterisation:
+            QMessageBox.information(self, TITLE, "Run a characterisation first (Record & run tab).")
+            return
+        if not self.project.path:
+            self.save_project(True)
+            if not self.project.path:
+                return
+        else:
+            self.save_project(False)
+        self.analyse.emit(self.project.path)
+
+    # -----------------------------
+    # Out of date components
+    # -----------------------------
+
+    def _source_name(self, key):
+        path = self.project.neuron_source if key == NEURON else self.project.design_path
+        return Path(path).name if path else GROUP_NAMES[key]
+
+    def check_sources(self):
+        """Look for saved changes to the components' files (timer)."""
+        if self.project.neuron is None and self.project.design_data is None:
+            return
+        statuses = {k: self.project.reference_status(k) for k in (NEURON, ACTIVATION)}
+        if statuses == self.statuses:
+            return
+        old, self.statuses = self.statuses, statuses
+        self._announce_statuses(old)
+        self._populate_tree()
+        if self.selection and self.selection[0] == "group":
+            self._show_properties()
+        self._update_actions()
+
+    def _announce_statuses(self, old=None):
+        for key, status in self.statuses.items():
+            if old is not None and old.get(key) == status:
+                continue
+            name = self._source_name(key)
+            if status == OUTDATED:
+                self.log_message(f"{name} was saved with changes: the full neuron still uses the version it imported. "
+                                 "Update (toolbar, or right-click its group) to take the new version.")
+            elif status == MISSING:
+                self.log_message(f"{name} was not found: the copy kept in the full neuron is used.")
+            elif status == CURRENT and old is not None and old.get(key) in (OUTDATED, MISSING):
+                self.log_message(f"{name} is up to date again.")
+
+    def _add_source_box(self, layout, key):
+        status = self.statuses.get(key)
+        source = self.project.neuron_source if key == NEURON else self.project.design_path
+        if not source:
+            return
+        box = QGroupBox("Source file")
+        v = QVBoxLayout(box)
+        label = QLabel(f"{source}<br><b style='color:{STATUS_COLORS.get(status, '#2e7d32')}'>"
+                       + {CURRENT: "Up to date", OUTDATED: "Out of date: the file was saved with changes",
+                          MISSING: "Not found: the copy kept here is used"}.get(status, "") + "</b>")
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        v.addWidget(label)
+        row = QHBoxLayout()
+        update = QPushButton("Update")
+        update.setEnabled(status == OUTDATED and self.worker is None)
+        update.clicked.connect(lambda _=False, k=key: self.update_component(k))
+        row.addWidget(update)
+        edit = QPushButton("Open in its tab")
+        edit.setEnabled(status != MISSING)
+        edit.clicked.connect(lambda _=False, p=source: self.open_source.emit(p))
+        row.addWidget(edit)
+        row.addStretch(1)
+        v.addLayout(row)
+        layout.addWidget(box)
+
+    def _tree_menu(self, pos):
+        item = self.tree.itemAt(pos)
+        data = item.data(0, Qt.UserRole) if item is not None else None
+        if not data:
+            return
+        key = data[1] if data[0] == "group" else (NEURON if data[0] == "neuron" else ACTIVATION)
+        source = self.project.neuron_source if key == NEURON else self.project.design_path
+        if not source:
+            return
+        menu = QMenu(self)
+        status = self.statuses.get(key)
+        update = menu.addAction(f"Update from {Path(source).name}")
+        update.setEnabled(status == OUTDATED and self.worker is None)
+        update.triggered.connect(lambda: self.update_component(key))
+        edit = menu.addAction(f"Open {Path(source).name} in its tab")
+        edit.setEnabled(status != MISSING)
+        edit.triggered.connect(lambda: self.open_source.emit(source))
+        menu.exec_(self.tree.viewport().mapToGlobal(pos))
+
+    def update_all(self):
+        for key in list(self.project.outdated()):
+            if not self.update_component(key):
+                break
+
+    def update_component(self, key):
+        """Take the saved version of a component's file (True if updated)."""
+        if self.worker is not None:
+            return False
+        name = self._source_name(key)
+        try:
+            if key == NEURON:
+                dialog = UpdateDialog(name, self.project.neuron_changes(), self)
+                if dialog.exec_() != QDialog.Accepted:
+                    return False
+                notes = self.project.update_neuron(keep_conflicts=dialog.keep.isChecked())
+                self._load_neuron_cad()
+            else:
+                notes = self.project.update_design()
+                self._load_design_cad()
+        except Exception as exc:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, TITLE, f"Could not update from {name}:\n{exc}")
+            return False
+        self.log_message(f"Updated from {name}" + (": " + "; ".join(notes) if notes else "."))
+        had_results = bool(self.rows)
+        self._after_import()
+        if self.project.characterisation:
+            self.show_dataset()
+            if not self.project.dataset_current():
+                self.log_message("The stored characterisation was made with the old version: run it again.")
+        elif had_results:
+            self.log_message("Solve again for results with the new version.")
+        return True
+
     def closeEvent(self, event):
+        self.watch.stop()
         if self.worker is not None:
             self.worker.cancel()
             self.worker.wait(30000)

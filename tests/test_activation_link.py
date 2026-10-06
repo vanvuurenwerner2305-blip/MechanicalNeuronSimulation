@@ -182,22 +182,18 @@ def test_activation_membrane_is_driven_by_the_activation_chamber(linked_neuron, 
     assert Path(loaded.parts[index["Membrane_Right"]].props["design"]) == Path(link.path).resolve()
 
 
-def test_sweep_reports_the_activation_outputs_and_a_weight_for_the_design(linked_neuron):
-    from app.sweep import run_sweep
+def test_sweep_reports_the_activation_outputs(linked_neuron):
+    from app.sweep_core import run_sweep
     cad, project, step = linked_neuron
     cad.load_step(step)
     index = {p.name: i for i, p in enumerate(project.parts)}
     rows = []
     worker = SimpleNamespace(check=lambda: None, report=lambda *a: None, log=lambda *a: None,
                              item=SimpleNamespace(emit=rows.append))
-    run_sweep(worker, cad, project, None, index["Chamber_Left"], np.array([5.0, 15.0]), None, None,
-              index["Chamber_Middle"])
+    run_sweep(worker, cad, project, None, index["Chamber_Left"], np.array([5.0, 15.0]), None, None)
     assert all(r["converged"] for r in rows)
     act = [r["act"][index["Membrane_Right"]] for r in rows]
     assert act[1]["dp"] > act[0]["dp"] and act[1]["area"] <= act[0]["area"]
-    for r in rows:  # the design's membrane is a path from the tube side into the activation chamber
-        assert "Chamber_Right" in r["W"]
-        assert r["p_a_rebuilt"] == pytest.approx(r["P"][index["Chamber_Middle"]], rel=1e-5)
 
 
 def test_the_design_stores_its_fem_solution_at_every_point(design):

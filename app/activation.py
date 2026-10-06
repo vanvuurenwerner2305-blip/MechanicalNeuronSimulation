@@ -127,12 +127,18 @@ class ActivationProject(Project):
     @classmethod
     def load(cls, path):
         path = Path(path)
-        data = json.loads(path.read_text(encoding="utf-8"))
+        project = cls.from_dict(json.loads(path.read_text(encoding="utf-8")), path.parent)
+        project.path = str(path)
+        return project
+
+    @classmethod
+    def from_dict(cls, data, folder):
+        """A design from its saved dict; a relative STEP path is relative to `folder`."""
         if data.get("type") != DESIGN_TYPE:
             raise ValueError("Not an activation-function design file.")
         project = cls()
         step = Path(data["step_path"])
-        project.step_path = str(step if step.is_absolute() else (path.parent / step).resolve())
+        project.step_path = str(step if step.is_absolute() else (Path(folder) / step).resolve())
         project.parts = [PartSettings(**p) for p in data["parts"]]
         for part in project.parts:  # first version: input/output channel sides
             if part.role in LEGACY_ROLES:
@@ -152,7 +158,6 @@ class ActivationProject(Project):
         lumen = next((q for q in project.parts if project.results and q.name == project.results.get("lumen")), None)
         if segment and lumen is not None and not lumen.props.get("outputs"):
             lumen.props["outputs"] = [{"name": "activation", "segment": int(segment)}]
-        project.path = str(path)
         return project
 
 
@@ -351,10 +356,14 @@ class ActivationDesign:
 
     @classmethod
     def load(cls, path):
-        project = ActivationProject.load(path)
+        return cls.of(ActivationProject.load(path), Path(path).stem)
+
+    @classmethod
+    def of(cls, project, name=""):
+        """The design of a loaded ActivationProject."""
         if not project.results:
-            raise ValueError(f"{path} holds no simulated mapping yet.")
-        return cls(project.results, Path(path).stem, output_definitions(project.parts, project.results))
+            raise ValueError(f"{name or 'The design'} holds no simulated mapping yet.")
+        return cls(project.results, name, output_definitions(project.parts, project.results))
 
     def area(self, dp):
         return np.interp(dp, self.dp, self.A)

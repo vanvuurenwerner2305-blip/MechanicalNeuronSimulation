@@ -240,7 +240,9 @@ def build_environment(cad, mesh: MeshData, project) -> BuildResult:
             contact_offset=0.5 * t,
             color=ROLE_COLORS[part.role], name=part.name)
 
-    empirical = {i: _empirical_membrane(parts[i], mesh.midsurfaces[i], getattr(project, "path", None), warnings)
+    pinned = getattr(project, "pinned_designs", {})   # {part name: ActivationDesign} instead of reading the file
+    empirical = {i: _empirical_membrane(parts[i], mesh.midsurfaces[i], getattr(project, "path", None), warnings,
+                                        pinned.get(parts[i].name))
                  for i in linked}
     for i in linked:
         env.membrane_list.append(empirical[i][0])
@@ -332,13 +334,15 @@ def design_path(part, project_path=None) -> Path:
     return path
 
 
-def _empirical_membrane(part, mid, project_path, warnings):
-    """(EmpiricalMembrane, ActivationDesign, path) of an Activation membrane part."""
+def _empirical_membrane(part, mid, project_path, warnings, design=None):
+    """(EmpiricalMembrane, ActivationDesign, path) of an Activation membrane part (`design`: a pinned version of
+    its design to use instead of the file, e.g. the copy kept in a full neuron)."""
     from .activation import ActivationDesign  # activation imports this module
     path = design_path(part, project_path)
-    if not path.exists():
-        raise ValueError(f"{part.name}: activation design not found: {path}")
-    design = ActivationDesign.load(path)
+    if design is None:
+        if not path.exists():
+            raise ValueError(f"{part.name}: activation design not found: {path}")
+        design = ActivationDesign.load(path)
     if not design.has_volume:
         raise ValueError(f"{part.name}: {path.name} was simulated before the membrane's swept volume was "
                          "recorded. Open it in the Pre-activation → activation space, run its study again and save it.")

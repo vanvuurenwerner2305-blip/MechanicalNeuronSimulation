@@ -21,7 +21,7 @@ The device is split into three *spaces*, each with its own design kind:
 
 | Space | ID | What it is | Main result |
 |---|---|---|---|
-| neuron ("inputs → pre-activation") | N### | input chambers push on membranes into a closed **pre-activation chamber** | the pre-activation pressure p_a and the **neuron equation** |
+| neuron ("inputs → pre-activation") | N### | input chambers push on membranes into a closed **pre-activation chamber** | the pre-activation pressure p_a against the input pressures |
 | activation ("pre-activation → activation") | A### | a membrane, driven by the pressure difference Δp across it, squeezes a soft **tube** through a pusher; gas flows through the tube | the **activation function**: tube area, mass flow and named output pressures against Δp |
 | full | F### | an N design whose membrane is replaced by an A design (its pre-simulated Δp → swept-volume curve) | outputs of the whole neuron against its inputs (**characterisation**) |
 
@@ -43,19 +43,6 @@ The device is split into three *spaces*, each with its own design kind:
 - **Activation membrane** — a neuron membrane replaced by an activation design (`design: A###`); the chamber
   on its driving side (`driving`, default Automatic = the closed chamber it touches) pushes it towards the tube.
 - **Ignore** — left out.
-
-### The neuron equation (neuron space)
-Every **input path** into the pre-activation chamber (from one input, through its membranes and any closed
-intermediate chambers) has a mechanical weight W_j = ΔV_j/(p_j − p_a): the volume it pushes into the
-pre-activation chamber per kPa of pressure difference. The chamber's own liquid/gas adds W_0. Then
-
-    p_a = (Σ W_j p_j + W_0 p_0 + B) / (Σ W_j + W_0)
-
-W is not constant (a slack membrane is very compliant near Δp = 0 and stiffens as it stretches), so each W is
-fitted as a polynomial in its Δp, one piece for Δp > 0 and one for Δp < 0, with the **lowest degrees** that
-reproduce every simulated p_a within the **tolerance** (kPa, default 1). B is a measured bias when a path runs
-through a closed chamber that is not neutral at rest (e.g. gas sealed above 0 kPa). A design whose equation
-needs low degrees at a tight tolerance behaves like a clean weighted sum — usually what a neuron design wants.
 
 ### Activation space roles
 - **Membrane / Shell** — loaded by Δp (positive Δp pushes it towards the tube), clamped at its edges.
@@ -130,10 +117,9 @@ Ranges: `from:to:points` (e.g. `0:20:5` → 0, 5, 10, 15, 20), a list `0,5,12`, 
 | `mns cad build <ID>` | CAD + project from design.yaml; geometry check; renders/model.png |
 | `mns cad inspect <ID>` | per body volume, bounding box, thin-plate thickness; overlaps; touching pairs |
 | `mns cad render <ID> [--views iso,front,top,right,section-x:0.5] [--exploded 0.3] [--only A,B] [--name f]` | a picture of the bodies |
-| `mns check <ID>` | mesh + assemble (no solve): which chamber loads which membrane and from which side, inputs, input paths, links, flow connections, bonds, warnings |
+| `mns check <ID>` | mesh + assemble (no solve): which chamber loads which membrane and from which side, inputs, links, flow connections, bonds, warnings |
 | `mns solve <ID> [--set Part.field=v]` | one static solve (neuron, full); `--set` only for this run |
-| `mns sweep <ID> --input Ch=from:to:n [--input Ch2=...] [--preactivation Ch\|none] [--tolerance 1] [--method lowest\|greedy]` | neuron sweep over 1–2 inputs + weights + neuron equation |
-| `mns fit <ID> --tolerance 0.5 [--method ...]` | refit the equation from the stored sweep (seconds, no simulation) |
+| `mns sweep <ID> --input Ch=from:to:n [--input Ch2=...]` | neuron sweep over 1–2 inputs: chamber pressures and linked designs' outputs at every point |
 | `mns dpsweep <ID> [--dp 0:30:16] [--set study.field=v]` | activation-function study over Δp (stores the results in model.mad) |
 | `mns characterise <ID> --axis Part.field=from:to:n [--axis ...] [--record key,key]` | full-neuron grid (stored in model.mfn) |
 | `mns compare [IDs] [--metrics a,b] [--x param --y metric]` | parameters and metrics of designs side by side; `--x/--y` plots one against the other into report/figures |
@@ -141,7 +127,7 @@ Ranges: `from:to:points` (e.g. `0:20:5` → 0, 5, 10, 15, 20), a list `0,5,12`, 
 | `mns note "text" [--design ID]` | message to the live view and log (milestones, decisions) |
 | `mns jobs` · `mns wait <job> [--timeout 540]` · `mns cancel <job>` | background jobs |
 
-Global options: `--why "reason"` (shown live to the user), `--background` (solve/sweep/dpsweep/characterise/fit:
+Global options: `--why "reason"` (shown live to the user), `--background` (solve/sweep/dpsweep/characterise:
 returns a job id at once), `--max-minutes N` (stop a run after N minutes), `--no-render` (skip pictures).
 
 **Long runs.** Anything that may take more than ~90 s: start it with `--background`, then `mns wait <job>`
@@ -155,7 +141,7 @@ Never poll with short loops. You may run two background jobs at once; more slows
 YAML. Keys written by mns at creation (`id`, `name`, `space`, `why`, `parent`, `created`) — leave them.
 
 ```yaml
-why: "Thinner membranes to raise W_1"   # the question this design answers
+why: "Thinner membranes for a stronger response to Input1"   # the question this design answers
 parameters:            # numbers or expressions of parameters defined above them (mm, MPa, kPa)
   R: 8
   t: 0.5
@@ -247,10 +233,9 @@ housing), `activation_valve` (round tube, block, free rigid pusher under a membr
 warnings) → if the geometry changed, look at renders/model.png once → `mns check` (for new geometry) →
 run → read the summary → update notes.md → `mns report design <ID>` and write its narrative.
 
-**C. Neuron**: `mns sweep N### --input A=0:20:5 --input B=0:20:5 --tolerance 1` — about 5–15 s per point. Read
-`equation.met`, `max_error_kPa`, `total_order`, the weights; look at results/weights.png when the fit is poor.
-Refit at other tolerances with `mns fit` (free). Compare designs on the constant weights (metrics
-`W:<input>+_mm3_per_kPa`) and the equation error.
+**C. Neuron**: `mns sweep N### --input A=0:20:5 --input B=0:20:5` — about 5–15 s per point. Read the
+closed chambers' pressure ranges and look at results/sweep_response.png; compare designs on how the
+pre-activation pressure responds to each input (sweep.csv has every point).
 
 **D. Activation**: `mns dpsweep A### --dp 0:30:16` — 10–40 s per point. Key metrics: `A0_mm2`,
 `half_area_dp_kPa`, `closing_dp_kPa` (area below 5% of A0), output ranges, swept volume. A design whose tube
@@ -293,7 +278,6 @@ brief.md. Use `--max-minutes` on runs that might hang.
 | chamber "touches no membrane" | check its faces meet the membrane face exactly; `cad render --views section-x` | — |
 | solve not converged (`load_reached` < 1) | `--set solver.load_steps=20`; lower pressures; `elements_per_side` 8 | record as a finding (e.g. a limit point / snap-through) |
 | membrane hits a wall / huge stretch (`max_area_stretch` > 2) | bigger chamber, thicker or stiffer membrane | treat as a design limit |
-| equation not met | `mns fit` with a looser tolerance to see the degrees needed; more sweep points near Δp=0 | report the tolerance it meets |
 | "EXTRAPOLATING" | dpsweep the activation design over a wider Δp | — |
 | activation point not converged | fewer/larger dp steps don't help; try `--set study.max_coupling_iterations=60`, a coarser tube mesh | note it |
 | unexpected error inside the simulator | read the last lines of .mns/cli.log | write it in feature_requests.md, move on |
@@ -308,7 +292,7 @@ Two attempts per problem, then record it and move on. A failed design is a resul
 ## 8. Reports
 
 `mns report design <ID>` writes `report/auto_design.tex` (parameters, bodies, model picture) and
-`report/auto_results.tex` (tables, figures, the neuron equation) — never edit those — and once creates
+`report/auto_results.tex` (tables, figures) — never edit those — and once creates
 `report/narrative.tex`, a skeleton with sections Aim / Design / Results / Findings and the `\input` lines.
 Replace each `%` comment with prose (Edit tool), keep the `\input` lines, then `mns report design <ID> --build`.
 The output lists `unwritten_sections` and any `latex_errors` (fix them in narrative.tex).

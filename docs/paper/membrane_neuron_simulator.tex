@@ -44,8 +44,8 @@ consists of thin rubber membranes that separate fluid chambers and deform agains
 The software imports such a device from CAD, models the membranes as geometrically nonlinear
 shells, the chambers as volume-dependent pressure laws and the rigid parts as contact obstacles,
 and solves for static equilibrium by minimising a total potential energy with a safeguarded
-Newton method. From a sweep over the input pressures it then back-infers the neuron equation, in
-the form of the mechanical weights of the neuron model, as low-degree piecewise polynomials.
+Newton method. Sweeps over the input pressures map the neuron's response, and a whole neuron can be
+characterised over a grid of its parameters and kept as a dataset.
 
 None of the ingredients is new: the membrane and bending elements, the pressure loads, the
 penalty contact and the Newton globalisation are standard techniques from the literature, cited
@@ -81,7 +81,7 @@ matches how the neuron is analysed in the thesis, where the input pressures are 
 state and the neuron's output is the equilibrium pressure of its sealed pre-activation chamber.
 
 The application has three spaces. \emph{Inputs to pre-activation} is the neuron itself (everything
-up to Section~\ref{sec:characterise}). \emph{Pre-activation to activation} is the activation-function
+up to Section~\ref{sec:sweep}). \emph{Pre-activation to activation} is the activation-function
 device, a membrane that squeezes a gas-carrying tube (Section~\ref{sec:activation}); it is simulated
 once over its pre-activation range and saved as a \emph{design}. \emph{Full neuron} links a neuron to a
 design and characterises the whole neuron over a grid of its parameters, so that it can later be
@@ -96,13 +96,12 @@ used without being simulated again (Section~\ref{sec:fullneuron}).
 \node[box, right=of mesh] (build) {Roles $\to$ shells,\\obstacles, chambers};
 \node[box, below=of build] (solve) {Newton solve with\\load stepping};
 \node[box, left=of solve] (sweep) {Sweep over\\input pressures};
-\node[box, left=of sweep] (fit) {Weights $W_j$,\\neuron equation};
 \node[box, below=of sweep] (char) {Full neuron:\\characterisation grid};
 \draw[->] (cad) -- (mesh); \draw[->] (mesh) -- (build); \draw[->] (build) -- (solve);
-\draw[->] (solve) -- (sweep); \draw[->] (sweep) -- (fit); \draw[->] (solve) |- (char);
+\draw[->] (solve) -- (sweep); \draw[->] (solve) |- (char);
 \end{tikzpicture}
 \caption{Pipeline of the simulator (Sections~\ref{sec:cad}, \ref{sec:energy}--\ref{sec:loadstep},
-\ref{sec:characterise} and \ref{sec:fullneuron}).}
+\ref{sec:sweep} and \ref{sec:fullneuron}).}
 \label{fig:pipeline}
 \end{figure}
 
@@ -127,13 +126,13 @@ File & Contents & Section \\
 \code{membrane\_sim/shell\_contact.py} & contact between membranes & \ref{sec:sheet} \\
 \code{membrane\_sim/solver.py} & assembly and Newton iteration & \ref{sec:assembly}, \ref{sec:newton} \\
 \code{membrane\_sim/environment.py} & load stepping & \ref{sec:loadstep} \\
-\code{membrane\_sim/characterise.py} & weights and neuron equation & \ref{sec:characterise} \\
 \code{membrane\_sim/empirical.py} & a membrane replaced by a design & \ref{sec:empirical} \\
 \code{app/cad.py}, \code{app/builder.py} & CAD import, meshing, coupling & \ref{sec:cad} \\
 \code{app/sweep.py} & parameter sweeps & \ref{sec:sweep} \\
 \code{membrane\_sim/solid.py}, \code{flow.py}, ... & device parts, gas flow & \ref{sec:activation} \\
 \code{app/activation.py} & device study, outputs, stored solution & \ref{sec:activation} \\
 \code{app/full\_neuron.py} & linking, characterisation dataset & \ref{sec:fullneuron} \\
+\code{app/analysis.py} & slices of the dataset for plotting & \ref{sec:fullneuron} \\
 \bottomrule
 \end{tabular}
 \caption{Where each part of the formulation lives in the code.}
@@ -220,10 +219,10 @@ default.
 \begin{remark}
 A membrane without pre-tension or bending stiffness has no transverse stiffness in its flat
 state: the tangent is singular at the start of every solve. The load stepping and the damped
-Newton steps of Section~\ref{sec:newton} deal with this. It is also the physical reason why the
-weights of Section~\ref{sec:characterise} behave singularly near zero pressure difference: a
-clamped circular membrane under pressure $p$ (Hencky's problem \cite{hencky1915}) deflects as
-$w \propto p^{1/3}$, so its displaced volume per unit pressure behaves like $p^{-2/3}$.
+Newton steps of Section~\ref{sec:newton} deal with this. It is also why a slack membrane's response
+is so compliant near zero pressure difference: a clamped circular membrane under pressure $p$
+(Hencky's problem \cite{hencky1915}) deflects as $w \propto p^{1/3}$, so its displaced volume per
+unit pressure behaves like $p^{-2/3}$.
 \end{remark}
 
 %=====================================================================
@@ -692,190 +691,6 @@ already established. A test checks that it reaches the same state as a fresh sol
 full neuron (Section~\ref{sec:fullneuron}) goes further: one load step and a predicted starting state.
 
 %=====================================================================
-\section{Back-inferring the neuron equation}\label{sec:characterise}
-%=====================================================================
-
-The thesis models the input stage of the neuron as a sealed pre-activation chamber $a$ whose
-equilibrium pressure is a weighted average of the pressures acting on it:
-\begin{equation}\label{eq:neuron}
-p_a = \frac{\sum_j W_j\,p_j + W_0\,p_0 + B}{\sum_j W_j + W_0},
-\end{equation}
-where $W_j$ is the mechanical weight (compliance) of input $j$, $W_0$ the compliance of the
-pre-activation fluid itself about its rest pressure $p_0$, and $B$ a bias volume that is zero unless a
-path contains a chamber that is not neutral at rest (Section~\ref{sec:bias}). In general the weights
-depend on the pressure differences, $W_j = W_j(p_j - p_a)$, so \eqref{eq:neuron} is implicit in
-$p_a$. This section describes how the weights are measured from simulations and fitted.
-
-\subsection{Input paths}
-
-A weight belongs to an \emph{input path}, not to a single membrane. Everything between an input
-chamber and the pre-activation chamber is lumped together. This can be one membrane, or, for the
-bulk-modulus weight mechanism, membrane -- sealed weight chamber -- membrane. Paths are found from
-the model's topology. Starting from every shell on the pre-activation chamber, the far side of the
-shell is examined:
-\begin{itemize}[noitemsep]
-\item no chamber there: the path reaches the surroundings, an \emph{ambient} input at $0$;
-\item a constant-pressure chamber: the path reaches that input;
-\item another sealed chamber: the search continues through the other shells of that chamber.
-\end{itemize}
-Shells that reach the same input form one path. A shell that reaches several inputs gets a
-combined label.
-
-\subsection{Secant and tangent weights}
-
-For path $j$ with shells $s$ on the pre-activation chamber, the volume pushed into the pre-activation
-chamber and the secant weight are
-\begin{equation}
-\dV_j = -\sum_{s\in j}\sigma_{s,a}\big(V_{\text{cone}}(\x_s) - V_{\text{cone}}(\X_s)\big),
-\qquad
-W_j = \frac{\dV_j}{p_j - p_a},
-\end{equation}
-and the pre-activation fluid's own term is
-\begin{equation}
-W_0 = -\frac{\dV_a}{p_a - p_0},\qquad p_0 = P_a(0),
-\end{equation}
-which is zero for a perfectly incompressible fluid. Since
-$\dV_a = -\sum_j \dV_j$, these definitions satisfy
-$\sum_j W_j(p_j-p_a) + W_0(p_0-p_a) = \sum_j\dV_j + \dV_a = 0$ \emph{identically}. So
-\eqref{eq:neuron} rebuilt from a point's own weights reproduces the simulated $p_a$ exactly. The
-``$p_a$ from weights'' column of the sweep table checks the bookkeeping (paths, signs, volumes),
-not the model. The weight is undefined where $p_j = p_a$ ($0/0$), and such points are left out.
-Only $W_j$ is identified: pressure--volume data cannot separate an effective area $A_j$ from a
-stiffness $K_j$ in $W_j = A_j/K_j$.
-
-The \emph{tangent} weight is the local compliance $\partial\dV_j/\partial p_j$ with $p_a$ held
-fixed. A unit increase of input pressure $p_j$ adds the load $\g_j$ (the volume gradient of input
-chamber $j$). With the pre-activation chamber's rank-one term removed from the tangent (fixed $p_a$),
-and every other sealed chamber following its own law,
-\begin{equation}
-W_j^{\tan} = -\g_a^{\mathsf T}\,\K_{\neg a}^{-1}\,\g_j,
-\qquad \K_{\neg a} = \mathbf{A} + \sum_{v\neq a} c_v\,\g_v\g_v^{\mathsf T},
-\end{equation}
-which is evaluated with \eqref{eq:woodbury}. For $W_0$ the tangent is $-1/P_a'(\dV_a)$. A test
-checks $W^{\tan}$ against finite differences (\code{test\_tangent\_weight\_matches\_finite\_difference}).
-
-\subsection{Sensitivity of the pre-activation pressure}
-
-For fixed weights, differentiating \eqref{eq:neuron} with respect to one weight gives
-\begin{equation}\label{eq:sensitivity}
-S_k = \frac{\partial p_a}{\partial W_k} = \frac{p_k - p_a}{\sum_j W_j + W_0},
-\end{equation}
-where $p_k-p_a$ becomes $p_0 - p_a$ for $W_0$. Increasing $W_k$ pulls $p_a$ towards $p_k$, and
-$S_k=0$ where $p_k=p_a$: there, a weight has no influence on the pre-activation pressure, however
-large or nonlinear it is. This is exactly where the secant weight of a slack membrane is singular,
-$W\propto |\Delta p|^{-2/3}$. The sweep plots colour every sample of $W_k$ by $|S_k|$, and the fit
-below uses it as its weighting.
-
-\subsection{Piecewise polynomial weights}
-
-Each weight is fitted as a polynomial in its own pressure difference, $\Delta p_j = p_j - p_a$ for
-an input and $\Delta p_0 = p_a - p_0$ for the pre-activation fluid. There is \emph{one polynomial for
-$\Delta p>0$ and one for $\Delta p<0$}, because a membrane deflecting towards the pre-activation
-chamber and one deflecting away from it can meet different obstacles. Each side is a separate
-\emph{piece} with its own degree. A weight sampled on one side only uses that side's polynomial for
-both signs.
-
-\paragraph{Sensitivity-weighted least squares.} For one piece with samples $(\Delta p_i, W_i)$
-and sensitivities $S_i$ from \eqref{eq:sensitivity}, evaluated with the sample's own weights, the
-polynomial of degree $n$ minimises
-\begin{equation}
-\sum_i \left(\frac{|S_i|}{\max_k |S_k|}\right)^2\Big(\hat W(\Delta p_i) - W_i\Big)^2,
-\qquad \hat W(\Delta p) = \sum_{m=0}^{n} c_m\,\Delta p^m.
-\end{equation}
-By \eqref{eq:sensitivity}, $|S_i|\,|\hat W - W_i|$ is to first order the error in $p_a$ caused by
-the error in the weight. So the fit minimises the linearised activation-pressure error, not the
-error in $W$. Without the weighting, the few samples just off $\Delta p = 0$, where $W$ is huge,
-dominated the fit and forced high degrees with enormous coefficients, even though they barely
-affect $p_a$. For conditioning, the fit is done in $\Delta p/\max|\Delta p|$ and rescaled
-afterwards. Samples with $|\Delta p| \le 10^{-6}\max|\Delta p|$ are left out, and the degree is
-capped at the number of distinct points minus one, and at 10.
-
-\paragraph{Where the weighted average breaks down.} Equation~\eqref{eq:sensitivity} requires
-$\sum_j W_j + W_0$ to be clearly positive. A sample whose weight sum is below $10^{-3}$ of
-$\sum_k|W_k|$ is given no sensitivity and is left out of the polynomial fits (it is still part of the
-tolerance check). The typical cause is an unmodelled bias, which the next subsection removes.
-
-\subsection{Bias of non-neutral paths}\label{sec:bias}
-
-A closed chamber \emph{inside} a path that is not neutral at rest pushes volume into the pre-activation
-chamber even when every pressure is equal. Examples are a gas weight chamber filled above ambient,
-or a liquid one filled with more or less liquid than its volume (a chamber is neutral when its
-pressure law gives zero gauge pressure at its rest volume). Where all pressures around the pre-activation
-chamber are equal, $p_a$ then still differs from them, which no weighted average can reproduce. The
-secant weights $W_j = \dV_j/\Delta p_j$ are forced to cancel: in one test design,
-$-152.6 + 109.7 + 42.6 + 0.3 \approx 0$\,mm$^3$/kPa at equal input pressures, which made $S_k$
-diverge. Such a \emph{biased} path is modelled as
-\begin{equation}
-\dV_j = b_j + W_j(\Delta p_j)\,\Delta p_j,
-\end{equation}
-which puts $B = \sum_j b_j$ in \eqref{eq:neuron}. $W_j = (\dV_j - b_j)/\Delta p_j$ is then fitted like
-any other weight.
-
-$b_j$ is \emph{measured}, not fitted. When fitted as a free constant together with the weights, it
-trades off against the polynomials. The tolerance on $p_a$ cannot tell them apart, and the fitted $B$
-varied from $0.6$ to $18$~mm$^3$ with the chosen degrees on the test design. Instead, before the
-sweep, one extra solve is made at the \emph{neutral state}: every constant-pressure input at the
-pre-activation chamber's rest pressure $p_0$. There an unbiased path pushes nothing, so what a biased
-path pushes is its bias. The small pressure difference that remains is corrected to first order:
-$b_j = \dV_j - W_j^{\tan}\Delta p_j$. On the test design this gives $b = 5.88$~mm$^3$, and the
-corrected weights along the sweep become positive and peak at $\Delta p = 0$, as for a slack
-membrane (1.75 \dots 15.4 \dots 1.88~mm$^3$/kPa), instead of passing through $-152.6$. The solve is
-skipped when no path is biased.
-
-\paragraph{Solving the equation.} Given the fitted weights, $p_a$ for an input set is a root of
-\begin{equation}
-r(p_a) = \sum_k \hat W_k(\Delta p_k)\,(p_k - p_a) + B = 0.
-\end{equation}
-Without a bias, a weighted average must lie between the lowest and highest pressure involved, so $r$
-is sampled at 121 points on $[\min_k p_k,\ \max_k p_k]$. A bias can move $p_a$ outside that range, so
-the interval is then widened by about $B/\sum_k \hat W_k(0)$. Every sign change is refined with
-Brent's method.
-
-Polynomial weights can make \eqref{eq:neuron} \emph{multivalued}: several pre-activation pressures
-satisfy it for the same inputs. Picking the root closest to the simulated $p_a$ would hide this,
-since the equation, used on its own, has nothing to pick with. The fit therefore scores every sample
-by its \emph{worst} root, so an equation only meets the tolerance if every pre-activation pressure it
-allows does. On the test design, the first version of this search accepted an equation that was
-within $0.29$~kPa at every sample by its nearest root, but $1.2$~kPa off by another root.
-
-\paragraph{Choosing the degrees.} The user sets a tolerance on the \emph{output} of the equation:
-the fit must reproduce the simulated pre-activation pressure of every sample within, by default,
-$1$~kPa. The degrees are then made as low as possible. All pieces start at degree 0 (constant
-weights). Two search strategies are available:
-\begin{itemize}
-\item \textbf{Lowest total order} (default): try every combination of piece degrees with total
-      order $0, 1, 2, \dots$ and stop at the first total order at which some combination meets the
-      tolerance, taking the one with the smallest maximum error. This is guaranteed to give the
-      lowest possible total order.
-\item \textbf{Biggest own error first} (greedy): while the tolerance is not met, add one degree to
-      the piece with the largest \emph{own} error. That is the worst $p_a$ error when only that
-      piece uses its polynomial and every other weight takes its sampled value. This is faster, but
-      it can end at a higher total order, because errors of different pieces can cancel.
-\end{itemize}
-No piece is raised past the first degree that fits its points exactly. If the tolerance cannot be
-met, the best combination found is returned and marked as such. The search is also limited to 2000
-degree combinations, since an unreachable tolerance would otherwise make the exhaustive search try
-millions of them. When the budget runs out, the best combination found so far is returned, marked as
-stopped. The result is written out as LaTeX: \eqref{eq:neuron} with each weight given as a two-case
-polynomial in its pressure difference, and $B$ with its parts $b_j$.
-
-\paragraph{Checking between the sweep points.} The tolerance is checked at the sweep points only.
-The application therefore also plots the simulated pre-activation pressure with the fitted equation over
-it: a curve for a one-input sweep, and a wireframe over the simulated surface for a two-input sweep.
-The equation is evaluated on a finer grid than the sweep, and any extra roots are shown. A
-high-degree polynomial can pass through every sweep point and still oscillate between them. That is
-visible there and is a reason to sweep more densely rather than to tighten the tolerance.
-
-\begin{remark}
-When the pre-activation fluid is nearly incompressible ($W_0 \ll W_j$), \eqref{eq:neuron} depends only
-on the \emph{ratios} of the input weights: scaling every $W_j$ by the same factor leaves $p_a$
-unchanged. A tolerance on $p_a$ then cannot pin down the absolute size of the weights, and fitted
-weights can be off from the sampled ones by a common factor while still meeting the tolerance. The
-fitted equation is correct as a map from input pressures to $p_a$. Individual fitted $W_j$ should
-only be compared with each other.
-\end{remark}
-
-%=====================================================================
 \section{The activation-function device}\label{sec:activation}
 %=====================================================================
 
@@ -888,7 +703,7 @@ flow resistance in series with the rest of the gas path, a pressure divider. The
 smallest cross-section $A$, the mass flow $\dot m$ and the pressures along the tube as functions of
 $\Delta p$, is saved with the device as a design file, so that it can be used as a part without
 simulating it again. In the neuron, $\Delta p$ is the \emph{pre-activation} (the pressure difference
-set by the pre-activation chamber, section~\ref{sec:characterise}) and the device maps it to the
+set by the pre-activation chamber, section~\ref{sec:sweep}) and the device maps it to the
 \emph{activation}: the gas pressure of a segment of the tube, chosen and named by the user; a device can
 have several such outputs (section~\ref{sec:output}). The software's two spaces are named accordingly: \emph{inputs to
 pre-activation} (the neuron) and \emph{pre-activation to activation} (this device). The model reuses the membranes, fluid chambers, rigid contact and Newton solver
@@ -1090,8 +905,7 @@ by the user or is the closed chamber the part touches), so the stationarity of t
 \end{equation}
 at equilibrium, with $P_\mathrm{tube} = 0$ when no chamber is on the tube side. Its gradient and
 tangent with respect to $q$ are $A_m \Delta p$ and $A_m^2\,\mathrm{d}\Delta p/\mathrm{d}v$; its
-volume gradient enters the rank-one chamber terms like a membrane's. For the characterisation
-(section~\ref{sec:characterise}) the wall is a membrane of the path from its tube side. The device's
+volume gradient enters the rank-one chamber terms like a membrane's. The device's
 outputs (every named $p_\mathrm{act}$, smallest area, mass flow) are read from the design at the solved $\Delta p$
 by linear interpolation, and held at the end values outside the simulated range. There the design is
 extrapolated rather than interpolated (the swept volume continues linearly with the end slope), and
@@ -1115,6 +929,14 @@ not the kinds of parts or chambers and not the design, since those would need a 
 the chamber pressures and volume changes, the pre-activation $\Delta p$ and the design's outputs can
 be recorded at every solve. The two models are shown side by side, each with its own position and
 rotation, which only affect the display.
+
+\paragraph{Pinned components.} Both components are embedded in the workbench file as they were
+imported, so later changes to their files do not leak in unnoticed (as with referenced components in
+a CAD assembly). The design is compared with its file by a hash of the file's bytes; the neuron by its
+content (paths made absolute, display settings left out), so saving it unchanged keeps it current. An
+update of the neuron is a three-way merge with the version it was imported at as the base: a value
+changed only in the file is taken, a value changed only in the workbench (a fluid parameter or a
+solver setting) is kept, and a value changed in both is the user's choice.
 
 The workbench \emph{characterises} the linked neuron: any number of chamber parameters
 $\theta_1,\dots,\theta_m$ (pressures, ghost volumes, liquid shares, stiffnesses, fluid volumes) are given
@@ -1162,6 +984,14 @@ bodies from its stored solution interpolated at that point's $\Delta p$
 (Section~\ref{sec:empirical}). A point whose $\Delta p$ is outside the design's simulated range is
 marked as extrapolating in the table and the view.
 
+\paragraph{Analysis.} The \emph{Analysis} space slices the stored grid for plotting: one recorded
+quantity against one or two swept parameters, with up to three more parameters laid out as columns,
+rows and layers of panels at a chosen number of their values, and every other parameter held at one
+value. Held values are either snapped to the nearest simulated value or interpolated with the
+multilinear formula above restricted to the held axes, clamped to the grid (no extrapolation); a
+corner that was not solved makes the value undefined, drawn as a gap. The deformed shapes at a chosen
+point are interpolated with the same weights.
+
 %=====================================================================
 \section{Verification}\label{sec:verification}
 %=====================================================================
@@ -1185,12 +1015,6 @@ they establish, the tests check that:
       obstacle; an inflating sheet lifts another without passing through it;
 \item \textbf{the solver is reproducible}: a warm-started solve reaches the same state as a fresh
       one;
-\item \textbf{the characterisation is correct}: weights of direct, ambient and bulk-modulus paths
-      rebuild the pre-activation pressure; a stiffer weight fluid transfers more; the tangent weight
-      matches finite differences; the fitted equation uses the lowest degrees that meet the
-      tolerance, with one polynomial per sign; a measured bias enters the equation exactly; a
-      multivalued equation is judged by its worst root; the search stops at its budget and can be
-      cancelled; cancelling weight sums give no sensitivity;
 \item \textbf{the CAD pipeline works}: part names, closed outward meshes, mid-surfaces, measured
       thickness, chamber--membrane coupling and project save/load on a generated test assembly;
 \item \textbf{the activation-function model is consistent}: the solid's energy of a homogeneous
@@ -1208,7 +1032,7 @@ they establish, the tests check that:
       pressure it sweeps the simulated volume; a sealed gas chamber closed by a membrane and by the
       membrane's own empirical curve reach the same pressure (within $0.05$\,kPa); in a neuron the
       solved $\Delta p$ is the driving minus the tube-side pressure, the design's outputs follow it in
-      a sweep, and the design's membrane is a weight of the neuron equation; the stored solution of a
+      a sweep; the stored solution of a
       design is interpolated between its points, and a pre-activation outside its range raises the
       extrapolation warning;
 \item \textbf{the full neuron and its characterisation work}: linking replaces the chosen membrane
@@ -1239,11 +1063,11 @@ they establish, the tests check that:
 \item \textbf{Material models.} Only incompressible neo-Hookean and St.\ Venant--Kirchhoff sheets are
       available, with no viscoelasticity or damage, and there is no check that stretches stay
       within the material's limits.
-\item \textbf{Activation-function device.} The tube is a compressible neo-Hookean solid on
-      displacement-based tetrahedra, which stiffen (lock) as $\nu \to 0.5$; use $\nu \le 0.49$. The
+\item \textbf{Activation-function device.} The tube is a compressible neo-Hookean solid. Its
+      displacement-based tetrahedra stiffen (lock) as $\nu \to 0.5$; use $\nu \le 0.49$. The
       area of a closed tube does not reach zero (contact gap and lumen corners, about $2\,\%$ of $A_0$
       on the test device). The flow is steady, isothermal and lumped (one pressure per segment); choked
-      or compressible orifice flow is only modelled if the user's law does it. Squeezing far past closure makes the
+      or compressible orifice flow is modelled only by a user-written law. Squeezing far past closure makes the
       solve slow (tens of seconds per point). A design used in a neuron is only valid for the supply
       and sink pressures it was simulated with, and only its swept volume couples back to the neuron:
       the tube's flow does not reach the neuron's chambers.

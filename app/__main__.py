@@ -48,7 +48,9 @@ def main(argv=None):
     app.setWindowIcon(QIcon(str(ICON)))
     window = AppWindow()
     window.show()
-    if len(argv) > 1:
+    if len(argv) > 2 and argv[1] == "--analyse":   # a full neuron's characterisation in the Analysis tab
+        window.open_analysis(argv[2])
+    elif len(argv) > 1:
         window.open_path(argv[1])
     return app.exec()
 

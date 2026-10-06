@@ -11,7 +11,7 @@ equilibrium with Newton–Raphson**. It replaced the explicit-dynamics 2D code i
 (`simulation.py` + notebooks — legacy context only, not maintained).
 
 GitHub remote `origin` = https://github.com/vanvuurenwerner2305-blip/MechanicalNeuronSimulation.git
-(pushed on the user's request, last 2026-09-30, commit 962fd4f — ask before pushing again). The global git user.name is the placeholder
+(pushed on the user's request, last 2026-10-06 — ask before pushing again). The global git user.name is the placeholder
 "Your Name"; commits use the configured identity. Files in `cad_models/` are the user's — do not
 commit/modify them unless asked.
 
@@ -69,57 +69,13 @@ PyQt5, matplotlib, `gmsh` pip-installed). Windows.
   "relaxation" Newton attempt when stalled (snap-through), `warm_start=True` ramps only the P0 change
   (used by sweeps; 3-10x faster). `history` holds every converged load step. `env.solver` keeps the
   last `NewtonSolver` for post-processing.
-- `characterise.py` — back-inferring the neuron equation up to p_a. **W belongs to an input path, not a
-  membrane** (user's definition, per the Article 2 chapter): W_j = dV_j/(p_j − p_a), dV_j = volume the
-  path's shells push into the activation chamber. `input_paths` walks from each activation-chamber shell
-  through closed intermediate chambers (`FluidVolume.is_closed`, e.g. a bulk-modulus weight chamber) to
-  the constant-pressure input(s); no chamber on a side = "ambient" (0 kPa). Activation fluid adds
-  W_0 = −dV_a/(p_a − p_0), p_0 = its law at rest volume. W_tan: unit load on the input with p_a fixed,
-  other closed chambers keep their law (Woodbury `_Tangent` without the activation column). Only W is
-  identified (user agreed A and K can not be separated). `fit_neuron_equation`: **the tolerance is on the
-  equation's output p_a (absolute, default 1 kPa), not on W** (user's requirement: low-degree fits).
-  **Weights are piecewise** (user, 2026-09-29): one polynomial for Δp > 0 and one for Δp < 0, each side a
-  separate "piece" with its own degree in the search; fits[k] = {"kind": "piecewise", "sides": {"+", "-"}}
-  (None = side not sampled, then the other side's polynomial is used for both, `weight_coefficients`).
-  `polyfit_weight` weights the least squares by the sensitivity |∂p_a/∂W| = |Δp|/ΣW (Eq. 4.10,
-  `activation_sensitivities`, ΣW over that sample's weights incl. W_0; user's request 2026-09-29, after an
-  earlier attempt was rolled back). Without sensitivities it falls back to |Δp| (= error in ΔV). Unweighted, the
-  huge W = ΔV/Δp just off Δp=0 (slack membrane) dominated and forced degree 4 with 1e6 coefficients. The
-  W-vs-Δp plot (`_plot_fit`) colours each dot by |∂p_a/∂W| (`weight_sensitivity` in `app/sweep.py`).
-  A sample whose ΣW cancels (≤ 1e-3 Σ|W|) gets NaN sensitivity and is left out of the fits: a gas weight chamber
-  pre-pressurised inside a path is a hidden bias (NeuronTest2.mns, Weight1 at 20 kPa: at Input1 = 0 all pressures
-  are 0 but p_a = 0.035, so W = -152.6 + 109.7 + 42.6 + 0.3 ≈ 0 and S → 2e10).
-  **Bias term B** (user, 2026-09-29): p_a = (ΣW_j p_j + W_0 p_0 + B)/(ΣW_j + W_0). A path through a closed chamber that
-  is not neutral at rest (`is_neutral`: pressure(0) ≠ 0) is biased: dV_j = b_j + W_j Δp_j. b_j is **measured, not
-  fitted** (fitted, B wandered 0.6..18 mm³ with the degrees): `measure_bias` in app/sweep.py does one extra solve with
-  every CONSTANT input (not vents) at the activation rest pressure, `bias_volumes` = dV - W_tan·Δp there (NeuronTest2
-  with Weight1 at 20 kPa: b = 5.884). Rows carry row["bias"]; `sample_weight` gives (dV - b)/Δp.
-  **Multivalued equations**: polynomial W can give several p_a roots; `solve_activation(all_roots=True)`; the fit
-  scores each sample by its *worst* root ("ambiguous" count in the result) - picking the nearest root had accepted an
-  equation 1.2 kPa off by another root. "Equation vs simulation" tab (`_plot_compare`): simulated p_a with the
-  equation over it (1D curve + other roots as x; 2D surface + 25×25 wireframe).
-  (Open issue found earlier: with a near-rigid activation fluid (W0 ≪ W) p_a depends
-  only on weight *ratios*, so the p_a tolerance lets every W be off by the same factor — e.g. constant W
-  fits 40-60% off the sampled W still met 1 kPa.) The 2D example
-  sweep (Left, Right 0..20 kPa) is all constants per side at 1 kPa (W_Left 956 / 2652, W_Right 1752 / 4324
-  mm³/kPa for Δp>0 / Δp<0, 0.41 kPa error). LaTeX: `neuron_equation_latex` returns pieces →
-  `equation_align` (cases) / `equation_lines` (mathtext has no cases). Dialog fits in a `Worker` thread
-  (`fit_worker`; exhaustive 715 combos ≈ 17 s at 0.3 kPa on 25 points).
-  All pieces start at degree 0. `LOWEST_TOTAL` (default): exhaustive over degree combinations by total order,
-  first total that meets the tolerance wins (least error among ties) — guaranteed minimal.
-  `BIGGEST_ERROR` (user's earlier rule): +1 degree to the weight with the biggest *own* error (p_a solved
-  with only that weight fitted, others at sampled W); can end higher because errors cancel (example
-  neuron at 1 kPa: exhaustive total 1 vs greedy 3). Degrees capped at the first exact fit / points−1.
-  Dialog: tolerance or method change does not refit; "Regenerate equation" refits from the stored rows
-  (no re-simulation). Equation tab (redesigned 2026-09-29, user found it unreadable): verdict banner, then a
-  scroll area with each line rendered at natural size (`math_pixmap` via mathtext) and one clickable `WeightCard` per
-  weight (piecewise sides with a painted `Brace`), next to the selected weight's fit plot; LaTeX source in its own tab.
-  The card's fit plot shows its fit
-  over the sampled points (Δp≈0 points shown as dotted lines). p_a per point from `solve_activation` (implicit root of
-  Σ W_k(x_k)(p_k − p_a) = 0 between min/max p_k). `polyfit_weight`: sensitivity-weighted least squares, Δp≈0 points left out.
-  `neuron_equation_latex` → LaTeX lines (matplotlib-mathtext compatible). `app/sweep.py`: activation
-  chamber combo, "p_a from weights" check column, "Neuron equation" tab (rendered + Copy LaTeX),
-  export `<name>.csv`, `_weights.csv`, `_equation.tex`.
+- **Neuron-equation back-inference removed** (user, 2026-10-06: "remove the equation back inferring stuff"; chose
+  everywhere + keep a plain sweep): `membrane_sim/characterise.py` (input-path weights W_j, bias, piecewise
+  polynomial fits, LaTeX equation), the sweep dialog's equation tabs/weights, `mns fit`, the sweep's equation output,
+  check's `input_paths_into_preactivation`, their tests and docs are gone. The neuron sweep (`app/sweep_core.py`
+  `run_sweep`, `app/sweep.py`) records chamber pressures/volumes and linked designs' outputs only (CSV export). Multi-
+  parameter studies: Full neuron characterisation + Analysis tab. Recover the old code from git (commit 4dbd64d) if
+  it is ever wanted again.
 
 **Naming (user, 2026-09-30):** the neuron's "activation" chamber/pressure is now called **pre-activation** in all
 user-facing text (UI, docstrings, paper; code identifiers such as `activation_index`, `solve_activation` and the symbol
@@ -146,6 +102,21 @@ xyz Euler degrees about the model's bbox centre, `transform_points`). Design pic
 placed at +x of the neuron on import. The neuron mesh is generated on the main thread before the worker (cached per
 import). `Project.from_dict(data, folder)` was split out of `Project.load` for the embedded project. Shared fixture
 `design` (simulated valve, session scope) is in `tests/conftest.py`.
+
+**Out-of-date components** (user, 2026-10-06: "like Fusion 360 ... shows that they are outdated and i can update
+them"): the .mfn (version 2) embeds both components as imported: the neuron (as before) + `neuron_base` (its
+`neuron_state` at import/update = dict with absolute paths, no `visible`), and the design (`design_data` = the .mad's
+ActivationProject dict, `design_sha1` = sha1 of the file bytes; `design()`/`design_project()` use the embedded copy,
+`linked_project()` sets `project.pinned_designs` which `builder._empirical_membrane` uses instead of the file).
+`reference_status(kind)` = current / out of date / not found (neuron: content compare with the base, so a re-save
+without changes stays current; design: byte sha1); cached per (mtime, size). `update_neuron(keep_conflicts)` is a
+three-way merge (values changed here only are kept, changed in the source taken, both = conflict),
+`neuron_changes()` lists them, unlinks a link part that is no longer a sheet. Version-1 files: design read from its
+path at load (same sha1 -> fingerprints unchanged); `_legacy_base`: if the source differs only in editable fields
+(chamber fields, solver) those count as edits here. GUI: `check_sources` on a 1.5 s QTimer, orange ⚠ group in the
+tree, "Update (n)" toolbar action (hidden when nothing is out of date), right-click group → Update / Open in its tab
+(`open_source` signal → `AppWindow.open_source`), `UpdateDialog` for the neuron. The fingerprint includes
+`design_sha1`, so an update flags the stored characterisation. Tests: `tests/test_full_neuron.py` (last 5).
 
 **Characterisation** (user, 2026-09-30: "sweep as many properties as i want and track as many as i want ... save this
 fully characterised dataset with the model ... later a workbench connects several neurons, we can't run the simulation
@@ -174,6 +145,18 @@ is stored as incomplete (no shapes). Opening a .mfn shows the stored dataset; `d
 Results tab: table only (plot removed), status, "Show the stored characterisation", CSV. 3D: neuron sheets and the
 design's stored FEM frames both coloured by |u| with one shared scale (`_frame_mesh`, `_thinned`). User model check
 (copies): Weight1 0..20 (3) × Weight2 0..10 (2) × ActivationChamber stiffness 10..40 (2) = 12 points in 55 s, 0.12 MB.
+
+**Analysis tab** (user, 2026-10-06; 4th tab, before "Agentic research study" = the renamed Design study tab, UI text
+only): `app/analysis.py` (Qt-free: `samples`, `axis_weights` (nearest or linear, clamped - no extrapolation),
+`slice_grid`, `panels`, `evaluate_point`) + `app/analysis_window.py` `AnalysisWindow(FullNeuronWindow)` (reuses CAD
+loading, tree, `_show_results`; overrides UI/actions/properties, read only). Opens a .mfn with a characterisation (File
+→ Open, or Full neuron "Analyse…"/F7 which saves and emits `analyse`). Z = one recorded key; swept parameters ticked in
+order get roles x, y, columns, rows, layers (`ROLES`); counted roles show N values (`counts`) instead of a slider;
+layers change with the scroll wheel over the canvas. "Interpolate" toggle (user): off = sliders/counts snap to
+simulated values, on = multilinear. Surfaces (mpl 3D, rotation synced on release) or colour maps, one shared Z scale and
+colour bar, red = extrapolated, x = not converged, NaN gaps = not solved. Clicking a point (pick on scatter/line) sets
+`point` → the 3D dock shows the interpolated frames (`evaluate_point` weights the stored shapes). Tests:
+`tests/test_analysis.py`.
 
 **Stored FEM solution + extrapolation warning** (user, 2026-09-30): `run_study` stores results["fem"] (`encode_fem`):
 per body (build.shells: membranes, tube, movers) name, kind (shell/solid/rigid), display faces, rest coords and one frame
@@ -318,7 +301,7 @@ user's brief.md + demo files.
   construction entities must be removed or they are written as extra products; `geometry_report` = overlaps by
   intersecting copies + touching via `occ.getDistance`), `model.py` (roles/props with aliases validated against
   `SPACE_ROLE_FIELDS`, build_design, `fill_measured` = GUI's _detect_thickness, preview.npz for the GUI, imports of
-  .mns/.mad/.mfn/.step; activation results are kept on import), `ops.py` (check/solve/sweep/fit, dpsweep, full
+  .mns/.mad/.mfn/.step; activation results are kept on import), `ops.py` (check/solve/sweep, dpsweep, full
   solve/characterise; results/, plots, renders, state metrics), `render.py` (offscreen PyVista multi-view PNG with
   labels), `plots.py` (matplotlib, fixed palette), `report.py` (generated auto_*.tex + agent-written narrative.tex,
   pdflatex twice; needs xcolor for hyperref colours), `jobs.py` (--background re-runs the CLI as a detached process,
@@ -326,7 +309,7 @@ user's brief.md + demo files.
   live/<design>.npz), `workspace.py` (new study: agent files, `.mns/bin/mns` (Git Bash) + `mns.cmd` bound to
   sys.executable, start_agent.cmd). Light commands (status, design list/show) import no torch/gmsh: < 0.4 s; model
   commands ~5 s start-up.
-- `app/sweep_core.py`: run_sweep, weights, equation fit/LaTeX/CSV moved out of the Qt dialog (sweep.py delegates);
+- `app/sweep_core.py`: run_sweep and the CSV, outside the Qt dialog (sweep.py delegates);
   `worker.wants_coords` adds deformed sheets to sweep rows (live view). `app/meshview.py`: Qt-free display meshes
   (viewport re-exports them).
 - `app/study_window.py` (4th tab "Design study"): polls events/progress/live files every 0.7 s, follow mode, preview
@@ -341,6 +324,13 @@ user's brief.md + demo files.
 `docs/paper/membrane_neuron_simulator.tex` (+ compiled PDF) — technical reference of the whole formulation,
 linked from the thesis instead of describing the simulator there (user, 2026-09-29). **Keep it in sync when the
 math changes.** Build: `pdflatex` twice in `docs/paper` (MiKTeX installed; aux files are git-ignored).
+`docs/manual/user_manual.tex` (+ compiled PDF) — the user manual (GUI workflow of every space, roles, properties,
+defaults, shortcuts, troubleshooting). Build the same way in `docs/manual`.
+
+**Before every push (user, 2026-10-06): update the LaTeX files** — bring `docs/paper/membrane_neuron_simulator.tex`
+and `docs/manual/user_manual.tex` up to date with the code being pushed (new features, changed defaults, labels,
+shortcuts, formulation), rebuild both PDFs with `pdflatex` twice (no overfull boxes or errors), and commit them with
+the push.
 
 ## Gotchas (learned the hard way)
 
@@ -396,12 +386,6 @@ math changes.** Build: `pdflatex` twice in `docs/paper` (MiKTeX installed; aux f
    (An earlier "empty slack, P stays P0" version was rejected by the user.)
    History step 0 ("0 (start)" in the results slider) records the full chamber pressures on the undeformed
    geometry (e.g. the initial suction), not the zero pressures of the load ramp (user asked for an iteration 0).
-
-4. **Input-path weights + neuron equation in sweeps** (done 2026-09-28; `membrane_sim/characterise.py`,
-   `app/sweep.py`; tests `-k "path or ambient or tangent_weight or solve_activation or equation_fit or usable or latex"` and
-   test_app `-k weights` pass). Equation tolerance added 2026-09-29. Known: an unpretensioned membrane has W ∝ Δp^(−2/3) (singular at Δp=0),
-   so tight tolerances drive W(Δp) to high degrees; at the default 1 kPa the example neuron gives
-   W1 constant, W2 linear, W0 constant (0.64 kPa error) with the exhaustive search. Δp=0 points are left out (user's choice).
 
 ## Status and open issues
 

@@ -158,25 +158,14 @@ def auto_results(design, base):
             out.append(r"\subsection*{Sweep}" + "\n")
             out.append(f"{r['points']} points ({r['converged']} converged) over "
                        + tex(", ".join(f"{k} {v[0]:g}..{v[1]:g} kPa ({v[2]} values)" for k, v in r["inputs"].items()))
-                       + (f"; pre-activation chamber {tex(r['preactivation'])}" if r.get("preactivation") else "")
                        + ".\n\n")
             if (results / "sweep_response.png").exists():
                 out.append(figure(_rel(results / "sweep_response.png", base), "Response to the inputs.", base=base))
-        if (results / "equation.tex").exists():
-            fit = runs.get("fit", {})
-            out.append(r"\subsection*{Neuron equation}" + "\n")
-            out.append(f"Fitted to a tolerance of {number(fit.get('tolerance'))} kPa on the pre-activation pressure "
-                       f"(met: {number(fit.get('met'))}, largest error {number(fit.get('error'))} kPa).\n")
-            out.append((results / "equation.tex").read_text(encoding="utf-8") + "\n")
-            for name, cap in (("weights.png", "The weights against their pressure differences, with the fits."),
-                              ("equation_vs_simulation.png", "The fitted equation against the simulation.")):
-                if (results / name).exists():
-                    out.append(figure(_rel(results / name, base), cap, base=base))
     elif design.space == "activation":
         if "study" in runs:
             m = design.state().get("metrics", {})
             out.append(r"\subsection*{Activation function}" + "\n")
-            rows = [[tex(k), number(v)] for k, v in m.items() if not k.startswith(("solve:", "full:", "W:", "equation"))]
+            rows = [[tex(k), number(v)] for k, v in m.items() if not k.startswith(("solve:", "full:"))]
             out.append(table(rows, ["Quantity", "Value"], "Key numbers of the activation-function study."))
             for name, cap in (("activation.png", "Tube area, mass flow, output pressure and swept volume against the "
                                                  "pressure difference across the membrane."),
@@ -231,7 +220,7 @@ def report_design(design, build=False):
         narrative.write_text(NARRATIVE, encoding="utf-8")
     spec = design.spec()
     title = f"{design.id}: {design.name}"
-    main = (PREAMBLE + r"\title{" + tex(title) + "}\n" + r"\author{Design study, " + tex(design.study.info.get("name"))
+    main = (PREAMBLE + r"\title{" + tex(title) + "}\n" + r"\author{Agentic research study, " + tex(design.study.info.get("name"))
             + "}\n" + r"\date{\today}" + "\n" + r"\begin{document}" + "\n" + r"\maketitle" + "\n"
             + (r"\noindent\textit{" + tex(spec.get("why")) + "}" + "\n\n" if spec.get("why") else "")
             + (f"Derived from {tex(spec['parent'])}.\n\n" if spec.get("parent") else "")
@@ -312,7 +301,7 @@ def report_study(study, build=False):
         pdf = d.folder / "report" / "design.pdf"
         if pdf.exists():
             parts.append("Full report: \\texttt{" + tex(_rel(pdf, folder)) + "}.\n\n")
-        for sub, name in (("results", "equation_vs_simulation.png"), ("results", "activation.png"),
+        for sub, name in (("results", "sweep_response.png"), ("results", "activation.png"),
                           ("results", "characterisation.png"), ("renders", "solve.png"), ("renders", "model.png")):
             p = d.folder / sub / name
             if p.exists():
@@ -323,8 +312,8 @@ def report_study(study, build=False):
     if not narrative.exists():
         narrative.write_text(STUDY_NARRATIVE, encoding="utf-8")
     brief = study.root / "brief.md"
-    main = (PREAMBLE + r"\title{" + tex(study.info.get("name", "Design study")) + "}\n"
-            + r"\author{Design study with the Membrane Neuron Simulator}" + "\n" + r"\date{\today}" + "\n"
+    main = (PREAMBLE + r"\title{" + tex(study.info.get("name", "Agentic research study")) + "}\n"
+            + r"\author{Agentic research study with the Membrane Neuron Simulator}" + "\n" + r"\date{\today}" + "\n"
             + r"\begin{document}" + "\n" + r"\maketitle" + "\n" + r"\tableofcontents" + "\n" + r"\input{narrative}"
             + "\n" + r"\end{document}" + "\n")
     (folder / "study.tex").write_text(main, encoding="utf-8")

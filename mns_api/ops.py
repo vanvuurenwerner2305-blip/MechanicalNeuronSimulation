@@ -2,7 +2,7 @@
 The simulations behind the commands, per space:
 
   neuron      check (mesh + model: which chamber loads which membrane), solve (one static solve), sweep (one or
-              two input pressures, weights and the fitted neuron equation), fit (refit the equation)
+              two input pressures)
   activation  check (tube, fluids, flow connections, bonds), study (the Δp sweep that makes the design usable)
   full        check, solve (once), characterise (a grid over chamber parameters, stored in the .mfn)
 
@@ -66,7 +66,6 @@ def chamber_index(project, name, what="chamber"):
 
 
 def neuron_check(design):
-    from membrane_sim.characterise import input_paths
     cad, project = load_model(design)
     parts = project.parts
     start = time.time()
@@ -83,11 +82,6 @@ def neuron_check(design):
                                 "pressure_kPa": parts[c].props.get("pressure"), "closed": v.is_closed}
                 for c, v in build.volumes.items()}
     pre = default_preactivation(project)
-    paths = []
-    if pre is not None:
-        for label, _, shells, between in input_paths(build.volumes[pre], list(build.volumes.values())):
-            paths.append({"input": label, "membranes": [s.name for s, _ in shells],
-                          "through_closed_chambers": [v.name for v in between]})
     links = {}
     for i, link in build.activation.items():
         names = {c: parts[c].name for c in link.sides}
@@ -100,7 +94,7 @@ def neuron_check(design):
            "chamber_loads": couplings, "sheets": sheets,
            "inputs": [n for n, c in chambers.items() if c["model"] == "input"],
            "preactivation_default": parts[pre].name if pre is not None else None,
-           "input_paths_into_preactivation": paths, "activation_links": links,
+           "activation_links": links,
            "contact_stiffness_MPa_per_mm": rounded(build.contact_stiffness), "warnings": build.warnings}
     write_json(design.path("results", "check.json"), out)
     design.set_state(checked=time.strftime("%Y-%m-%dT%H:%M:%S"), status=_status(design, "checked"))
@@ -171,8 +165,7 @@ def neuron_solve(design, sets=(), render=True, max_minutes=None):
     return summary
 
 
-def neuron_sweep(design, inputs, preactivation=None, tolerance=1.0, method="lowest", sets=(), max_minutes=None,
-                 render=True):
+def neuron_sweep(design, inputs, sets=(), max_minutes=None, render=True):
     """inputs: [(chamber name, values)] (one or two)."""
     from app.sweep_core import run_sweep
     if not 1 <= len(inputs) <= 2:
@@ -188,12 +181,6 @@ def neuron_sweep(design, inputs, preactivation=None, tolerance=1.0, method="lowe
             raise ApiError(f"{name} is not a constant-pressure input chamber",
                            f"Inputs: {', '.join(p.name for p in parts if p.props.get('model') == CONSTANT)}")
         idx.append((i, list(values)))
-    if preactivation in (None, "", "auto"):
-        act = default_preactivation(project)
-    elif str(preactivation).lower() == "none":
-        act = None
-    else:
-        act = chamber_index(project, preactivation, "pre-activation chamber")
     events = design.study.events
     mesh = generate_mesh(cad, project)
     shells_idx = [i for i, p in enumerate(parts) if p.role in DEFORMABLE]
@@ -217,7 +204,7 @@ def neuron_sweep(design, inputs, preactivation=None, tolerance=1.0, method="lowe
     b_index, b_values = idx[1] if len(idx) > 1 else (None, [math.nan])
     stopped = None
     try:
-        run_sweep(worker, cad, project, mesh, a_index, np.asarray(a_values), b_index, np.asarray(b_values), act)
+        run_sweep(worker, cad, project, mesh, a_index, np.asarray(a_values), b_index, np.asarray(b_values))
     except TimeoutError as exc:
         stopped = str(exc)
     events.clear_progress()
@@ -226,15 +213,12 @@ def neuron_sweep(design, inputs, preactivation=None, tolerance=1.0, method="lowe
         raise ApiError("The sweep produced no points" + (f" ({stopped})" if stopped else ""))
     seconds = time.time() - start
     sweep = {"inputs": [{"chamber": parts[i].name, "values": v} for i, v in idx], "a_index": a_index,
-             "b_index": b_index, "preactivation": parts[act].name if act is not None else None,
-             "preactivation_index": act, "set": dict(sets), "seconds": seconds, "stopped": stopped,
+             "b_index": b_index, "set": dict(sets), "seconds": seconds, "stopped": stopped,
              "chambers": [c for c, p in enumerate(parts) if p.role == CHAMBER],
              "linked": [i for i, p in enumerate(parts) if p.role == ACTIVATION_MEMBRANE],
              "rows": [_row_json(r) for r in rows]}
     write_json(design.path("results", "sweep_rows.json"), sweep)
     summary = sweep_summary(design, project, sweep, rows, render=render)
-    if act is not None:
-        summary["equation"] = neuron_fit(design, tolerance, method, project=project, sweep=sweep, rows=rows)
     design.set_state(status=_status(design, "swept"))
     return summary
 
@@ -252,13 +236,6 @@ def _row_back(row):
     for key in ("P", "dV", "act"):
         if key in out:
             out[key] = {int(k): v for k, v in out[key].items()}
-    for w in out.get("W", {}).values():
-        for k, v in list(w.items()):
-            if v is None:
-                w[k] = math.nan
-    for k in ("p_a_rebuilt",):
-        if out.get(k) is None:
-            out[k] = math.nan
     return out
 
 
@@ -274,16 +251,13 @@ def load_sweep(design):
 def sweep_summary(design, project, sweep, rows, render=True):
     from app.sweep_core import write_sweep_csv
     parts = project.parts
-    act = sweep["preactivation_index"]
     a_index, b_index = sweep["a_index"], sweep["b_index"]
     csv_path = design.path("results", "sweep.csv")
-    write_sweep_csv(csv_path, rows, parts, a_index, b_index, sweep["chambers"], sweep["linked"],
-                    _weight_keys(rows), parts[act].name if act is not None else "")
+    write_sweep_csv(csv_path, rows, parts, a_index, b_index, sweep["chambers"], sweep["linked"])
     files = {"csv": str(csv_path)}
     ok = [r for r in rows if r["converged"]]
     out = {"design": design.id, "points": len(rows), "converged": len(ok), "seconds": round(sweep["seconds"], 1),
-           "inputs": {d["chamber"]: [min(d["values"]), max(d["values"]), len(d["values"])] for d in sweep["inputs"]},
-           "preactivation": sweep["preactivation"]}
+           "inputs": {d["chamber"]: [min(d["values"]), max(d["values"]), len(d["values"])] for d in sweep["inputs"]}}
     if sweep.get("stopped"):
         out["stopped"] = sweep["stopped"]
     extrapolated = sum(bool(r.get("extrapolated")) for r in rows)
@@ -328,104 +302,9 @@ def sweep_summary(design, project, sweep, rows, render=True):
             plots.panels(path, a_vals, panels, f"{a_name} [kPa]", title=f"{design.id}: response")
         files["response_plot"] = str(path)
     out["files"] = files
-    design.record_run("sweep", {k: out[k] for k in ("points", "converged", "seconds", "inputs", "preactivation")})
+    design.record_run("sweep", {k: out[k] for k in ("points", "converged", "seconds", "inputs")})
     return out
 
-
-def _weight_keys(rows):
-    from app.sweep_core import weight_keys_of
-    return weight_keys_of(rows)
-
-
-METHODS = {"lowest": "lowest_total", "greedy": "biggest_error"}
-
-
-def neuron_fit(design, tolerance=1.0, method="lowest", project=None, sweep=None, rows=None, max_evaluations=2000):
-    """Fit the neuron equation to the stored sweep (no new simulations)."""
-    from membrane_sim.characterise import BIGGEST_ERROR, LOWEST_TOTAL, weight_degree
-    from app.sweep_core import (FLUID, SIDE_NAME, describe_fit, equation_activation, equation_fit, equation_latex,
-                                fits_of, latex_source, sample_weight, weight_label, write_weights_csv)
-    from membrane_sim.characterise import equation_lines
-    if sweep is None:
-        sweep, rows = load_sweep(design)
-    act = sweep["preactivation_index"]
-    if act is None:
-        raise ApiError("The sweep had no pre-activation chamber, so there are no weights to fit.",
-                       f"Run mns sweep {design.id} again with --preactivation <closed chamber>.")
-    method_name = {"lowest": LOWEST_TOTAL, "greedy": BIGGEST_ERROR}.get(method, method)
-    start = time.time()
-    fit = equation_fit(rows, act, float(tolerance), method_name)
-    keys = _weight_keys(rows)
-    act_name = sweep["preactivation"]
-    tex = latex_source(rows, fit, keys, act_name)
-    results = design.path("results")
-    (results / "equation.tex").write_text(tex, encoding="utf-8")
-    write_weights_csv(results / "weights.csv", rows, fit, keys, act_name)
-    write_json(results / "equation_fit.json", {"fit": fit, "tolerance": tolerance, "method": method_name,
-                                                "weight_keys": keys})
-    fits = fits_of(fit, keys)
-    weights = {}
-    for j, k in enumerate([k for k in keys if k != FLUID], start=1):
-        weights[f"W_{j} ({k})"] = describe_fit(fits[k])
-    if FLUID in fits:
-        weights[f"W_0 ({weight_label(FLUID, act_name)})"] = describe_fit(fits[FLUID])
-    equation = equation_latex(rows, fit, keys, act_name, precision=4)
-    out = {"tolerance_kPa": tolerance, "met": bool(fit["met"]), "max_error_kPa": rounded(fit["error"]),
-           "total_order": int(sum(weight_degree(f) for f in fit["fits"].values())), "weights": weights,
-           "bias_mm3": rounded(fit.get("bias")) if fit.get("bias") else None,
-           "ambiguous_points": fit.get("ambiguous", 0), "stopped_early": bool(fit.get("stopped")),
-           "latex": [line[0] for line in equation_lines(equation)] if equation else [], "seconds": round(time.time() - start, 1),
-           "files": {"latex": str(results / "equation.tex"), "weights_csv": str(results / "weights.csv")}}
-    # figures: each weight's samples and fit; the equation against the simulation
-    panels = []
-    ok = [r for r in rows if r["converged"] and r["W"]]
-    for j, k in enumerate([k for k in keys if k != FLUID] + ([FLUID] if FLUID in fits else []), start=1):
-        dp = [r["W"][k]["dp"] for r in ok if k in r["W"]]
-        W = [sample_weight(r, k) for r in ok if k in r["W"]]
-        curves = []
-        for side, f in fits[k]["sides"].items():
-            if f is not None:
-                x = np.linspace(*f["dp_range"], 100)
-                curves.append((f"fit {SIDE_NAME[side]}: degree {f['degree']}", x,
-                               np.polynomial.polynomial.polyval(x, f["coefficients"])))
-        title = f"W_0: {act_name} fluid" if k == FLUID else f"W_{j}: {k}"
-        panels.append((title, dp, W, curves, "p_a - p_0 [kPa]" if k == FLUID else f"p({k}) - p_a [kPa]"))
-    if panels:
-        out["files"]["weights_plot"] = plots.weight_fits(results / "weights.png", panels)
-    if ok:
-        names = [d["chamber"] for d in sweep["inputs"]]
-        sim = [r["P"][act] for r in ok]
-        pred = []
-        for r in ok:
-            swept = {names[0]: r["a"]}
-            if len(names) > 1:
-                swept[names[1]] = r["b"]
-            roots = equation_activation(rows, fit, keys, swept)
-            pred.append(min(roots, key=lambda x: abs(x - r["P"][act])) if roots else math.nan)
-        if len(names) == 1:
-            order = np.argsort([r["a"] for r in ok])
-            a = np.array([r["a"] for r in ok])[order]
-            plots.lines(results / "equation_vs_simulation.png", a,
-                        [("simulated", np.array(sim)[order]), ("equation", np.array(pred)[order])],
-                        f"{names[0]} [kPa]", f"p_a of {act_name} [kPa]",
-                        title=f"equation within {fit['error']:.3g} kPa (tolerance {tolerance:g})")
-        else:
-            av, bv = sorted({r["a"] for r in ok}), sorted({r["b"] for r in ok})
-            z = np.full((len(bv), len(av)), np.nan)
-            for r, p, s in zip(ok, pred, sim):
-                z[bv.index(r["b"]), av.index(r["a"])] = p - s
-            plots.heatmap(results / "equation_vs_simulation.png", av, bv, z, f"{names[0]} [kPa]",
-                          f"{names[1]} [kPa]", "equation - simulated p_a [kPa]", diverging=True,
-                          title=f"equation error (max {fit['error']:.3g} kPa)")
-        out["files"]["equation_plot"] = str(results / "equation_vs_simulation.png")
-    metrics = {"equation_error_kPa": fit["error"], "equation_met": bool(fit["met"]),
-               "equation_total_order": out["total_order"], "equation_tolerance_kPa": tolerance}
-    for name, f in fits.items():
-        for side, s in f["sides"].items():
-            if s is not None and s["degree"] == 0:
-                metrics[f"W:{name}{side}_mm3_per_kPa"] = s["coefficients"][0]
-    design.record_run("fit", {"tolerance": tolerance, "met": out["met"], "error": out["max_error_kPa"]}, metrics)
-    return out
 
 
 # -----------------------------

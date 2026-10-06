@@ -1,8 +1,8 @@
 # Brief
 
 ## Goal
-<!-- What should the study find out? e.g. "Find membrane thickness and chamber height that give equal weights
-W1 = W2 within 5% and a neuron equation of total order <= 2 at 0.5 kPa." -->
+<!-- What should the study find out? e.g. "Find membrane thickness and chamber height for which Input1 and
+Input2 raise the pre-activation pressure equally (within 5%) over 0-20 kPa." -->
 
 ## Starting point
 <!-- The designs imported from your files (they are in designs/), and what they are. -->

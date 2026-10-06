@@ -208,10 +208,10 @@ def test_ghost_volume_adds_to_the_chamber_and_liquid_share_applies_to_the_total(
     assert kw["gas_volume"] == pytest.approx(15.0)       # 15 mm3 of the 30 is incompressible
 
 
-def test_sweep_reports_input_weights_that_rebuild_the_activation_pressure(neuron):
+def test_sweep_records_the_chamber_pressures_at_every_input_pressure(neuron):
     from types import SimpleNamespace
     from app.project import INCOMPRESSIBLE
-    from app.sweep import FLUID, equation_fit, run_sweep
+    from app.sweep_core import run_sweep
     cad, project, path = neuron
     cad.load_step(path)
     saved = {p.name: dict(p.props) for p in project.parts}
@@ -224,20 +224,14 @@ def test_sweep_reports_input_weights_that_rebuild_the_activation_pressure(neuron
             p.props.update({"Chamber_Left": dict(pressure=5.0), "Chamber_Right": dict(pressure=5.0),
                             "Chamber_Middle": dict(model=INCOMPRESSIBLE, stiffness=10.0)}[p.name])
     try:
-        run_sweep(worker, cad, project, None, index["Chamber_Left"], np.array([10.0, 15.0, 20.0]), None, None,
-                  index["Chamber_Middle"])
+        run_sweep(worker, cad, project, None, index["Chamber_Left"], np.array([10.0, 15.0, 20.0]), None, None)
         middle = index["Chamber_Middle"]
         assert len(rows) == 3 and all(r["converged"] for r in rows)
-        for r in rows:
-            assert set(r["W"]) == {"Chamber_Left", "Chamber_Right", FLUID}
-            for name in ("Chamber_Left", "Chamber_Right"):
-                w = r["W"][name]
-                assert w["dp"] == pytest.approx(r["P"][index[name]] - r["P"][middle], abs=1e-9) and w["W"] > 0
-            assert r["p_a_rebuilt"] == pytest.approx(r["P"][middle], rel=1e-6)
-        fit = equation_fit(rows, middle, 1.0)
-        assert fit["met"] and fit["error"] <= 1.0
-        assert set(fit["fits"]) == {"Chamber_Left", "Chamber_Right", FLUID}
-        assert all(w["kind"] == "piecewise" for w in fit["fits"].values())
+        rows.sort(key=lambda r: r["a"])
+        assert [r["P"][index["Chamber_Left"]] for r in rows] == pytest.approx([10.0, 15.0, 20.0])
+        pre = [r["P"][middle] for r in rows]
+        assert 0 < pre[0] < pre[1] < pre[2] < 20.0          # the closed chamber follows the input
+        assert all("W" not in r for r in rows)
     finally:
         for p in project.parts:
             p.props = saved[p.name]
