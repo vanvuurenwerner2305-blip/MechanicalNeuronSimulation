@@ -1,0 +1,253 @@
+# Membrane Neuron Simulator
+
+Desktop simulation software for fluid-driven membranes and shells. You build the device in CAD,
+import it as STEP, click each solid to give it a role (membrane, shell, rigid body, fluid chamber),
+and solve for static equilibrium with a Newton–Raphson solver.
+
+The window has five tabs, each with its own model:
+
+- **Inputs → pre-activation**: membranes between fluid chambers, with solves and input sweeps (`*.mns`).
+- **Pre-activation → activation**: the valve that turns the pre-activation pressure into a tube's open
+  area and the activation pressure. Simulate it once and save it as a design (`*.mad`) to use as a part.
+- **Full neuron**: both linked, with fluid parameters, recording and characterisation (`*.mfn`). Shows
+  when its components are out of date and updates them.
+- **Analysis**: plots a full neuron's stored characterisation against its swept parameters.
+- **Agentic research study**: an AI design agent (Claude Code) works on a study folder, followed live.
+
+## Installation
+
+On a fresh Windows machine:
+
+1. Install Python 3.10–3.12. Use [Anaconda](https://www.anaconda.com/download), or Python 3.11 from
+   [python.org](https://www.python.org/downloads/) with "Add python.exe to PATH" ticked.
+2. Download this repository (green **Code** button → *Download ZIP*, then unzip; or `git clone`).
+3. Double-click **`install.bat`**. It creates a Python environment in
+   `%LOCALAPPDATA%\MembraneNeuronSimulator\venv` and installs the packages of
+   [`requirements.txt`](requirements.txt). The first run downloads about 1 GB; run it again to repair the
+   environment.
+4. Double-click **`Membrane Neuron Simulator.bat`** to start the program.
+
+The environment lives in a short path outside the project folder because Windows limits paths to 260
+characters, and some packages (torch) nest deeply. Without `install.bat`, install the packages into any
+Python 3.10–3.12 with `python -m pip install -r requirements.txt`. Use PyQt5 only: PySide6 or PyQt6 next to
+it can break the 3D view.
+
+Optional:
+- [MiKTeX](https://miktex.org/download) (`pdflatex` on the path) for the PDF reports of studies and sweeps.
+- [Claude Code](https://claude.com/claude-code) for the agentic research study tab.
+
+## Running
+
+```
+python run_app.py                    # start the application
+python run_app.py model.step         # ...and import a STEP file
+python run_app.py project.mns        # ...or open a saved neuron project
+python run_app.py valve.mad          # ...or an activation design
+python run_app.py neuron.mfn         # ...or a full neuron
+python run_app.py --analyse neuron.mfn   # ...in the Analysis tab
+python -m pytest tests               # solver benchmarks + application pipeline tests
+```
+
+The full user manual is [`docs/manual/user_manual.pdf`](docs/manual/user_manual.pdf) (LaTeX source next to it).
+
+## Workflow
+
+1. **Model in CAD** so that every region is its own solid body:
+   - each membrane or shell is a thin solid;
+   - each fluid chamber is a solid that fills the fluid space;
+   - frames and obstacles are solids.
+
+   Export the assembly or multi-body part as STEP, in millimetres. Part names (or Fusion 360
+   body names) are carried over.
+2. **File → Open STEP.** Every solid shows up in the model tree.
+3. **Assign roles.** Click a part in the 3D view (Ctrl+click adds more), or select it in the tree,
+   then pick its role. To reach parts inside the frame, untick the frame in the tree or use a
+   section cut. *Edit → Auto-assign roles from names* guesses roles from names like `Membrane_1`
+   or `Chamber_A`.
+4. **Set properties:**
+   - membranes/shells: material, Young's modulus, thickness (0 = measured from the CAD solid),
+     element size, which edges are fixed;
+   - chambers: pressure model and pressure (gauge: the surroundings are 0 kPa, and a membrane face
+     that touches no chamber sees 0 kPa):
+     - **Constant pressure** (green): the inputs.
+     - **Closed: ideal gas** (blue, darker = more liquid): sealed air, optionally partly filled
+       with incompressible liquid.
+     - **Closed: incompressible** (purple): sealed and full of liquid. Stiffness is in kPa per %
+       volume change (default 10 kPa/%; water is 22 000, and above ~1 000 the results barely change
+       while the solve gets slower).
+     - **Vent** (transparent): open to the surroundings, always 0 kPa.
+5. **Mesh / Check model** (Ctrl+M / Ctrl+K). Membranes and shells are replaced by their
+   mid-surfaces, and fixed nodes are shown in blue. The message log lists which chamber acts on
+   which membrane.
+6. **Solve** (F5) and look at the **Results** tab:
+   - displacement or area-stretch contours, with a slider through the load steps;
+   - a table of chamber pressures and volumes;
+   - VTK and CSV export.
+7. **Sweep** (F6) maps the response over one or two input chamber pressures: every chamber's pressure
+   and any linked activation design's outputs at every point (table, line plot or heat map, CSV export).
+   Each point starts from the previous solution, so sweeps are several times faster than separate
+   solves. For more parameters, use the Full neuron tab's characterisation and the Analysis tab.
+
+`examples/make_neuron_step.py` writes `examples/soft_neuron.step`, the soft neuron as a named
+STEP assembly, for trying the workflow.
+
+### How CAD solids become the simulation model
+
+| Role | Simulated as |
+|---|---|
+| Membrane | Shell on the mid-surface of the solid, no bending stiffness |
+| Shell | Same, with bending stiffness |
+| Rigid body | Contact obstacle (closed surface mesh) |
+| Fluid chamber | Pressure on every membrane/shell whose face it touches; closed chambers change pressure with volume |
+| Ignore / Unassigned | Left out |
+
+- The mid-surface is built from the largest CAD face of the thin solid. Each node is moved half the
+  locally measured thickness into the solid. A membrane should therefore have one main face (a
+  plate, disc or dome made as a single face).
+- Membrane edges are clamped: either every boundary edge, or only the edges that touch rigid bodies.
+- Chamber-membrane coupling is found geometrically: points just beyond each membrane face are
+  tested against every chamber solid.
+
+## Activation function space
+
+The device is a valve: the pressure difference Δp across a membrane squeezes a soft tube, through a
+part bonded to the membrane (e.g. a pusher, rigid or deformable), against a rigid body. Gas flows
+through the tube from a supply to a sink, and the software computes how the tube's cross-section,
+the mass flow and the pressures along the tube change with Δp - how the pressure divides depending
+on how far the tube is clamped.
+
+1. In CAD, make solids for the membrane, the pusher (touching the membrane's face and the tube), the
+   tube, the rigid body behind it, and the gas: one body filling the tube, a supply body against its
+   inlet end and a sink body against its outlet end. `examples/make_activation_step.py` writes such
+   a device.
+2. Open the STEP file in the Activation function tab and assign roles (Edit → Auto-assign guesses them
+   from names like Membrane, Pusher, Tube, TubeFluid, InletFluid, OutletFluid).
+3. **Flow connections** appear in the model tree wherever two fluid bodies touch (and where a dynamic
+   fluid faces the outside). Click one to make it an **Opening** (no resistance), an **Orifice** (your
+   equation) or **Closed** (Flow tab).
+4. Set the Δp range and the gas (gas constant, temperature, atmospheric pressure, viscosity) in the
+   **Study** tab and press **Simulate** (F5). At every Δp the structure and the flow are iterated until
+   the pressures on the tube wall stop changing.
+5. **Save design** (Ctrl+S) stores the roles, connections, settings and the results in one `.mad`
+   file. Opening it shows the curves without simulating again; from Python,
+   `ActivationDesign.load("valve.mad")` gives `.area(dp)`, `.mass_flow(dp)` and `.end_pressure(dp)`.
+
+| Role | Simulated as |
+|---|---|
+| Membrane / Shell | As in the neuron space, clamped along its edges; Δp pushes it towards the tube; bonded to every free rigid body or solid its face touches |
+| Channel (tube) | 3D solid (10-node tetrahedra, compressible neo-Hookean), fixed at its two end faces |
+| Fluid, Constant pressure | A supply or sink held at a set pressure |
+| Fluid, Dynamic pressure | Pressure follows from the flow. The fluid filling the tube is cut into **Segments** along it, each a flow resistance in series with its own pressure on the tube wall |
+| Solid | Deformable 3D solid (e.g. a soft pusher); free, or fixed where it touches fixed rigid bodies; contact with the tube and other solids |
+| Rigid body, Motion = Fixed | Fixed obstacle |
+| Rigid body, Motion = Free | Moves and tilts as a rigid body (e.g. a rigid pusher); contact with the tube and solids |
+
+Resistance equations give the pressure drop in Pa for a mass flow `mdot` (kg/s), in SI units, with the
+variables `rho` (gas density at the mean pressure), `rho_up` (upstream density), `mu`, `A`, `P`
+(perimeter), `h`, `w`, `L`, `Dh = 4A/P`, `p`, `p_up`, `p_down`. A segment uses the smallest section in
+it; a connection uses its contact face. Defaults: laminar segments `32*mu*L*mdot/(rho*A*Dh**2)`, orifice
+`(mdot/(0.61*A))**2/(2*rho_up)`. The gas density follows the ideal gas law. A closed tube keeps a small
+area (about 2 % of A0) from the contact gap between its walls.
+
+## Analysis of a characterisation
+
+The **Analysis** tab plots a full neuron's stored characterisation (File → Open a `.mfn`, or **Analyse…** in the
+Full neuron tab) without simulating anything. Choose the result (Z) and tick swept parameters as plot axes in turn:
+one gives a curve, two a surface, three a row of surfaces, four a grid and five layers of grids (scroll wheel over
+the plots). Unticked parameters are held at their slider's value; from the third axis on a parameter shows a number
+of its values instead. **Interpolate** switches between the simulated points only and linear interpolation between
+them. Click a point to see the neuron deformed there in the 3D view; the model tree shows every part's settings
+(read only).
+
+## Agentic research studies
+
+The **Agentic research study** tab runs an AI design agent (Claude Code) on a study folder and follows it live:
+
+1. **New study…**: choose an empty folder, write the brief (goal, free parameters and ranges, what to measure,
+   budget) and add your starting models (`.mns`, `.mad`, `.mfn`); they are imported as designs.
+2. **Start agent**: opens Windows Terminal in the study folder with Claude Code running. The first time,
+   accept Claude Code's "trust this folder" question. The agent works only through the `mns` command
+   line: its rules are in the study's `CLAUDE.md`, its manual in `MANUAL.md`, and `.claude/settings.json`
+   blocks scripts and edits outside the study.
+3. Watch the tab: the agent's current command and its reason, the design list, the event log, the
+   deforming shape during solves, and every plot and picture. **Open in its space** opens a design in the
+   neuron, activation or full-neuron tab.
+
+At the end, `report/study.pdf` holds the overall findings, and `designs/<ID>_<name>/` holds each design:
+`design.yaml` (parameters, CAD, roles), `model.step`, the simulator project, `results/`, `renders/` and
+`report/design.pdf`.
+
+The same command line works by hand (`<study>/.mns/bin/mns`, or `python -m mns_api` with this folder on
+`PYTHONPATH`): `mns help` lists the commands, and `agent/MANUAL.md` documents them and the design file format.
+
+## Layout
+
+```
+install.bat             installer (Python environment + requirements.txt); Membrane Neuron Simulator.bat starts the app
+app/                    desktop application (PyQt5 via qtpy, PyVista viewport, gmsh CAD kernel)
+  cad.py                STEP import, per-body surface meshing, mid-surface extraction
+  project.py            roles, property schemas, solver settings, .mns project files
+  builder.py            project + CAD -> membrane_sim.Environment, chamber/membrane coupling detection
+  main_window.py        main window; panels.py, viewport.py, sweep.py, workers.py
+  sweep_core.py         input sweep and its CSV without Qt (shared with mns_api)
+  analysis.py, analysis_window.py   Analysis tab (slices of a stored characterisation)
+  study_window.py       Agentic research study tab (follows a study folder; starts the agent)
+mns_api/                headless API and the `mns` command line (design files -> CAD -> runs -> reports)
+agent/                  the agent's rules (AGENT_RULES.md, copied as the study's CLAUDE.md), MANUAL.md, settings.json, brief template
+membrane_sim/           solver core (usable on its own)
+  shell.py              large-strain membrane triangle + Morley bending (node coords + edge rotations)
+  fluid.py              FluidVolume: chamber pressure P(dV); dV from the moving shells only
+  contact.py            exact signed distance to closed triangle meshes, penalty contact
+  solver.py             Newton-Raphson: consistent tangent, sparse LU + Woodbury, line search
+  environment.py        Environment: build, solve (fresh or warm-started), reset
+examples/               STEP generators for a test neuron and valve, icon generator
+tests/                  analytical benchmarks, consistency checks, application pipeline tests
+```
+
+## Solver model
+
+A summary of the formulation (elements, pressure loads, contact, Newton globalisation):
+
+- **Membrane**: plane-stress triangle on the exact surface deformation gradient. Incompressible
+  neo-Hookean (the default, for rubber) or St. Venant–Kirchhoff. Optional pre-tension.
+- **Bending**: Morley triangle with one mid-edge rotation unknown per edge. It is independent of
+  mesh orientation and converges to Kirchhoff plate theory.
+- **Fluid chambers** (all pressures gauge, 0 = atmospheric):
+  - constant pressure (inputs);
+  - closed ideal gas (isothermal) with an optional incompressible share. With a fraction `f` of
+    liquid the gas volume is `Vg = (1 - f) V0`, all volume change goes into the gas, and
+    `P = (Patm + P0) Vg / (Vg + dV) - Patm`. The gas can never be compressed to zero volume;
+  - closed incompressible: `P = P0 - s * 100 dV / V0` with `s` in pressure per % volume change;
+  - vent: always 0;
+  - or any differentiable `pressure_law(dV, P0)` in scripts.
+
+  Chamber walls are not meshed: shell edges are fixed, so `dV` follows from the shells alone.
+- **Contact**: nodal penalty `1/2 k A_node gap^2` against rigid bodies, with the mid-surface kept
+  half a thickness away. `k` is pressure per unit penetration. The automatic value gives about 5%
+  of the thickness at the highest input pressure.
+- **Solve**: pressures are ramped by a load factor from 0 to 1, and a step is cut automatically
+  when Newton fails. A warm start ramps only the change from the previous solution.
+
+Units in the application: mm, N, MPa (pressures entered in kPa).
+
+## Verification (tests/)
+
+| Check | Result |
+|---|---|
+| Residual = dEnergy, tangent = dResidual (finite differences, with pressure, volume stiffness, contact, bending) | 1e-5 rel |
+| Clamped square plate, `w = 0.00126 q a^4 / D` | 32x32 mesh: +2.5 % (8x8: +33 %, 16x16: +9 %) |
+| Clamped circular plate, `w = q a^4 / 64D` | 24 rings: +0.6 % |
+| Pure-bending energy on a cylinder at 0/30/45° mesh orientation | orientation-independent, converges O(h) |
+| Hencky inflated membrane, `w = 0.655 a (qa/Et)^(1/3)` | 0.654 |
+| Contact signed distance vs brute force (non-convex prism, body with cavity) | exact |
+| Warm-started solve vs fresh solve | identical |
+| Gas chamber with incompressible share: energy/residual/tangent consistency, Boyle's law on the gas share, gas pocket never collapses | exact |
+| STEP import: names, volumes, outward meshes, mid-surfaces, chamber couplings, project round trip | exact |
+
+## Known limitations
+
+- Membranes and shells do not contact each other, only rigid bodies. Only a closed chamber's gas
+  keeps two membranes apart.
+- Contact is checked at mesh nodes, so use an element size small enough to follow the obstacle's
+  curvature.
+- A membrane's mid-surface comes from its single largest CAD face.

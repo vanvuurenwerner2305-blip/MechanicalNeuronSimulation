@@ -1,0 +1,414 @@
+"""
+Thin shell made of 3-node triangles.
+
+Unknowns: node positions x (3 per node) and, when bending is on, one mid-edge normal
+rotation psi per edge.
+
+The shell energy is the sum of
+  * membrane energy: geometrically exact (large strain) plane-stress triangle,
+    incompressible neo-Hookean or St. Venant-Kirchhoff, plus an optional isotropic
+    pre-tension (energy = tension * current area);
+  * bending energy: geometrically nonlinear Morley triangle. Every edge carries a
+    mid-edge normal; its rotation relative to a face is
+        phi = theta/2 + s*psi     (interior edge, theta = dihedral angle, s = +-1 edge orientation)
+        phi = psi                 (free boundary edge: zero moment)
+        phi = angle(n_face, N0)   (clamped boundary edge: mid-edge normal held at the rest normal)
+    and the face curvature is constant,
+        kappa = 1/A * sum_i l_i * phi_i * m_i (x) m_i,
+    (l_i edge length, m_i in-plane outward edge normal, both from the rest state), with
+    energy A * D/2 * (nu tr(dk)^2 + (1-nu) dk:dk). The psi dofs make this the Morley
+    plate element, which converges independently of mesh orientation.
+
+Element gradients and Hessians are exact derivatives of the energy (the Newton solver's consistent
+tangent): written out by hand for the membrane (`membrane_terms`), from torch.func for bending.
+"""
+from functools import partial
+
+import math
+
+import numpy as np
+import torch
+from torch.func import vmap, grad, hessian
+
+from .mesh import boundary_nodes
+
+DTYPE = torch.float64
+EDGE_INTERIOR, EDGE_FREE, EDGE_CLAMPED = 0, 1, 2
+
+
+# -----------------------------
+# Element energies (single element, vmapped below)
+# -----------------------------
+
+def _right_cauchy_green(xe, Dm_inv):
+    Ds = torch.stack((xe[1] - xe[0], xe[2] - xe[0]), dim=1)  # (3, 2)
+    F = Ds @ Dm_inv                                           # (3, 2) surface deformation gradient
+    area = 0.5 * torch.linalg.norm(torch.linalg.cross(Ds[:, 0], Ds[:, 1]))
+    return F.T @ F, area
+
+
+def _neo_hookean_energy(xe, Dm_inv, A0, mu_t, lam_t, tension):
+    """Incompressible neo-Hookean membrane (thickness change eliminated): mu t/2 (I1 + 1/J^2 - 3)."""
+    C, area = _right_cauchy_green(xe, Dm_inv)
+    I1 = C[0, 0] + C[1, 1]
+    J2 = C[0, 0] * C[1, 1] - C[0, 1] * C[1, 0]
+    return A0 * 0.5 * mu_t * (I1 + 1.0 / J2 - 3.0) + tension * area
+
+
+def _svk_energy(xe, Dm_inv, A0, mu_t, lam_t, tension):
+    """Plane-stress St. Venant-Kirchhoff membrane on the Green-Lagrange strain."""
+    C, area = _right_cauchy_green(xe, Dm_inv)
+    E = 0.5 * (C - torch.eye(2, dtype=C.dtype, device=C.device))
+    trE = E[0, 0] + E[1, 1]
+    return A0 * (0.5 * lam_t * trE ** 2 + mu_t * (E * E).sum()) + tension * area
+
+
+def membrane_terms(xe, G, A0, material, mu_t, lam_t, tension, tangent=True):
+    """
+    Energy (E,), gradient (E, 9) and Hessian (E, 9, 9) or None of the membrane triangles, written out by hand
+    (the same values as torch.func on _neo_hookean_energy / _svk_energy, several times faster).
+
+    The deformation gradient's columns are f_alpha = sum_a G[a, alpha] x_a (G = rows of Dm_inv, g_0 = -g_1 - g_2),
+    and both energies are functions of s = (a, b, c) = (f0.f0, f1.f1, f0.f1), i.e. of C = [[a, c], [c, b]], with
+    J^2 = det C = ab - c^2 and area = A0 J:
+        neo-Hookean  A0 mu t/2 (a + b + 1/J^2 - 3)
+        SVK          A0 (lam t/8 (a + b - 2)^2 + mu t/4 ((a - 1)^2 + (b - 1)^2 + 2 c^2))
+    plus tension * A0 J. Chain rule: d psi/df = psi_s ds/df, d2psi/df2 = psi_s d2s/df2 + ds/df^T psi_ss ds/df.
+    """
+    f = torch.einsum("eaq,eai->eqi", G, xe)                     # (E, 2, 3)
+    f0, f1 = f[:, 0], f[:, 1]
+    a, b, c = (f0 * f0).sum(-1), (f1 * f1).sum(-1), (f0 * f1).sum(-1)
+    J2 = a * b - c * c
+    one = torch.ones_like(a)
+    zero = torch.zeros_like(a)
+
+    # psi(J2) part: k / J2 + tension A0 sqrt(J2)
+    kJ = 0.5 * A0 * mu_t if material == "neo_hookean" else zero
+    J = torch.sqrt(J2)
+    energy = kJ / J2 + tension * A0 * J
+    phi1 = -kJ / J2 ** 2 + 0.5 * tension * A0 / J
+    phi2 = 2.0 * kJ / J2 ** 3 - 0.25 * tension * A0 / (J2 * J)
+
+    # polynomial part in (a, b, c)
+    if material == "neo_hookean":
+        k = 0.5 * A0 * mu_t
+        energy = energy + k * (a + b - 3.0)
+        Ps = torch.stack((k, k, zero), -1)
+        Pss = None
+    else:
+        tr = a + b - 2.0
+        energy = energy + A0 * (lam_t / 8.0 * tr ** 2 + mu_t / 4.0 * ((a - 1) ** 2 + (b - 1) ** 2 + 2 * c * c))
+        Ps = torch.stack((A0 * (lam_t / 4.0 * tr + mu_t / 2.0 * (a - 1)),
+                          A0 * (lam_t / 4.0 * tr + mu_t / 2.0 * (b - 1)),
+                          A0 * mu_t * c), -1)
+        d, o = A0 * (lam_t / 4.0 + mu_t / 2.0), A0 * lam_t / 4.0
+        Pss = torch.stack((torch.stack((d, o, zero), -1),
+                           torch.stack((o, d, zero), -1),
+                           torch.stack((zero, zero, A0 * mu_t * one), -1)), 1)
+
+    Js = torch.stack((b, a, -2.0 * c), -1)                       # dJ2/ds
+    psi_s = Ps + phi1[:, None] * Js                              # (E, 3)
+    zf = torch.zeros_like(f0)
+    ds = torch.stack((torch.stack((2 * f0, zf), 1),              # ds/df (E, 3, 2, 3)
+                      torch.stack((zf, 2 * f1), 1),
+                      torch.stack((f1, f0), 1)), 1)
+    grad_f = torch.einsum("es,esqi->eqi", psi_s, ds)
+    grad = torch.einsum("eaq,eqi->eai", G, grad_f).reshape(-1, 9)
+    if not tangent:
+        return energy, grad, None
+
+    Jss = torch.tensor([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -2.0]], dtype=xe.dtype, device=xe.device)
+    psi_ss = phi1[:, None, None] * Jss + phi2[:, None, None] * Js[:, :, None] * Js[:, None, :]
+    if Pss is not None:
+        psi_ss = psi_ss + Pss
+    # psi_s d2s/df2 = S[q, r] delta_ij with S = [[2 psi_a, psi_c], [psi_c, 2 psi_b]]
+    S = torch.stack((torch.stack((2 * psi_s[:, 0], psi_s[:, 2]), -1),
+                     torch.stack((psi_s[:, 2], 2 * psi_s[:, 1]), -1)), 1)
+    GSG = torch.einsum("eaq,eqr,ebr->eab", G, S, G)               # (E, 3, 3) nodes x nodes
+    eye = torch.eye(3, dtype=xe.dtype, device=xe.device)
+    dsx = torch.einsum("eaq,esqi->esai", G, ds)                  # ds/dx (E, 3, 3 nodes, 3)
+    H = (GSG[:, :, None, :, None] * eye[None, None, :, None, :]).reshape(-1, 9, 9)
+    dsx = dsx.reshape(-1, 3, 9)
+    H = H + torch.einsum("esm,est,etn->emn", dsx, psi_ss, dsx)
+    return energy, grad, H
+
+
+def _edge_rotations(q, N0, etype, esign):
+    """
+    Mid-edge normal rotations phi (3,) of one triangle.
+    q = [a, b, c, opposite node across edge 0, 1, 2 (18 coords), psi_0, psi_1, psi_2];
+    edge k is opposite vertex k.
+    """
+    xb, psi = q[:18].reshape(6, 3), q[18:]
+    a, b, c = xb[0], xb[1], xb[2]
+    n1 = torch.linalg.cross(b - a, c - a)
+    verts = (a, b, c)
+    phis = []
+    for k in range(3):
+        i, j, l = verts[(k + 1) % 3], verts[(k + 2) % 3], xb[3 + k]
+        e = j - i
+        n_neighbour = torch.linalg.cross(i - j, l - j)
+        n2 = torch.where(etype[k] == EDGE_INTERIOR, n_neighbour,
+                         torch.where(etype[k] == EDGE_CLAMPED, N0, n1))
+        theta = torch.atan2(torch.dot(torch.linalg.cross(n1, n2), e) / torch.linalg.norm(e),
+                            torch.dot(n1, n2))
+        phi = torch.where(etype[k] == EDGE_INTERIOR, 0.5 * theta + esign[k] * psi[k],
+                          torch.where(etype[k] == EDGE_CLAMPED, theta, psi[k]))
+        phis.append(phi)
+    return torch.stack(phis)
+
+
+def _bending_energy(q, N0, etype, esign, phi0, M):
+    d = _edge_rotations(q, N0, etype, esign) - phi0
+    return d @ M @ d
+
+
+class Shell:
+    def __init__(self,
+                 vertices,
+                 faces,
+                 thickness: float,
+                 youngs_modulus: float,
+                 poisson_ratio: float = 0.3,
+                 material: str = "neo_hookean",
+                 bending: bool = True,
+                 pretension: float = 0.0,
+                 fixed=None,
+                 boundary_rotation: str = "clamped",
+                 contact_offset: float = None,
+                 color: str = "red",
+                 name: str = None,
+                 device="cpu"):
+        """
+        vertices, faces   : rest mesh (see mesh.py for orientation convention).
+        thickness         : shell thickness t.
+        youngs_modulus    : E. For "neo_hookean" the material is incompressible (nu = 0.5,
+                            shear modulus E/3) and poisson_ratio is ignored.
+        material          : "neo_hookean" (rubber, large strain) or "svk".
+        bending           : include bending stiffness D = E t^3 / (12 (1 - nu^2)).
+        pretension        : isotropic in-plane pre-tension (force / length).
+        fixed             : bool mask or index list of pinned nodes. Default: all boundary nodes.
+        boundary_rotation : "clamped" (boundary edges between pinned nodes keep their rest
+                            slope) or "free" (hinged).
+        contact_offset    : distance the mid-surface keeps from obstacles, typically thickness / 2.
+                            None uses the Environment's contact_offset.
+        """
+        self.device = torch.device(device)
+        self.color = color
+        self.name = name
+        self.contact_offset = contact_offset
+        self.faces_np = np.asarray(faces, dtype=np.int64)
+        X_np = np.asarray(vertices, dtype=float)
+        n_nodes = X_np.shape[0]
+
+        if material not in ("neo_hookean", "svk"):
+            raise ValueError(f"Unknown material '{material}'")
+        self.material = material
+        self.bending = bending
+
+        # Boundary conditions
+        if fixed is None:
+            fixed_mask = boundary_nodes(self.faces_np, n_nodes)
+        else:
+            fixed = np.asarray(fixed)
+            fixed_mask = fixed.astype(bool) if fixed.dtype == bool else np.isin(np.arange(n_nodes), fixed)
+
+        # Rest geometry
+        F = self.faces_np
+        a, b, c = X_np[F[:, 0]], X_np[F[:, 1]], X_np[F[:, 2]]
+        n = np.cross(b - a, c - a)
+        A0 = 0.5 * np.linalg.norm(n, axis=1)
+        if np.any(A0 <= 0):
+            raise ValueError("Mesh contains degenerate triangles.")
+        N0 = n / (2.0 * A0[:, None])
+        e1 = (b - a) / np.linalg.norm(b - a, axis=1, keepdims=True)
+        e2 = np.cross(N0, e1)
+        Dm = np.stack([np.stack([np.einsum("ij,ij->i", e1, b - a), np.einsum("ij,ij->i", e1, c - a)], 1),
+                       np.stack([np.einsum("ij,ij->i", e2, b - a), np.einsum("ij,ij->i", e2, c - a)], 1)], 1)
+
+        nodal_area = np.zeros(n_nodes)
+        for k in range(3):
+            np.add.at(nodal_area, F[:, k], A0 / 3.0)
+
+        # Edge topology and mid-edge rotation dofs
+        topo = self._build_edge_topology(F, fixed_mask, boundary_rotation)
+        bend_nodes, edge_type, edge_id, edge_sign, n_edges = topo
+        self.n_edges = n_edges if bending else 0
+        edge_fixed = np.zeros(self.n_edges, dtype=bool)
+        if bending:
+            edge_fixed[edge_id[edge_type == EDGE_CLAMPED]] = True  # rotation prescribed by the clamp
+
+        # Tensors
+        tt = partial(torch.as_tensor, dtype=DTYPE, device=self.device)
+        self.X = tt(X_np)
+        self.x = self.X.clone()
+        self.psi = torch.zeros(self.n_edges, dtype=DTYPE, device=self.device)
+        self.faces = torch.as_tensor(F, device=self.device)
+        self.fixed = torch.as_tensor(fixed_mask, device=self.device)
+        self.fixed_dofs = torch.as_tensor(np.concatenate([np.repeat(fixed_mask, 3), edge_fixed]), device=self.device)
+        self.rest_area = tt(A0)
+        self.nodal_area = tt(nodal_area)
+        self.volume_origin = self.X.mean(dim=0)  # reference point for cone volumes (see fluid.py)
+        self._Dm_inv = tt(np.linalg.inv(Dm))
+        self._G = torch.stack((-self._Dm_inv.sum(1), self._Dm_inv[:, 0], self._Dm_inv[:, 1]), 1)  # f = sum_a G[a] x_a
+        self._N0 = tt(N0)
+        self._bend_nodes = torch.as_tensor(bend_nodes, device=self.device)
+        self._edge_id = torch.as_tensor(edge_id, device=self.device)
+        self._edge_type = torch.as_tensor(edge_type, device=self.device)
+        self._edge_sign = tt(edge_sign)
+
+        # Local dof maps: node dofs are node*3 + component, edge dofs follow after all nodes
+        comp = torch.arange(3, device=self.device)
+        self.face_dofs = (3 * self.faces[:, :, None] + comp).reshape(-1, 9)
+        self.bend_dofs = torch.cat([(3 * self._bend_nodes[:, :, None] + comp).reshape(-1, 18),
+                                    3 * n_nodes + self._edge_id], dim=1)
+
+        # Material (also changed later by set_material) and vectorised element kernels
+        self.thickness = None
+        self.set_material(youngs_modulus, thickness, poisson_ratio, pretension)
+        self._bend_e = vmap(_bending_energy)
+        self._bend_g = vmap(grad(_bending_energy))
+        self._bend_h = vmap(hessian(_bending_energy))
+        if bending:
+            self._phi0 = vmap(_edge_rotations)(self._bend_q(self.X, self.psi), self._N0, self._edge_type,
+                                               self._edge_sign)
+
+        # Pressure couplings are registered by FluidVolume.add_boundary
+        self.fluid_volumes = []
+
+    def set_material(self, youngs_modulus=None, thickness=None, poisson_ratio=None, pretension=None):
+        """Set (or change, on a built model) E, t, nu (SVK only) and the pre-tension; None keeps the current value.
+        The mesh is unchanged: the mid-surface stays where it is. A contact offset of half the old thickness
+        follows the new thickness."""
+        E = float(self.youngs_modulus if youngs_modulus is None else youngs_modulus)
+        t = float(self.thickness if thickness is None else thickness)
+        if E <= 0 or t <= 0:
+            raise ValueError(f"{self.name or 'shell'}: Young's modulus and thickness must be positive.")
+        if self.material == "neo_hookean":
+            nu, mu, lam = 0.5, E / 3.0, 0.0
+            energy_fn = _neo_hookean_energy
+        else:
+            nu = float(self.poisson_ratio if poisson_ratio is None else poisson_ratio)
+            mu, lam = E / (2.0 * (1.0 + nu)), E * nu / (1.0 - nu ** 2)
+            energy_fn = _svk_energy
+        if self.thickness and self.contact_offset and math.isclose(self.contact_offset, 0.5 * self.thickness):
+            self.contact_offset = 0.5 * t
+        self.thickness, self.youngs_modulus, self.poisson_ratio = t, E, nu
+        if pretension is not None or not hasattr(self, "pretension"):
+            self.pretension = float(pretension or 0.0)
+        self.bending_stiffness = E * t ** 3 / (12.0 * (1.0 - nu ** 2)) if self.bending else 0.0
+        self._M = torch.as_tensor(self._bending_matrices(
+            self.X.cpu().numpy(), self.faces_np, self._N0.cpu().numpy(), self.rest_area.cpu().numpy(), nu,
+            self.bending_stiffness), dtype=DTYPE, device=self.device)
+        self._mem = dict(material=self.material, mu_t=mu * t, lam_t=lam * t, tension=self.pretension)
+        self._mem_e = vmap(partial(energy_fn, mu_t=mu * t, lam_t=lam * t, tension=self.pretension))  # reference
+
+    # -----------------------------
+    # Setup helpers
+    # -----------------------------
+
+    @staticmethod
+    def _build_edge_topology(F, fixed_mask, boundary_rotation):
+        directed = {}
+        for f in range(len(F)):
+            for k in range(3):
+                key = (F[f, (k + 1) % 3], F[f, (k + 2) % 3])
+                if key in directed:
+                    raise ValueError("Shell mesh is non-manifold or inconsistently oriented.")
+                directed[key] = (f, k)
+
+        bend_nodes = np.concatenate([F, F], axis=1)  # boundary edges point at the own opposite vertex (unused)
+        edge_type = np.full((len(F), 3), EDGE_FREE, dtype=np.int64)
+        edge_id = np.zeros((len(F), 3), dtype=np.int64)
+        edge_sign = np.zeros((len(F), 3))
+        undirected = {}
+        for (i, j), (f, k) in directed.items():
+            edge_id[f, k] = undirected.setdefault((min(i, j), max(i, j)), len(undirected))
+            edge_sign[f, k] = 1.0 if i < j else -1.0
+            twin = directed.get((j, i))
+            if twin is not None:
+                g, m = twin
+                bend_nodes[f, 3 + k] = F[g, m]
+                edge_type[f, k] = EDGE_INTERIOR
+            elif boundary_rotation == "clamped" and fixed_mask[i] and fixed_mask[j]:
+                edge_type[f, k] = EDGE_CLAMPED
+        return bend_nodes, edge_type, edge_id, edge_sign, len(undirected)
+
+    @staticmethod
+    def _bending_matrices(X, F, N0, A0, nu, D):
+        """Per-face 3x3 matrix M with energy = dphi^T M dphi."""
+        verts = X[F]                                                   # (F, 3, 3)
+        e = np.stack([verts[:, (k + 2) % 3] - verts[:, (k + 1) % 3] for k in range(3)], axis=1)
+        l = np.linalg.norm(e, axis=2)                                  # (F, 3)
+        m = np.cross(e, N0[:, None, :]) / l[..., None]                 # in-plane outward edge normals
+        G = nu + (1.0 - nu) * np.einsum("fid,fjd->fij", m, m) ** 2
+        return D / (2.0 * A0)[:, None, None] * l[:, :, None] * l[:, None, :] * G
+
+    def _bend_q(self, x, psi):
+        return torch.cat([x[self._bend_nodes].reshape(-1, 18), psi[self._edge_id]], dim=1)
+
+    # -----------------------------
+    # State
+    # -----------------------------
+
+    @property
+    def n_nodes(self) -> int:
+        return self.X.shape[0]
+
+    @property
+    def n_dof(self) -> int:
+        return 3 * self.n_nodes + self.n_edges
+
+    def get_state(self) -> torch.Tensor:
+        return torch.cat([self.x.reshape(-1), self.psi])
+
+    def set_state(self, u: torch.Tensor):
+        self.x = u[:3 * self.n_nodes].reshape(-1, 3)
+        self.psi = u[3 * self.n_nodes:]
+
+    def reset(self):
+        self.x = self.X.clone()
+        self.psi = torch.zeros_like(self.psi)
+
+    def displacement(self) -> torch.Tensor:
+        return self.x - self.X
+
+    def fluid_volume_contacts(self, fluid_volume_tuple):
+        """
+        (volume_behind, volume_in_front): the volume behind the shell (opposite to its normal)
+        pushes along +normal, the one in front pushes back, as in the 2D simulator.
+        Either entry may be None (ambient pressure 0).
+        """
+        behind, in_front = fluid_volume_tuple
+        if behind is not None:
+            behind.add_boundary(self, +1)
+        if in_front is not None:
+            in_front.add_boundary(self, -1)
+
+    # -----------------------------
+    # Element contributions
+    # -----------------------------
+
+    def element_terms(self, tangent: bool = True):
+        """
+        Yield (local_dofs (E, d), energy (E,), gradient (E, d), hessian (E, d, d) or None)
+        for the membrane and bending element groups at the current state.
+        """
+        yield (self.face_dofs, *membrane_terms(self.x[self.faces], self._G, self.rest_area, tangent=tangent,
+                                               **self._mem))
+
+        if self.bending:
+            args = (self._bend_q(self.x, self.psi), self._N0, self._edge_type, self._edge_sign, self._phi0, self._M)
+            yield (self.bend_dofs,
+                   self._bend_e(*args),
+                   self._bend_g(*args),
+                   self._bend_h(*args) if tangent else None)
+
+    def to(self, device):
+        """Move all tensors to another device."""
+        self.device = torch.device(device)
+        for name in ("X", "x", "psi", "faces", "fixed", "fixed_dofs", "rest_area", "nodal_area", "volume_origin",
+                     "_Dm_inv", "_G", "_N0", "_bend_nodes", "_edge_id", "_edge_type", "_edge_sign", "_M",
+                     "face_dofs", "bend_dofs") + (("_phi0",) if self.bending else ()):
+            setattr(self, name, getattr(self, name).to(self.device))
+        return self

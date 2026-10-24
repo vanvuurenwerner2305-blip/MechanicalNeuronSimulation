@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.html
+*.vtk
+*.vtp
+*.msh
+examples/output/
+docs/paper/*.aux
+docs/paper/*.log
+docs/paper/*.out
+docs/paper/*.toc
+docs/manual/*.aux
+docs/manual/*.log
+docs/manual/*.out
+docs/manual/*.toc
+
+# not published yet: the technical paper and the research article (kept locally)
+docs/paper/
+agent/background/article.*
+cad_models/
+
+# LaTeX build output
+docs/manual/build.log
